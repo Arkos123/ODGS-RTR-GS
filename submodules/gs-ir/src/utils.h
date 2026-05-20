@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdint>  // 提供 uint32_t, int32_t 等类型定义
+#include <cmath>    // 提供数学函数
 #include <math.h>
 #include <vector_functions.h>
 #include <vector_types.h>

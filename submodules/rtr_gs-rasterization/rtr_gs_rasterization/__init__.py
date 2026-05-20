@@ -2,7 +2,6 @@ import os
 from typing import NamedTuple
 import torch.nn as nn
 import torch
-from utils.system_utils import Timing
 
 from rtr_gs_rasterization import _C
 
