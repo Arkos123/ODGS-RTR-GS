@@ -10,7 +10,14 @@ from utils.graphics_utils import focal2fov
 WARNED = False
 
 
-def loadCam(args, id, cam_info, resolution_scale):
+def loadCam(args, id, cam_info, resolution_scale, read_cam_only=False):
+    if read_cam_only:
+        return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T,
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, fx=cam_info.fx, fy=cam_info.fy, cx=cam_info.cx, cy=cam_info.cy,
+                  image=None, depth=None, normal=None, image_mask=None,
+                  width=cam_info.width,
+                  height=cam_info.height,
+                  image_name=cam_info.image_name, uid=id, render_only=read_cam_only)
     orig_h, orig_w = cam_info.image.shape[:2]
 
     if args.resolution in [1, 2, 4, 8]:
@@ -74,12 +81,12 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image_name=cam_info.image_name, uid=id, data_device=args.data_device)
 
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args):
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, read_cam_only=False):
     camera_list = []
 
     for id, c in enumerate(tqdm(cam_infos, desc="resolution scale: {}".format(resolution_scale), leave=False)):
         # for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+        camera_list.append(loadCam(args, id, c, resolution_scale, read_cam_only))
 
     return camera_list
 

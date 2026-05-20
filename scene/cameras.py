@@ -6,9 +6,10 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProject
 
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy, fx, fy, cx, cy, image, image_name, uid,
+    def __init__(self, colmap_id, R, T, FoVx, FoVy, fx, fy, cx, cy, image=None, image_name='', uid=0,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda",
-                 height=None, width=None, depth=None, normal=None, image_mask=None):
+                 height=None, width=None, depth=None, normal=None, image_mask=None,
+                 render_only=False):
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -38,17 +39,17 @@ class Camera(nn.Module):
             self.image_width = width
             self.image_height = height
 
-        if depth is not None:
+        if depth is not None or render_only:
             self.depth = depth
         else:
             self.depth = torch.zeros((1, self.image_height, self.image_width), dtype=torch.float32, device=data_device)
 
-        if normal is not None:
+        if normal is not None or render_only:
             self.normal = normal
         else:
             self.normal = torch.zeros((3, self.image_height, self.image_width), dtype=torch.float32, device=data_device)
 
-        if image_mask is not None:
+        if image_mask is not None or render_only:
             self.image_mask = image_mask
         else:
             self.image_mask = torch.ones_like(self.depth)

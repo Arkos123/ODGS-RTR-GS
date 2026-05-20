@@ -299,7 +299,16 @@ def read_hdr(path: str) -> np.ndarray:
         buffer_ = np.frombuffer(h.read(), np.uint8)
     bgr = cv2.imdecode(buffer_, cv2.IMREAD_UNCHANGED)
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    return rgb
+    
+    # Handle LDR formats (PNG, JPG) - normalize to 0-1 range and linearize sRGB
+    if rgb.dtype == np.uint8:
+        rgb = rgb.astype(np.float32) / 255.0
+        # Convert sRGB to linear space
+        mask = rgb > 0.04045
+        rgb_linear = np.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+        return rgb_linear
+    
+    return rgb.astype(np.float32)
 
 
 
@@ -324,6 +333,10 @@ def latlong_to_cubemap(latlong_map: torch.Tensor, res: List[int]) -> torch.Tenso
     cubemap = torch.zeros(
         6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device="cuda"
     )
+    
+    # Ensure latlong_map is float32 for nvdiffrast texture function
+    latlong_map_float = latlong_map.float()
+    
     for s in range(6):
         gy, gx = torch.meshgrid(
             torch.linspace(-1.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device="cuda"),
@@ -342,7 +355,7 @@ def latlong_to_cubemap(latlong_map: torch.Tensor, res: List[int]) -> torch.Tenso
         texcoord = torch.cat((tu, tv), dim=-1)
 
         cubemap[s, ...] = dr.texture(
-            latlong_map[None, ...], texcoord[None, ...], filter_mode="linear"
+            latlong_map_float[None, ...], texcoord[None, ...], filter_mode="linear"
         )[0]
         
     return cubemap

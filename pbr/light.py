@@ -101,6 +101,18 @@ class CubemapLight(nn.Module):
     def xfm(self, mtx) -> None:
         self.mtx = mtx
 
+    def rotate_dirs(self, directions: torch.Tensor) -> torch.Tensor:
+        if self.mtx is None:
+            return directions
+        orig_shape = directions.shape
+        flat = directions.reshape(-1, 3)
+        if not isinstance(self.mtx, torch.Tensor):
+            mtx_t = torch.tensor(self.mtx, dtype=torch.float32, device=directions.device)
+        else:
+            mtx_t = self.mtx.to(dtype=torch.float32, device=directions.device)
+        rotated = (mtx_t @ flat.T).T
+        return rotated.reshape(orig_shape)
+
     def clamp_(self, min: Optional[float]=None, max: Optional[float]=None) -> None:
         self.base.clamp_(min, max)
 
@@ -174,10 +186,12 @@ class CubemapLight(nn.Module):
                                 torch.sin(theta) * torch.cos(phi), 
                                 torch.sin(phi)], dim=-1).view(res[0], res[1], 3)    # [envH, envW, 3]
         
+        sample_dirs = self.rotate_dirs(reflvec) if self.mtx is not None else reflvec
+
         if base:
             color = dr.texture(
                 self.base[None, ...],
-                reflvec[None, ...].contiguous(),
+                sample_dirs[None, ...].contiguous(),
                 filter_mode="linear",
                 boundary_mode="cube",
             )[
@@ -186,7 +200,7 @@ class CubemapLight(nn.Module):
         else:
             color = dr.texture(
                 self.diffuse[None, ...],
-                reflvec[None, ...].contiguous(),
+                sample_dirs[None, ...].contiguous(),
                 filter_mode="linear",
                 boundary_mode="cube",
             )[
@@ -223,9 +237,12 @@ class CubemapLight(nn.Module):
         return view_dirs
     
     def get_env_map(self):
+        dirs = self.envmap_dirs
+        if self.mtx is not None:
+            dirs = self.rotate_dirs(dirs)
         envmap = dr.texture(
             self.base[None, ...],
-            self.envmap_dirs[None, ...].contiguous(),
+            dirs[None, ...].contiguous(),
             filter_mode="linear",
             boundary_mode="cube",
         )[

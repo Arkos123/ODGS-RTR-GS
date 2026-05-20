@@ -14,8 +14,77 @@ from .rtr_gs_rasterization import GaussianRasterizationSettings, GaussianRasteri
 from gs_ir import recon_occlusion
 import nvdiffrast.torch as dr
 
+
 def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                 scaling_modifier=1.0, override_color=None, is_training=False, dict_params=None):
+    """渲染指定视角的高斯模型，支持基础反射渲染和PBR渲染
+
+    Args:
+        viewpoint_camera (Camera): 相机参数，包含视角、位置、内参等
+        pc (GaussianModel): 高斯模型，包含3D高斯点的属性
+        pipe: 渲染管线配置参数，控制渲染行为
+        bg_color (torch.Tensor): 背景颜色，形状为[3]
+        scaling_modifier (float, optional): 缩放修改器，用于调整高斯点大小。Defaults to 1.0.
+        override_color (torch.Tensor, optional): 覆盖颜色，如果提供则使用此颜色替代SH计算。Defaults to None.
+        is_training (bool, optional): 是否为训练模式，影响反射贴图和环境贴图的模式。Defaults to False.
+        dict_params (dict, optional): 参数字典，包含渲染所需的各种参数。Defaults to None.
+            - refmap: 反射贴图
+            - iteration: 当前迭代次数
+            - canonical_rays: 规范光线
+            - brdf_lut: BRDF查找表
+            - transfer_net: PRT传输网络（可选）
+            - cubemap: 环境贴图（当pc.use_pbr=True时）
+            - occlusion_volumes: 遮挡体积（可选）
+            - aabb: 轴对齐包围盒（可选）
+
+    Returns:
+        dict: 包含渲染结果的字典，包含以下键：
+            - render: 最终反射渲染图像 [3, H, W]
+            - depth: 深度图 [1, H, W]
+            - depth_var: 深度方差 [1, H, W]
+            - normal: 法线图 [3, H, W]
+            - pseudo_normal: 伪法线图 [3, H, W]
+            - surface_xyz: 表面3D坐标 [3, H, W]
+            - opacity: 透明度图 [1, H, W]
+            - viewspace_points: 视图空间点 [N, 2]
+            - visibility_filter: 可见性过滤器 [N]
+            - radii: 高斯半径 [N]
+            - num_rendered: 渲染的高斯数量
+            - num_contrib: 贡献的高斯数量
+            - weights: 权重 [N, H, W]
+            - ref_roughness: 反射粗糙度图 [1, H, W]
+            - ref_strength: 反射强度图 [1, H, W]
+            - pbr: PBR渲染结果 [3, H, W]（当pc.use_pbr=True时）
+            - base_color: 基础颜色图 [3, H, W]（当pc.use_pbr=True时）
+            - roughness: 粗糙度图 [1, H, W]（当pc.use_pbr=True时）
+            - metallic: 金属度图 [1, H, W]（当pc.use_pbr=True时）
+            - visibility: 可见性/遮挡图 [1, H, W]（当pc.use_pbr=True时）
+            - vis_dict: 可视化字典，包含各种中间结果（仅在非训练模式时），包含以下键：
+                - depth: 归一化深度图 [1, H, W]
+                - normal: 归一化法线图 [3, H, W]（0.5+0.5）
+                - pseudo_normal: 归一化伪法线图 [3, H, W]（0.5+0.5）
+                - ref_roughness: 反射粗糙度图 [1, H, W]
+                - ref_strength: 反射强度图 [1, H, W]
+                - radiance_color: 辐射颜色图 [3, H, W]
+                - ref_color: 反射颜色图 [3, H, W]
+                - ref_tint: 反射色调图 [3, H, W]
+                - blended_radiance: 混合辐射图 [3, H, W]
+                - blended_ref_color: 混合反射颜色图 [3, H, W]
+                - ref_export_base: 反射环境贴图导出 [3, H, W]
+                - base_color: 基础颜色图（gamma校正）[3, H, W]（当pc.use_pbr=True时）
+                - base_color_rgb: 基础颜色图（原始RGB）[3, H, W]（当pc.use_pbr=True时）
+                - roughness: 粗糙度图 [1, H, W]（当pc.use_pbr=True时）
+                - metallic: 金属度图 [1, H, W]（当pc.use_pbr=True时）
+                - visibility: 可见性/遮挡图 [1, H, W]（当pc.use_pbr=True时）
+                - diffuse_pbr: PBR漫反射分量 [3, H, W]（当pc.use_pbr=True时）
+                - specular_pbr: PBR镜面反射分量 [3, H, W]（当pc.use_pbr=True时）
+                - image_pbr: PBR完整图像 [3, H, W]（当pc.use_pbr=True时）
+                - incidents_light: 入射光照 [1, H, W]（当pc.use_pbr=True时）
+                - env_export_base: 环境贴图基础导出 [3, H, W]（当pc.use_pbr=True时）
+                - env_export_diffuse: 环境贴图漫反射导出 [3, H, W]（当pc.use_pbr=True时）
+            - pbr_env: PBR与环境贴图的混合结果 [3, H, W]（当pc.use_pbr=True且非训练模式时）
+            - env_only: 纯环境贴图 [3, H, W]（当pc.use_pbr=True且非训练模式时）
+    """
     
     gamma_func = lambda x : linear2srgb_torch(x)
     refmap = dict_params["refmap"]
@@ -269,7 +338,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
                     .contiguous()
                 )  # [HW, 3]
         
-        if "occlusion_volumes" in dict_params.keys():
+        if "occlusion_volumes" in dict_params.keys() and dict_params.get("enable_occlusion", True):
             occlusion_volumes = dict_params["occlusion_volumes"]
             aabb = dict_params["aabb"]
             occlusion_map = recon_occlusion(
@@ -284,6 +353,15 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
                             aabb = aabb,
                             degree = occlusion_volumes["degree"],
                         ).reshape(H, W, 1)
+            
+            # 调试：检查 occlusion_map 的值范围
+            # print("Occlusion map min:", occlusion_map.min().item())
+            # print("Occlusion map max:", occlusion_map.max().item())
+            # print("Occlusion map mean:", occlusion_map.mean().item())
+            
+            # 如果 occlusion_map 的值接近 1，说明没有阴影
+            if occlusion_map.mean().item() > 0.95:
+                print("Warning: Occlusion map is almost all 1 (no shadow effect)")
         else:
             occlusion_map = None
 
@@ -413,6 +491,8 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         if pc.use_pbr:
             directions = viewpoint_camera.get_world_directions()
             directions = directions.permute(1, 2, 0).unsqueeze(0)
+            if cubemap.mtx is not None:
+                directions = cubemap.rotate_dirs(directions)
             direct_env = dr.texture(
                 cubemap.base[None, ...],  # [1, 6, 16, 16, 3]
                 directions.contiguous(),  # [1, H, W, 3]

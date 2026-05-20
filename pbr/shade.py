@@ -1,4 +1,5 @@
 import os
+import math
 from typing import Dict, Optional, Union
 
 import numpy as np
@@ -177,6 +178,9 @@ def get_reflectance_color_forward(
         2.0 * (normals * view_dirs).sum(-1, keepdims=True).clamp(min=0.0) * normals - view_dirs
     )  # [1, H, W, 3]
 
+    if light.mtx is not None:
+        ref_dirs = light.rotate_dirs(ref_dirs)
+
     NoV = saturate_dot(normals, view_dirs)  # [1, H, W, 1]
     fg_uv = torch.cat((NoV, roughness), dim=-1)  # [1, H, W, 2]
     fg_lookup = dr.texture(
@@ -219,6 +223,9 @@ def get_reflectance_color(
     ref_dirs = (
         2.0 * (normals * view_dirs).sum(-1, keepdims=True).clamp(min=0.0) * normals - view_dirs
     )  # [1, H, W, 3]
+
+    if light.mtx is not None:
+        ref_dirs = light.rotate_dirs(ref_dirs)
 
     NoV = saturate_dot(normals, view_dirs)  # [1, H, W, 1]
     fg_uv = torch.cat((NoV, roughness), dim=-1)  # [1, H, W, 2]
@@ -281,10 +288,17 @@ def pbr_shading(
         2.0 * (normals * view_dirs).sum(-1, keepdims=True).clamp(min=0.0) * normals - view_dirs
     )  # [1, H, W, 3]
 
+    # Apply environment rotation if set
+    sampling_dirs = ref_dirs
+    sampling_normals = normals
+    if light.mtx is not None:
+        sampling_dirs = light.rotate_dirs(ref_dirs)
+        sampling_normals = light.rotate_dirs(normals)
+
     # Diffuse lookup
     diffuse_light = dr.texture(
         light.diffuse[None, ...],  # [1, 6, 16, 16, 3]
-        normals.contiguous(),  # [1, H, W, 3]
+        sampling_normals.contiguous(),  # [1, H, W, 3]
         filter_mode="linear",
         boundary_mode="cube",
     )  # [1, H, W, 3]
@@ -320,7 +334,7 @@ def pbr_shading(
     miplevel = light.get_mip(roughness)  # [1, H, W, 1]
     spec = dr.texture(
         light.specular[0][None, ...],  # [1, 6, env_res, env_res, 3]
-        ref_dirs.contiguous(),  # [1, H, W, 3]
+        sampling_dirs.contiguous(),  # [1, H, W, 3]
         mip=list(m[None, ...] for m in light.specular[1:]),
         mip_level_bias=miplevel[..., 0],  # [1, H, W]
         filter_mode="linear-mipmap-linear",

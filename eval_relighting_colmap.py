@@ -88,7 +88,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     if pipe.ref_map:
         refmap = CubemapLight(base_res=128).cuda()
         refmap.train()
-    
+
         if args.checkpoint:
             refmap_checkpoint = os.path.dirname(args.checkpoint) + "/refmap_" + os.path.basename(args.checkpoint)
             if os.path.exists(refmap_checkpoint):
@@ -97,6 +97,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             else:
                 NotImplementedError("No checkpoint or loaded iteration found")
 
+        refmap.build_mips()
         refmap.training_setup(opt, light_type="ref")
         pbr_kwargs["refmap"] = refmap
 
@@ -105,13 +106,22 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    if not pipe.specular_workflow:
-        capture_list = ["pbr", "base_color", "diffuse_pbr", "specular_pbr"]
-    else:
-        capture_list = ["pbr", "diffuse_color", "specular_color", "diffuse_pbr", "specular_pbr"]
+    # 检查属性是否存在
+    # if   not pipe.specular_workflow:
+    capture_list = ["pbr", "base_color", "diffuse_pbr", "specular_pbr"]
+    # else:
+        # capture_list = ["pbr", "diffuse_color", "specular_color", "diffuse_pbr", "specular_pbr"]
 
     envmap_base_dir = args.envmap_path
     task_dict = {
+        "studio": {
+            "capture_list": capture_list,
+            "envmap_path": envmap_base_dir + "big-studio-01_4K.exr",
+        },
+        "rock-theatre": {
+            "capture_list": capture_list,
+            "envmap_path": envmap_base_dir + "rock-theatre-viewpoint_4K.exr",
+        },
         "sunset": {
             "capture_list": capture_list,
             "envmap_path": envmap_base_dir + "sunset.hdr",
@@ -139,7 +149,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     }
 
 
-    task_names = ['bridge', 'city', 'fireplace', 'forest', 'night']
+    # task_names = ['bridge', 'city', 'fireplace', 'forest', 'night']
+    task_names = ['rock-theatre']
     for task_name in task_names:
         cubemap = None
         hdri = read_hdr(task_dict[task_name]["envmap_path"])
@@ -350,7 +361,7 @@ if __name__ == "__main__":
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    is_pbr = args.type in ['neilf', 'neilf_blend', 'neilf_forward', 'neilf_ref_pbr']
+    is_pbr = args.type in ['neilf', 'neilf_blend', 'neilf_forward', 'neilf_ref_pbr', 'render_ref_pbr']
     training(lp.extract(args), op.extract(args), pp.extract(args), is_pbr=is_pbr)
 
     # All done

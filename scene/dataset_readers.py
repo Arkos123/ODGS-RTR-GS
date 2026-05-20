@@ -14,7 +14,7 @@ from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from tqdm import tqdm
 import cv2
-from scene.utils import load_img_rgb, load_mask_bool, load_depth, load_pfm
+from scene.utils import load_img_rgb, get_img_size, load_mask_bool, load_depth, load_pfm
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -34,6 +34,7 @@ class CameraInfo(NamedTuple):
     normal: np.array = None
     depth: np.array = None
     image_mask: np.array = None
+    trans: np.array = np.array([0, 0, 0])
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -66,7 +67,7 @@ def getNerfppNorm(cam_info):
     return {"translate": translate, "radius": radius}
 
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, debug=False):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, debug=False, read_cam_only=False):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -106,7 +107,10 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, debug=False
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = load_img_rgb(image_path)
+        if read_cam_only:
+            image = None
+        else:
+            image = load_img_rgb(image_path)
 
         # mask_path = os.path.join(os.path.dirname(images_folder), "masks", os.path.basename(extr.name))
         # mask = 1.0 - load_mask_bool(mask_path) / 255
@@ -160,7 +164,7 @@ def storePly(path, xyz, rgb, normals=None):
     ply_data.write(path)
 
 
-def readColmapSceneInfo(path, images, eval, llffhold=8, debug=False):
+def readColmapSceneInfo(path, images, eval, llffhold=8, debug=False, read_cam_only=False):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -175,7 +179,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, debug=False):
     reading_dir = "images" if images is None else images
     cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics,
                                            images_folder=os.path.join(path, reading_dir),
-                                           debug=debug)
+                                           debug=debug, read_cam_only=read_cam_only)
     cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     if "DTU" in path and not debug:
@@ -191,20 +195,23 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, debug=False):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    pcd = None
+    ply_path = None
+    if not read_cam_only:
+        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            storePly(ply_path, xyz, rgb)
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            pcd = fetchPly(ply_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+            pcd = None
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
@@ -213,7 +220,7 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, debug=False):
     return scene_info
 
 
-def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", debug=False):
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png", debug=False, read_cam_only=False):
     cam_infos = []
 
     read_mvs = False
@@ -241,31 +248,39 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             R = np.transpose(w2c[:3, :3])  # R is stored transposed due to 'glm' in CUDA code
             T = w2c[:3, 3]
 
-            image = load_img_rgb(image_path)
-            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+            if read_cam_only:
+                image = None
+                width, height = get_img_size(image_path)
+                image_mask = None
+                depth = None
+                normal = None
+            else:
+                image = load_img_rgb(image_path)
+                width, height = get_img_size(image_path)
+                bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
 
-            image_mask = np.ones_like(image[..., 0])
-            if image.shape[-1] == 4:
-                image_mask = image[:, :, 3]
-                image = image[:, :, :3] * image[:, :, 3:4] + bg * (1 - image[:, :, 3:4])
+                image_mask = np.ones_like(image[..., 0])
+                if image.shape[-1] == 4:
+                    image_mask = image[:, :, 3]
+                    image = image[:, :, :3] * image[:, :, 3:4] + bg * (1 - image[:, :, 3:4])
 
-            # read depth and mask
-            depth = None
-            normal = None
-            if read_mvs:
-                depth_path = os.path.join(mvs_dir + "/depths/", os.path.basename(frame["file_path"]) + ".tiff")
-                normal_path = os.path.join(mvs_dir + "/normals/", os.path.basename(frame["file_path"]) + ".pfm")
+                # read depth and mask
+                depth = None
+                normal = None
+                if read_mvs:
+                    depth_path = os.path.join(mvs_dir + "/depths/", os.path.basename(frame["file_path"]) + ".tiff")
+                    normal_path = os.path.join(mvs_dir + "/normals/", os.path.basename(frame["file_path"]) + ".pfm")
 
-                depth = load_depth(depth_path)
-                normal = load_pfm(normal_path)
+                    depth = load_depth(depth_path)
+                    normal = load_pfm(normal_path)
 
-                depth = depth * image_mask
-                normal = normal * image_mask[..., np.newaxis]
+                    depth = depth * image_mask
+                    normal = normal * image_mask[..., np.newaxis]
 
-            fovy = focal2fov(fov2focal(fovx, image.shape[0]), image.shape[1])
+            fovy = focal2fov(fov2focal(fovx, width), height)
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, image=image, image_mask=image_mask,
                                         image_path=image_path, depth=depth, normal=normal, image_name=image_name,
-                                        width=image.shape[1], height=image.shape[0]))
+                                        width=width, height=height))
 
             if debug and idx >= 5:
                 break
@@ -273,31 +288,34 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
     return cam_infos
 
 
-def readNerfSyntheticInfo(path, white_background, eval, extension=".png", debug=False):
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png", debug=False, read_cam_only=False):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, debug=debug)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension, debug=debug, read_cam_only=read_cam_only)
     if eval:
         print("Reading Test Transforms")
         test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension,
-                                                   debug=debug)
+                                                   debug=debug, read_cam_only=read_cam_only)
     else:
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "points3d.ply")
-    if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
-        num_pts = 100_000
-        print(f"Generating random point cloud ({num_pts})...")
+    pcd = None
+    ply_path = None
+    if not read_cam_only:
+        ply_path = os.path.join(path, "points3d.ply")
+        if not os.path.exists(ply_path):
+            # Since this data set has no colmap data, we start with random points
+            num_pts = 100_000
+            print(f"Generating random point cloud ({num_pts})...")
 
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-        shs = np.random.random((num_pts, 3)) / 255.0
-        normals = np.random.randn(*xyz.shape)
-        normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+            # We create random points inside the bounds of the synthetic Blender scenes
+            xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+            shs = np.random.random((num_pts, 3)) / 255.0
+            normals = np.random.randn(*xyz.shape)
+            normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
 
-        storePly(ply_path, xyz, SH2RGB(shs) * 255, normals)
+            storePly(ply_path, xyz, SH2RGB(shs) * 255, normals)
 
     try:
         pcd = fetchPly(ply_path)
@@ -313,7 +331,7 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png", debug=
     return scene_info
 
 
-def loadCamsFromScene(path, valid_list, white_background, debug):
+def loadCamsFromScene(path, valid_list, white_background, debug, read_cam_only=False):
     with open(f'{path}/sfm_scene.json') as f:
         sfm_scene = json.load(f)
 
@@ -355,40 +373,46 @@ def loadCamsFromScene(path, valid_list, white_background, debug):
 
             image_path = os.path.join(path, image_list[index])
             image_name = Path(image_path).stem
-
-            image = load_img_rgb(image_path)
-            mask_path = os.path.join(path + "/pmasks/", os.path.basename(image_list[index]).replace(os.path.splitext(image_list[index])[-1], ".png"))
-            
-            if os.path.exists(mask_path):
-                img_mask = load_mask_bool(mask_path)
-                # if pmask is available, mask the image for PSNR
-                image *= img_mask[..., np.newaxis]
+            if read_cam_only:
+                image = None
+                img_mask = None
+                width, height = get_img_size(image_path)
             else:
-                img_mask = np.ones_like(image[:, :, 0])
+                image = load_img_rgb(image_path)
+                width = image.shape[1]
+                height = image.shape[0]
+                mask_path = os.path.join(path + "/pmasks/", os.path.basename(image_list[index]).replace(os.path.splitext(image_list[index])[-1], ".png"))
+                
+                if os.path.exists(mask_path):
+                    img_mask = load_mask_bool(mask_path)
+                    # if pmask is available, mask the image for PSNR
+                    image *= img_mask[..., np.newaxis]
+                else:
+                    img_mask = np.ones_like(image[:, :, 0])
 
-            fovx = focal2fov(focal_length_x, image.shape[1])
-            fovy = focal2fov(focal_length_y, image.shape[0])
+            fovx = focal2fov(focal_length_x, width)
+            fovy = focal2fov(focal_length_y, height)
             if int(index) in valid_list:
                 image *= img_mask[..., np.newaxis]
                 test_cam_infos.append(CameraInfo(uid=index, R=R, T=T, FovY=fovy, FovX=fovx, fx=focal_length_x,
                                                  fy=focal_length_y, cx=ppx, cy=ppy, image=image,
                                                  image_path=image_path, image_name=image_name,
                                                  image_mask=img_mask,
-                                                 width=image.shape[1], height=image.shape[0]))
+                                                 width=width, height=height))
             else:
                 image *= img_mask[..., np.newaxis]
                 train_cam_infos.append(CameraInfo(uid=index, R=R, T=T, FovY=fovy, FovX=fovx, fx=focal_length_x,
                                                   fy=focal_length_y, cx=ppx, cy=ppy, image=image,
                                                   image_path=image_path, image_name=image_name,
                                                   image_mask=img_mask,
-                                                  width=image.shape[1], height=image.shape[0]))
+                                                  width=width, height=height))
         if debug and i >= 5:
             break
 
     return train_cam_infos, test_cam_infos, bbox_transform
 
 
-def readNeILFInfo(path, white_background, eval, debug=False):
+def readNeILFInfo(path, white_background, eval, debug=False, read_cam_only=False):
     validation_indexes = []
     # if "data_dtu" in path:
     if True:
@@ -402,7 +426,7 @@ def readNeILFInfo(path, white_background, eval, debug=False):
         print("Reading Test transforms")
 
     train_cam_infos, test_cam_infos, bbx_trans = loadCamsFromScene(
-        f'{path}/inputs', validation_indexes, white_background, debug)
+        f'{path}/inputs', validation_indexes, white_background, debug, read_cam_only=read_cam_only)
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -410,20 +434,23 @@ def readNeILFInfo(path, white_background, eval, debug=False):
     # if not os.path.exists(ply_path):
     org_ply_path = f'{path}/inputs/model/sparse.ply'
 
-    # scale sparse.ply
-    pcd = fetchPly(org_ply_path)
-    inv_scale_mat = np.linalg.inv(bbx_trans)  # [4, 4]
-    points = pcd.points
-    xyz = (np.concatenate([points, np.ones_like(points[:, :1])], axis=-1) @ inv_scale_mat.T)[:, :3]
-    normals = pcd.normals
-    colors = pcd.colors
-
-    storePly(ply_path, xyz, colors * 255, normals)
-
-    try:
-        pcd = fetchPly(ply_path)
-    except:
+    if read_cam_only:
         pcd = None
+    else:
+        # scale sparse.ply
+        pcd = fetchPly(org_ply_path)
+        inv_scale_mat = np.linalg.inv(bbx_trans)  # [4, 4]
+        points = pcd.points
+        xyz = (np.concatenate([points, np.ones_like(points[:, :1])], axis=-1) @ inv_scale_mat.T)[:, :3]
+        normals = pcd.normals
+        colors = pcd.colors
+
+        storePly(ply_path, xyz, colors * 255, normals)
+
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -433,7 +460,7 @@ def readNeILFInfo(path, white_background, eval, debug=False):
     return scene_info
 
 def readCamerasFromTransforms2(path, transformsfile, white_background, 
-                               extension=".png", benchmark_size = 512, debug=False):
+                               extension=".png", benchmark_size = 512, debug=False, read_cam_only=False):
     cam_infos = []
     
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -461,19 +488,26 @@ def readCamerasFromTransforms2(path, transformsfile, white_background,
             w2c = np.linalg.inv(c2w)
             R = np.transpose(w2c[:3, :3])
             T = w2c[:3, 3]
+            
+            if read_cam_only:
+                image = None
+                mask = None
+                width, height = get_img_size(image_path)
+            else:
+                image = load_img_rgb(image_path)
+                width = image.shape[1]
+                height = image.shape[0]
+                mask = load_mask_bool(mask_path).astype(np.float32)
+                image = cv2.resize(image, (benchmark_size, benchmark_size), interpolation=cv2.INTER_AREA)
+                mask = cv2.resize(mask, (benchmark_size, benchmark_size), interpolation=cv2.INTER_AREA)
+    
+                bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+                image = image * mask[..., None] + bg * (1 - mask[..., None])
 
-            image = load_img_rgb(image_path)
-            mask = load_mask_bool(mask_path).astype(np.float32)
-            image = cv2.resize(image, (benchmark_size, benchmark_size), interpolation=cv2.INTER_AREA)
-            mask = cv2.resize(mask, (benchmark_size, benchmark_size), interpolation=cv2.INTER_AREA)
-
-            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-            image = image * mask[..., None] + bg * (1 - mask[..., None])
-
-            fovy = focal2fov(fov2focal(fovx, image.shape[0]), image.shape[1])
+            fovy = focal2fov(fov2focal(fovx, width), height)
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, image=image, image_mask=mask,
                                         image_path=image_path, depth=None, normal=None, image_name=image_name,
-                                        width=image.shape[1], height=image.shape[0]))
+                                        width=width, height=height))
 
             if debug and idx >= 5:
                 break
@@ -481,40 +515,44 @@ def readCamerasFromTransforms2(path, transformsfile, white_background,
     return cam_infos
 
 
-def readStanfordORBInfo(path, white_background, eval, extension=".exr", benchmark_size = 512, debug=False):
+def readStanfordORBInfo(path, white_background, eval, extension=".exr", benchmark_size = 512, debug=False, read_cam_only=False):
     print("Reading Training Transforms")
     train_cam_infos = readCamerasFromTransforms2(path, "transforms_train.json", white_background, 
-                                                 extension, benchmark_size, debug=debug)
+                                                 extension, benchmark_size, debug=debug, read_cam_only=read_cam_only)
     if eval:
         print("Reading Test Transforms")
         test_cam_infos = readCamerasFromTransforms2(path, "transforms_test.json", white_background, 
-                                                    extension, benchmark_size, debug=debug)
+                                                    extension, benchmark_size, debug=debug, read_cam_only=read_cam_only)
     else:
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "points3d.ply")
-    if os.path.exists(ply_path):
-        os.remove(ply_path)
-        
-    # Since this data set has no colmap data, we start with random points
-    num_pts = 100_000
-    print(f"Generating random point cloud ({num_pts})...")
-
-    # We create random points inside the bounds of the synthetic Blender scenes
-    xyz = np.random.random((num_pts, 3)) * 1 - 0.5
-    # print(np.min(xyz), np.max(xyz))
-    shs = np.random.random((num_pts, 3)) / 255.0
-    normals = np.random.randn(*xyz.shape)
-    normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
-
-    storePly(ply_path, xyz, SH2RGB(shs) * 255, normals)
-
-    try:
-        pcd = fetchPly(ply_path)
-    except:
+    if read_cam_only:
         pcd = None
+        ply_path = None
+    else:
+        ply_path = os.path.join(path, "points3d.ply")
+        if os.path.exists(ply_path):
+            os.remove(ply_path)
+            
+        # Since this data set has no colmap data, we start with random points
+        num_pts = 100_000
+        print(f"Generating random point cloud ({num_pts})...")
+
+        # We create random points inside the bounds of the synthetic Blender scenes
+        xyz = np.random.random((num_pts, 3)) * 1 - 0.5
+        # print(np.min(xyz), np.max(xyz))
+        shs = np.random.random((num_pts, 3)) / 255.0
+        normals = np.random.randn(*xyz.shape)
+        normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+
+        storePly(ply_path, xyz, SH2RGB(shs) * 255, normals)
+
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
@@ -524,7 +562,7 @@ def readStanfordORBInfo(path, white_background, eval, extension=".exr", benchmar
 
     return scene_info
 
-def readCamerasFromTransforms3(path, transformsfile, white_background, extension=".png", debug=False):
+def readCamerasFromTransforms3(path, transformsfile, white_background, extension=".png", debug=False, read_cam_only=False):
     cam_infos = []
 
     with open(os.path.join(path, transformsfile)) as json_file:
@@ -549,16 +587,23 @@ def readCamerasFromTransforms3(path, transformsfile, white_background, extension
 
             bg = 1 if white_background else 0
             
-            image = load_img_rgb(image_path)
-            mask = load_mask_bool(mask_path).astype(np.float32)
+            if read_cam_only:
+                image = None
+                mask = None
+                width, height = get_img_size(image_path)
+            else:
+                image = load_img_rgb(image_path)
+                height, width = image.shape[2]
 
-            bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
-            image = image[..., :3] * mask[..., None] + bg * (1 - mask[..., None])
+                mask = load_mask_bool(mask_path).astype(np.float32)
 
-            fovy = focal2fov(fov2focal(fovx, image.shape[0]), image.shape[1])
+                bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+                image = image[..., :3] * mask[..., None] + bg * (1 - mask[..., None])
+
+            fovy = focal2fov(fov2focal(fovx, width), height)
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, image=image, image_mask=mask,
                                         image_path=image_path, image_name=image_name,
-                                        width=image.shape[1], height=image.shape[0]))
+                                        width=width, height=height))
 
             if debug and idx >= 5:
                 break
@@ -566,35 +611,38 @@ def readCamerasFromTransforms3(path, transformsfile, white_background, extension
     return cam_infos
 
 
-def readSynthetic4RelightInfo(path, white_background, eval, debug=False):
+def readSynthetic4RelightInfo(path, white_background, eval, debug=False, read_cam_only=False):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms3(path, "transforms_train.json", white_background, "_rgb.exr", debug=debug)
+    train_cam_infos = readCamerasFromTransforms3(path, "transforms_train.json", white_background, "_rgb.exr", debug=debug, read_cam_only=read_cam_only)
     if eval:
         print("Reading Test Transforms")
-        test_cam_infos = readCamerasFromTransforms3(path, "transforms_test.json", white_background, "_rgba.png", debug=debug)
+        test_cam_infos = readCamerasFromTransforms3(path, "transforms_test.json", white_background, "_rgba.png", debug=debug, read_cam_only=read_cam_only)
     else:
         test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
+    
+    pcd = None
+    ply_path = None
+    if not read_cam_only:
+        ply_path = os.path.join(path, "points3d.ply")
+        if not os.path.exists(ply_path):
+            # Since this data set has no colmap data, we start with random points
+            num_pts = 100_000
+            print(f"Generating random point cloud ({num_pts})...")
 
-    ply_path = os.path.join(path, "points3d.ply")
-    if not os.path.exists(ply_path):
-        # Since this data set has no colmap data, we start with random points
-        num_pts = 100_000
-        print(f"Generating random point cloud ({num_pts})...")
+            # We create random points inside the bounds of the synthetic Blender scenes
+            xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+            shs = np.random.random((num_pts, 3)) / 255.0
+            normals = np.random.randn(*xyz.shape)
+            normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
 
-        # We create random points inside the bounds of the synthetic Blender scenes
-        xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
-        shs = np.random.random((num_pts, 3)) / 255.0
-        normals = np.random.randn(*xyz.shape)
-        normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+            storePly(ply_path, xyz, SH2RGB(shs) * 255, normals)
 
-        storePly(ply_path, xyz, SH2RGB(shs) * 255, normals)
-
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

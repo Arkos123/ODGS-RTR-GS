@@ -26,14 +26,15 @@ import torch.nn.functional as F
 class Scene:
     gaussians: GaussianModel
 
-    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True,
-                 resolution_scales=[1.0]):
+    def __init__(self, args: ModelParams, gaussians: GaussianModel = None, load_iteration=None, shuffle=True,
+                 resolution_scales=[1.0], read_cam_only=False):
         """b
         :param path: Path to colmap scene main folder.
         """
-        self.model_path = args.model_path
+        self.model_path = None if read_cam_only else args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        source_path = args.source_path if read_cam_only else args.source_path
 
         if load_iteration:
             if load_iteration == -1:
@@ -45,36 +46,40 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
         
-        print(os.path.join(args.source_path, "transforms_train.json"))
+        print(os.path.join(source_path, "transforms_train.json"))
 
+        eval = True if read_cam_only else args.eval
+        debug = False if read_cam_only else args.debug_cuda
+        white_background = True if read_cam_only else args.white_background
+        
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval,
-                                                          debug=args.debug_cuda)
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        if os.path.exists(os.path.join(source_path, "sparse")):
+            scene_info = sceneLoadTypeCallbacks["Colmap"](source_path, None if read_cam_only else args.images, eval,
+                                                          debug=debug, read_cam_only=read_cam_only)
+        elif os.path.exists(os.path.join(source_path, "transforms_train.json")):
             
-            if "stanford_orb" in args.source_path:
+            if "stanford_orb" in source_path:
                 print("Found keyword stanford_orb, assuming Stanford ORB data set!")
-                scene_info = sceneLoadTypeCallbacks["StanfordORB"](args.source_path, args.white_background, args.eval, 
-                                                                   debug=args.debug_cuda)
-            elif "Synthetic4Relight" in args.source_path:
+                scene_info = sceneLoadTypeCallbacks["StanfordORB"](source_path, white_background, eval, 
+                                                                   debug=debug, read_cam_only=read_cam_only)
+            elif "Synthetic4Relight" in source_path:
                 print("Found transforms_train.json file, assuming Synthetic4Relight data set!")
-                scene_info = sceneLoadTypeCallbacks["Synthetic4Relight"](args.source_path, args.white_background, args.eval,
-                                                            debug=args.debug_cuda)
+                scene_info = sceneLoadTypeCallbacks["Synthetic4Relight"](source_path, white_background, eval,
+                                                            debug=debug, read_cam_only=read_cam_only)
             else:
                 print("Found transforms_train.json file, assuming Blender data set!")
-                scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, 
-                                                               debug=args.debug_cuda)
-        elif os.path.exists(os.path.join(args.source_path, "inputs/sfm_scene.json")):
+                scene_info = sceneLoadTypeCallbacks["Blender"](source_path, white_background, eval, 
+                                                               debug=debug, read_cam_only=read_cam_only)
+        elif os.path.exists(os.path.join(source_path, "inputs/sfm_scene.json")):
             print("Found sfm_scene.json file, assuming NeILF data set!")
-            scene_info = sceneLoadTypeCallbacks["NeILF"](args.source_path, args.white_background, args.eval,
-                                                         debug=args.debug_cuda)
+            scene_info = sceneLoadTypeCallbacks["NeILF"](source_path, white_background, eval,
+                                                         debug=debug, read_cam_only=read_cam_only)
         else:
             assert False, "Could not recognize scene type!"
 
-        if not self.loaded_iter:
+        if not self.loaded_iter and not read_cam_only:
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply"),
-                                                                   'wb') as dest_file:
+                                                                'wb') as dest_file:
                 dest_file.write(src_file.read())
             json_cams = []
             camlist = []
@@ -96,10 +101,10 @@ class Scene:
         for resolution_scale in resolution_scales:
             print("Loading Training Cameras")
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale,
-                                                                            args)
+                                                                            args, read_cam_only=read_cam_only)
             print("Loading Test Cameras")
             self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale,
-                                                                           args)
+                                                                           args, read_cam_only=read_cam_only)
 
         self.scene_info = scene_info
 

@@ -5,6 +5,7 @@ from arguments import OptimizationParams
 from pbr.shade import pbr_shading
 from scene.gaussian_model import GaussianModel
 from scene.cameras import Camera
+from utils.prt_utils import PRTutils
 from utils.sh_utils import eval_sh
 from utils.graphics_utils import linear2srgb_torch
 from .rtr_gs_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -13,13 +14,34 @@ from gs_ir import recon_occlusion
 
 def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                 scaling_modifier=1.0, override_color=None, is_training=False, dict_params=None):
-    
+    """_summary_
+
+    Args:
+        viewpoint_camera (Camera): _description_
+        pc (GaussianModel): _description_
+        pipe (_type_): _description_
+        bg_color (torch.Tensor): _description_
+        scaling_modifier (float, optional): _description_. Defaults to 1.0.
+        override_color (_type_, optional): _description_. Defaults to None.
+        is_training (bool, optional): _description_. Defaults to False.
+        dict_params (_type_, optional): _description_. Defaults to None.
+
+    Returns:
+        _type_: _description_
+    """
 
     gamma_func = lambda x : linear2srgb_torch(x)
 
-    cubemap = dict_params["cubemap"]
-    cubemap.eval()
-
+    # Setup environment maps
+    if pc.use_pbr:
+        cubemap = dict_params["cubemap"]
+        if is_training:
+            cubemap.train()
+            cubemap.build_mips()
+        else:
+            cubemap.eval()
+            # build_mips() should be called once before rendering
+            # Assuming it's already called during initialization
     
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
@@ -64,6 +86,16 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     depths = (xyz_homo @ viewpoint_camera.world_view_transform)[:, 2:3]
     depths2 = depths.square()
     
+    # PRT: Compute radiance transfer color if enabled
+    only_diffuse = False # dict_params["iteration"] < pipe.diffuse_iteration
+    if pipe.compute_with_prt:
+        net = dict_params.get("transfer_net", None)
+        viewdirs = F.normalize(viewpoint_camera.camera_center - means3D, dim=-1)
+        if only_diffuse:
+            override_color = PRTutils.cal_diffuse(pc)
+        else:
+            override_color = PRTutils.cal_color(pc, net, viewdirs, normal, is_training)
+    
 
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
@@ -77,8 +109,8 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         scales = pc.get_scaling
         rotations = pc.get_rotation
 
-
-    colors_precomp = torch.zeros_like(pc.get_base_color)
+    # Use PRT color if computed, otherwise use zero tensor
+    colors_precomp = override_color if override_color is not None else torch.zeros_like(pc.get_base_color)
 
 
     features = torch.cat([depths, depths2, normal], dim=-1) # [1, 1, 3]
@@ -86,9 +118,23 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     roughness = pc.get_roughness
     metallic = pc.get_metallic
 
-
-    incidents = pc.get_incidents  # incident shs
-    incidents_light = torch.clamp(eval_sh(pc.active_sh_degree, incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2), normal), 0.0, 1.0)
+    # Handle incident light for PBR - support relighting mode
+    if pc.use_pbr:
+        if not pipe.relight:
+            # Use trained incident light
+            incidents = pc.get_incidents
+            incidents_light = torch.clamp(eval_sh(pc.active_sh_degree, incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2), normal), 0.0, 1.0)
+        else:
+            # Relighting mode: either use transfer_light or zero out incident light
+            if pipe.transfer_light:
+                transfer_shs = pc.get_incidents.permute(0, 2, 1)
+                light_shs = cubemap.shs
+                incidents = light_shs * transfer_shs
+                incidents = incidents.permute(0, 2, 1)
+                incidents_light = torch.clamp(eval_sh(pc.active_sh_degree, incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2), normal), 0.0, 1.0)
+            else:
+                # For relighting, zero out incident light (will be computed by PBR shading)
+                incidents_light = torch.zeros_like(base_color)
 
     features = torch.cat([features, base_color, roughness, metallic, incidents_light], dim=-1) # [1, 1, 3, 3, 1, 1, 3]
 
@@ -146,7 +192,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
                 .contiguous()
             )  # [HW, 3]
         
-    if "occlusion_volumes" in dict_params.keys():
+    if "occlusion_volumes" in dict_params.keys() and dict_params.get("enable_occlusion", True):
         occlusion_volumes = dict_params["occlusion_volumes"]
         aabb = dict_params["aabb"]
         occlusion_map = recon_occlusion(
@@ -161,6 +207,15 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
                         aabb = aabb,
                         degree = occlusion_volumes["degree"],
                     ).reshape(H, W, 1)
+        
+        # # 调试：检查 occlusion_map 的值范围
+        # print("Occlusion map min:", occlusion_map.min().item())
+        # print("Occlusion map max:", occlusion_map.max().item())
+        # print("Occlusion map mean:", occlusion_map.mean().item())
+        
+        # 如果 occlusion_map 的值接近 1，说明没有阴影
+        if occlusion_map.mean().item() > 0.95:
+            print("Warning: Occlusion map is almost all 1 (no shadow effect)")
     else:
         occlusion_map = None
     
