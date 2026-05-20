@@ -476,7 +476,8 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument('--gui', action='store_true', default=False, help="use gui")
-    parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast'], default='render_ref')
+    parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast',
+                                                   'render_ref_equirect', 'render_ref_pbr_equirect'], default='render_ref')
     parser.add_argument("--test_interval", type=int, default=4000)
     parser.add_argument("--save_interval", type=int, default=30000)
     parser.add_argument("--skip_eval", action="store_true", default=False)
@@ -490,12 +491,18 @@ if __name__ == "__main__":
     print(f"Current rendering type:  {args.type}")
     print("Optimizing " + args.model_path)
 
+    # Equirect mode: force forward_shading for multi-pass compatibility
+    if args.type in ['render_ref_equirect', 'render_ref_pbr_equirect']:
+        args.equirect = True
+        args.forward_shading = True
+        print("Equirectangular mode enabled: forward_shading=True")
+
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    is_pbr = args.type in ['render_ref_pbr', 'render_ref_fast']
+    is_pbr = args.type in ['render_ref_pbr', 'render_ref_fast', 'render_ref_pbr_equirect']
     training(lp.extract(args), op.extract(args), pp.extract(args), is_pbr=is_pbr)
 
     # All done

@@ -75,6 +75,7 @@ class PipelineParams(ParamGroup):
         self.relight = False
         self.transfer_light = False
         self.editing_config_path = ""
+        self.equirect = False
         super().__init__(parser, "Pipeline Parameters")
 
 

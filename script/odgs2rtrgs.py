@@ -90,6 +90,10 @@ def convert_odgs_to_rtrgs(xyz, features_dc, features_extra, opacities, scales, r
     diffuse_transfer_dc = np.zeros((N, 1, 1), dtype=np.float32)
     diffuse_transfer_rest = np.zeros((N, n_sh_coeffs - 1, 1), dtype=np.float32)
 
+    # ODGS 使用各向同性缩放 [N, 1]，RTR-GS 使用各向异性缩放 [N, 3]
+    # 将各向同性缩放扩展为各向同性 x3（三维数值相同）
+    scales_expanded = np.repeat(scales, 3, axis=1) if scales.shape[1] == 1 else scales
+
     # 拼接所有属性：顺序需与 construct_list_of_attributes 保持一致
     attributes_list = [
         xyz,                                              # 3
@@ -104,7 +108,7 @@ def convert_odgs_to_rtrgs(xyz, features_dc, features_extra, opacities, scales, r
         diffuse_transfer_dc.reshape(N, -1),               # 1
         diffuse_transfer_rest.reshape(N, -1),             # (d+1)² - 1
         opacities.reshape(N, -1),                         # 1
-        scales,                                           # 3
+        scales_expanded,                                  # 3 (由 [N,1] 扩展为 [N,3])
         rots,                                             # 4
     ]
 

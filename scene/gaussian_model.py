@@ -46,7 +46,7 @@ class GaussianModel:
 
     def __init__(self, sh_degree: int, render_type='render'):
         self.render_type = render_type
-        self.use_pbr = render_type in ['render_ref_pbr', 'render_fast']
+        self.use_pbr = render_type in ['render_ref_pbr', 'render_fast', 'render_ref_pbr_equirect']
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree
         self._xyz = torch.empty(0)

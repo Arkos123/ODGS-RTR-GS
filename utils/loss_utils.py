@@ -29,7 +29,7 @@ def create_window(window_size, channel):
     return window
 
 
-def ssim(img1, img2, window_size=11, size_average=True):
+def ssim(img1, img2, window_size=11, size_average=True, ws_map=None):
     channel = img1.size(-3)
     window = create_window(window_size, channel)
 
@@ -37,10 +37,10 @@ def ssim(img1, img2, window_size=11, size_average=True):
         window = window.cuda(img1.get_device())
     window = window.type_as(img1)
 
-    return _ssim(img1, img2, window, window_size, channel, size_average)
+    return _ssim(img1, img2, window, window_size, channel, size_average, ws_map=ws_map)
 
 
-def _ssim(img1, img2, window, window_size, channel, size_average=True):
+def _ssim(img1, img2, window, window_size, channel, size_average=True, ws_map=None):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)
     mu2 = F.conv2d(img2, window, padding=window_size // 2, groups=channel)
 
@@ -57,10 +57,18 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
 
-    if size_average:
-        return ssim_map.mean()
+    if ws_map is not None:
+        ws_map = ws_map.unsqueeze(0) if ws_map.dim() == 2 else ws_map
+        ws_ssim = (ssim_map * ws_map).sum() / ws_map.sum()
+        if size_average:
+            return ssim_map.mean(), ws_ssim
+        else:
+            return ssim_map.mean(1).mean(1).mean(1), ws_ssim
     else:
-        return ssim_map.mean(1).mean(1).mean(1)
+        if size_average:
+            return ssim_map.mean()
+        else:
+            return ssim_map.mean(1).mean(1).mean(1)
 
 
 def cal_gradient(data):
@@ -115,3 +123,21 @@ def tv_loss(depth):
     h_tv = torch.square(depth[..., 1:, :] - depth[..., :-1, :]).mean()
     w_tv = torch.square(depth[..., :, 1:] - depth[..., :, :-1]).mean()
     return h_tv + w_tv
+
+
+def est_wsmap(img):
+    """生成等距柱状投影的纬度权重图 (cosine latitude weights)
+
+    对 equirectangular 图像，位于赤道（中间行）的像素权重为 1.0，
+    位于两极（顶部/底部行）的像素权重接近 0.0。
+    用于 WS-PSNR / WS-SSIM 等纬度加权指标。
+
+    Args:
+        img: [C, H, W] 或 [1, C, H, W] 的图像张量
+    Returns:
+        ws_map: [1, H, W] 的权重图
+    """
+    H = img.shape[-2]
+    row = torch.arange(H, device=img.device).float()
+    ws_map = torch.cos((row + 0.5 - H / 2) * torch.pi / H).reshape(1, H, 1)
+    return ws_map.expand(-1, -1, img.shape[-1])
