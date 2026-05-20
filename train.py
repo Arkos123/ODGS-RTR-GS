@@ -46,6 +46,10 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         print("Create Gaussians from checkpoint {}".format(args.checkpoint))
         first_iter = gaussians.create_from_ckpt(args.checkpoint, restore_optimizer=True)
 
+    elif args.ply_checkpoint:
+        print("Loading Gaussian geometry from PLY checkpoint: {}".format(args.ply_checkpoint))
+        gaussians.load_ply(args.ply_checkpoint)
+
     elif scene.loaded_iter:
         gaussians.load_ply(os.path.join(dataset.model_path,
                                         "point_cloud",
@@ -484,6 +488,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_interval", type=int, default=30000)
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
+    parser.add_argument("--ply_checkpoint", type=str, default=None,
+                        help="Path to a .ply file with pre-trained Gaussian geometry (e.g. converted from ODGS)")
     parser.add_argument("--occlusion_path", type=str, default=None)
 
     args = parser.parse_args(sys.argv[1:])
