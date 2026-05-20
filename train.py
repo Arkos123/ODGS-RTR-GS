@@ -81,8 +81,9 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         pbr_kwargs["transfer_net"] = transfer_net
 
     if is_pbr or pipe.ref_map:
-        canonical_rays = scene.get_canonical_rays()
-        pbr_kwargs["canonical_rays"] = canonical_rays
+        if not pipe.equirect:
+            canonical_rays = scene.get_canonical_rays()
+            pbr_kwargs["canonical_rays"] = canonical_rays
         brdf_lut = get_brdf_lut().cuda()
         pbr_kwargs["brdf_lut"] = brdf_lut
 
