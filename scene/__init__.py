@@ -74,6 +74,10 @@ class Scene:
             print("Found sfm_scene.json file, assuming NeILF data set!")
             scene_info = sceneLoadTypeCallbacks["NeILF"](source_path, white_background, eval,
                                                          debug=debug, read_cam_only=read_cam_only)
+        elif os.path.exists(os.path.join(source_path, "data_extrinsics.json")):
+            print("Found data_extrinsics.json file, assuming OpenMVG equirectangular data set!")
+            scene_info = sceneLoadTypeCallbacks["OpenMVG"](source_path, white_background, eval,
+                                                           debug=debug, read_cam_only=read_cam_only)
         else:
             assert False, "Could not recognize scene type!"
 

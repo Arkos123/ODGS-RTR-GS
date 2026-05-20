@@ -537,7 +537,7 @@ class GaussianModel:
         for i in range(self._specular_tint.shape[1]):
             l.append('specular_tint_{}'.format(i))
         for i in range(self._ref_tint.shape[1]):
-            l.append('ref_tint{}'.format(i))
+            l.append('ref_tint_{}'.format(i))
         l.append('ref_strength')
         l.append('ref_roughness')
 
@@ -716,7 +716,7 @@ class GaussianModel:
             specular_tint[:, idx] = np.asarray(plydata.elements[0][attr_name])
         
         ref_strength = np.asarray(plydata.elements[0]["ref_strength"])[..., np.newaxis]
-        ref_roughness = np.asarray(plydata.elements[0]["ref_strength"])[..., np.newaxis]
+        ref_roughness = np.asarray(plydata.elements[0]["ref_roughness"])[..., np.newaxis]
 
 
         ref_tint_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("ref_tint")]
@@ -732,18 +732,18 @@ class GaussianModel:
             specular_feature[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         diffuse_transfer_dc = np.zeros((xyz.shape[0], 1, 1))
-        diffuse_transfer_dc[:, 0, 0] = np.asarray(plydata.elements[0]["incidents_dc_0"])
+        diffuse_transfer_dc[:, 0, 0] = np.asarray(plydata.elements[0]["diffuse_transfer_dc_0"])
 
         extra_diffuse_transfer_names = [p.name for p in plydata.elements[0].properties if
                                  p.name.startswith("diffuse_transfer_rest_")]
         extra_diffuse_transfer_names = sorted(extra_diffuse_transfer_names, key=lambda x: int(x.split('_')[-1]))
         assert len(extra_diffuse_transfer_names) == 1 * (self.max_sh_degree + 1) ** 2 - 1
         diffuse_transfer_extra = np.zeros((xyz.shape[0], len(extra_diffuse_transfer_names)))
-        for idx, attr_name in enumerate(extra_incidents_names):
+        for idx, attr_name in enumerate(extra_diffuse_transfer_names):
             diffuse_transfer_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        diffuse_transfer_extra = diffuse_transfer_extra.reshape((incidents_extra.shape[0], 1, (self.max_sh_degree + 1) ** 2 - 1))
+        diffuse_transfer_extra = diffuse_transfer_extra.reshape((diffuse_transfer_extra.shape[0], 1, (self.max_sh_degree + 1) ** 2 - 1))
 
 
 
@@ -776,10 +776,10 @@ class GaussianModel:
         self._ref_roughness = nn.Parameter(torch.tensor(ref_roughness, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._specular_feature = nn.Parameter(torch.tensor(specular_feature, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._diffuse_transfer_dc = nn.Parameter(torch.tensor(incidents_dc, dtype=torch.float, device="cuda").transpose(
+        self._diffuse_transfer_dc = nn.Parameter(torch.tensor(diffuse_transfer_dc, dtype=torch.float, device="cuda").transpose(
                 1, 2).contiguous().requires_grad_(True))
         self._diffuse_transfer_rest = nn.Parameter(
-            torch.tensor(incidents_extra, dtype=torch.float, device="cuda").transpose(
+            torch.tensor(diffuse_transfer_extra, dtype=torch.float, device="cuda").transpose(
                 1, 2).contiguous().requires_grad_(True))
 
         self.active_sh_degree = self.max_sh_degree

@@ -5,6 +5,7 @@ import json
 import numpy as np
 
 from typing import NamedTuple
+from PIL import Image
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
     read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
 from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
@@ -652,10 +653,128 @@ def readSynthetic4RelightInfo(path, white_background, eval, debug=False, read_ca
 
     return scene_info
 
+
+def readCamerasFromOpenMVG(path, extrinsicsfile, cam_dict, white_background, read_cam_only=False):
+    """读取 OpenMVG 格式的全景图相机数据（等距柱状投影）
+
+    Args:
+        path: 数据集根目录
+        extrinsicsfile: data_extrinsics.json
+        cam_dict: 相机 key → 文件名的映射
+        white_background: 是否使用白色背景
+        read_cam_only: 是否仅读取相机信息（不加载图像）
+    """
+    cam_infos = []
+    fovx = 3.13768641  # 等距柱状全景图的水平视场角 ≈ π
+
+    with open(os.path.join(path, extrinsicsfile)) as json_file:
+        contents = json.load(json_file)
+        frames = contents["extrinsics"]
+        for idx, frame in enumerate(frames):
+            cam_key = frame["key"]
+            cam_name = os.path.join('images', cam_dict[cam_key])
+
+            # OpenMVG: rotation 是世界→相机旋转, center 是相机在世界坐标系中的位置
+            # 需要转换为 R (相机→世界转置) 和 T (平移)
+            R = np.array(frame["value"]["rotation"]).T
+            T = -np.array(frame["value"]["rotation"]) @ np.array(frame["value"]["center"])
+
+            image_path = os.path.join(path, cam_name)
+            image_name = Path(cam_name).stem
+
+            if read_cam_only:
+                image = None
+                width, height = get_img_size(image_path)
+            else:
+                image_pil = Image.open(image_path)
+                im_data = np.array(image_pil.convert("RGBA"))
+                bg = np.array([1, 1, 1]) if white_background else np.array([0, 0, 0])
+                norm_data = im_data / 255.0
+                image = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+                width = image.shape[1]
+                height = image.shape[0]
+
+            fovy = focal2fov(fov2focal(fovx, width), height)
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx,
+                                        image=image, image_path=image_path, image_name=image_name,
+                                        width=width, height=height))
+
+    return cam_infos
+
+
+def readOpenMVGInfo(path, white_background, eval, debug=False, read_cam_only=False):
+    """读取 OpenMVG 格式的全景图数据集（等距柱状投影）
+
+    数据集目录需要包含:
+        data_views.json        — 视图信息，包含 key → 文件名 的映射
+        data_extrinsics.json   — 外参（相机位姿）
+        train.txt / test.txt   — 训练/测试集划分
+        pcd.ply / colorized.ply — 初始点云
+    """
+    print("Reading OpenMVG equirectangular data")
+
+    my_views = os.path.join(path, "data_views.json")
+    camfile_dict = {}
+    with open(my_views) as views:
+        json_views = json.load(views)
+        camview_list = json_views["views"]
+        for camview in camview_list:
+            camfile_dict[camview["key"]] = camview["value"]["ptr_wrapper"]["data"]["filename"]
+
+    cam_infos_unsorted = readCamerasFromOpenMVG(path, "data_extrinsics.json", camfile_dict,
+                                                 white_background, read_cam_only=read_cam_only)
+    cam_infos = sorted(cam_infos_unsorted.copy(), key=lambda x: x.image_name)
+
+    try:
+        train_file = os.path.join(path, 'train.txt')
+        test_file = os.path.join(path, 'test.txt')
+        with open(train_file, 'r') as f:
+            train_name_list = f.read().splitlines()
+        with open(test_file, 'r') as f:
+            test_name_list = f.read().splitlines()
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if c.image_name in train_name_list]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if c.image_name in test_name_list]
+
+    except Exception as e:
+        raise AssertionError(f"Please specify train/test split files (train.txt, test.txt): {e}")
+
+    print(f"# of Train: {len(train_cam_infos)}, \t# of Test: {len(test_cam_infos)}")
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    pcd = None
+    ply_path = None
+    if not read_cam_only:
+        if os.path.exists(os.path.join(path, "pcd.ply")):
+            ply_path = os.path.join(path, "pcd.ply")
+        elif os.path.exists(os.path.join(path, "colorized.ply")):
+            ply_path = os.path.join(path, "colorized.ply")
+        else:
+            raise FileNotFoundError(f"No initial point cloud found in {path}. "
+                                    f"Expected pcd.ply or colorized.ply")
+
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender": readNerfSyntheticInfo,
     "Synthetic4Relight": readSynthetic4RelightInfo,
     "NeILF": readNeILFInfo,
     "StanfordORB": readStanfordORBInfo,
+    "OpenMVG": readOpenMVGInfo,
 }
