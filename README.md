@@ -1,117 +1,262 @@
-# RTR-GS: 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection  (MM 2025)
+# RTR-GS + ODGS Unified Workspace
 
-### <p align="center">  [🖨️ArXiv]([](https://arxiv.org/pdf/2507.07733)) | [📰Paper]([](https://dl.acm.org/doi/abs/10.1145/3746027.3755197))</p>
+This repository integrates two projects in a single unified environment:
 
-<p align="center">
-<a target="_blank">Yongyang Zhou<sup>1</sup></a>, <a target="_blank">Fanglue Zhang<sup>2</sup></a>, <a target="_blank">Zichen Wang<sup>1</sup></a>, <a target="_blank">Lei Zhang<sup>1</sup></a>, </i></sup></a></h5> <br><sup>1</sup>Beijing Institute of Technology <sup>2</sup>Victoria University of Wellington 
-</p>
+| Project | Description | Reference |
+|---------|-------------|-----------|
+| **RTR-GS** | 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection | MM 2025 |
+| **ODGS** (submodule) | Omnidirectional 3D Gaussian Splatting for 360-degree equirectangular images | NeurIPS 2024 |
 
+- Original RTR-GS README: [README_orig_RTR-GS.md](README_orig_RTR-GS.md)
+- Original ODGS README/CLAUDE: [submodules/odgs/CLAUDE.md](submodules/odgs/CLAUDE.md)
 
-This is official implement of RTR-GS for the paper *RTR-GS: 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection*.
-
-![teaser](./teaser.png)
-
-### Installation
-
-#### Clone this repo
-
-```shell
-git clone https://github.com/ZyyZyy06/RTR-GS.git
-```
-
-#### Install dependencies
-
-```shell
-# install environment
-conda env create --file environment.yml
-conda activate rtr-gs
-
-# install pytorch=1.12.1
-conda install pytorch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1 cudatoolkit=11.6 -c pytorch -c conda-forge
-
-# install torch_scatter==2.1.1
-pip install torch_scatter==2.1.1
-
-# install kornia==0.6.12
-pip install kornia==0.6.12
-
-# install nvdiffrast=0.3.1
-git clone https://github.com/NVlabs/nvdiffrast
-pip install ./nvdiffrast
-```
-
-#### Install the pytorch extensions
-
-We recommend that users compile the extension with CUDA 11.6 to avoid the potential problems.
-
-```shell
-# install knn-cuda
-pip install ./submodules/simple-knn
-
-# install rtr-gs-rasterization
-pip install ./submodules/rtr_gs-rasterization
-
-# install baking module from gs-ir
-pip install ./submodules/gs-ir
-pip install ./submodules/diff-gaussian-rasterization
-# or
-cd ./submodules/diff-gaussian-rasterization
-python setup.py develop
-```
-
-**## Dataset**
-
-We evaluate our method on [TensoIR-Synthetic](https://zenodo.org/records/7880113#.ZE68FHZBz18), [Shiny Blender Sysnthetic](https://storage.googleapis.com/gresearch/refraw360/ref.zip)，[Shiny Blender Real](https://storage.googleapis.com/gresearch/refraw360/ref_real.zip), and [Stanford ORB]([GitHub - StanfordORB/Stanford-ORB: Official Repository of the Stanford-ORB dataset](https://github.com/StanfordORB/Stanford-ORB))  datasets. We regenerated the Shiny Blender Synthetic dataset from the original Blender files for our relighting tests, keeping the format consistent.
-
-
-
-### Running
-
-We run the code in a single NVIDIA GeForce RTX 3090 GPU (24G). We have written corresponding run scripts for different datasets, including training, testing, relighting, and more. For example, if you want to test on the TensoIR dataset, please edit the $root\_dir$  and output_path in $script/run\_synthetic.sh$, and run the following command:
-
-```sh
-# For TensoIR or ShinyBlender Synthetic
-sh script/run_synthetic.sh
-# For Mipnerf360 or Shiny Blender Real
-sh script/run_real_scene.sh
-```
-
-We have written all the commands for training, baking, evaluation, and re lighting evaluation in the script.
-
-Here are explanations of some important control parameters：
-
-```sh
---compute_with_prt #using prt to instead of sh.
---ref_map #using reflection map
--t #render_ref(Hybrid rendering model) render_ref_pbr(Add pbr branch)
-```
-
-
-
-### Trying on your own data
-
-We recommend that users reorganize their own data as nerf-synthetic dataset and then optimize.
-
-### Citation
-
-If you find our work useful in your research, please be so kind to cite:
+## Directory Structure
 
 ```
+RTR-GS/
+├── submodules/
+│   ├── simple-knn/                     # KNN density estimation (shared by both projects)
+│   ├── rtr_gs-rasterization/           # RTR-GS CUDA rasterizer (PRT + reflection)
+│   ├── gs-ir/                          # Irradiance / occlusion CUDA kernels
+│   ├── diff-gaussian-rasterization/    # RTR-GS's modified diff rasterizer
+│   └── odgs/                           # ODGS submodule
+│       └── submodules/
+│           ├── odgs-gaussian-rasterization/  # ODGS equirectangular CUDA rasterizer
+│           └── simple-knn/                   # (ignored, use the shared one above)
+├── environment.yml                     # Unified conda environment (name: odgs-rtr)
+├── README.md                           # This file
+└── README_orig_RTR-GS.md               # Original RTR-GS documentation
+```
+
+## Prerequisites
+
+- Linux (tested on Ubuntu)
+- NVIDIA GPU with CUDA 11.8 support (e.g. RTX 3090, A100, etc.)
+- NVIDIA driver supporting CUDA 11.8 (driver version >= 520)
+- Conda (Miniconda or Anaconda)
+- GCC (for compiling CUDA extensions)
+
+## Installation
+
+### Step 1: Clone with submodules
+
+```bash
+git clone <your-repo-url> RTR-GS
+cd RTR-GS
+
+# Initialize all submodules recursively
+git submodule update --init --recursive
+```
+
+Note: ODGS's `submodules/simple-knn/` is intentionally left empty. The shared `simple-knn` at `submodules/simple-knn/` is used instead.
+
+### Step 2: Create conda environment
+
+```bash
+conda env create -f environment.yml
+conda activate odgs-rtr
+```
+
+### Step 3: Install extra pip packages
+
+Some packages require manual installation with specific version pins.
+
+#### kornia (needed by RTR-GS for image filtering)
+
+```bash
+pip install kornia==0.7.3
+```
+
+#### torch-scatter (needed by RTR-GS)
+
+```bash
+pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
+```
+
+#### nvdiffrast (needed by RTR-GS for differentiable rendering)
+
+> **Compatibility note**: PyTorch 2.1.2 requires `setuptools<70` for its CUDA extension build system.
+> The `pip install "setuptools<70"` step below ensures this.
+
+```bash
+pip install "setuptools<70" wheel ninja
+git clone https://github.com/NVlabs/nvdiffrast.git /tmp/nvdiffrast
+pip install /tmp/nvdiffrast --no-build-isolation
+rm -rf /tmp/nvdiffrast
+```
+
+#### protobuf (fix tensorboard compatibility)
+
+> `environment.yml` installs `tensorboard=2.10.0`, which requires an older protobuf version.
+> Without this fix, running ODGS or RTR-GS training will fail with:
+> `TypeError: Descriptors cannot be created directly.`
+
+```bash
+pip install "protobuf>=3.20,<4"
+```
+
+### Step 4: Compile CUDA extensions
+
+All CUDA extensions must be compiled for the current PyTorch + CUDA version. Compile in this order:
+
+> **Note**: All `pip install .` commands below use `--no-build-isolation` to ensure
+> the build process can access PyTorch and CUDA from the current environment.
+
+```bash
+# (4a) simple-knn – shared by both projects, install only once
+cd submodules/simple-knn
+pip install . --no-build-isolation
+cd ../..
+
+# (4b) RTR-GS extensions
+cd submodules/rtr_gs-rasterization
+pip install . --no-build-isolation
+cd ../..
+
+cd submodules/gs-ir
+pip install . --no-build-isolation
+cd ../..
+
+cd submodules/diff-gaussian-rasterization
+pip install . --no-build-isolation
+cd ../..
+
+# (4c) ODGS extension – equirectangular rasterizer
+cd submodules/odgs/submodules/odgs-gaussian-rasterization
+pip install . --no-build-isolation
+cd ../../..
+
+cd submodules/odgs/submodules
+# 如果没有需下载
+git clone https://github.com/Cekavis/diff-gaussian-rasterization-pinhole.git
+cd diff-gaussian-rasterization-pinhole
+pip install . --no-build-isolation
+cd ../..
+
+```
+
+### Step 5: Verify installation
+
+```bash
+conda activate odgs-rtr
+
+python -c "
+import torch
+print(f'PyTorch {torch.__version__}, CUDA {torch.version.cuda}, Available: {torch.cuda.is_available()}')
+
+import simple_knn
+print('simple_knn: OK')
+
+import rtr_gs_rasterization
+print('rtr_gs_rasterization: OK')
+
+import gs_ir
+print('gs_ir: OK')
+
+import diff_gaussian_rasterization
+print('diff_gaussian_rasterization: OK')
+
+import odgs_gaussian_rasterization
+print('odgs_gaussian_rasterization: OK')
+
+import nvdiffrast.torch as dr
+print('nvdiffrast: OK')
+
+from torch_scatter import scatter
+print('torch_scatter: OK')
+"
+```
+
+## Usage
+
+### RTR-GS: Training + Inverse Rendering
+
+Refer to the original documentation in [README_orig_RTR-GS.md](README_orig_RTR-GS.md) for full details.
+
+#### Stage 1 – Geometry and Reflection (30k iterations)
+
+```bash
+python train.py --eval \
+    -s <data_path> \
+    -m <output_path>/stage1 \
+    --lambda_mask_entropy 0.1 \
+    --diffuse_iteration 3000 \
+    --ref_map \
+    --skip_eval \
+    -t render_ref \
+    --compute_with_prt
+```
+
+#### Bake occlusion volumes
+
+```bash
+python baking.py \
+    --checkpoint <output_path>/stage1/checkpoint/chkpnt30000.pth \
+    --bound 1.5 \
+    --occlu_res 128
+```
+
+#### Stage 2 – PBR Refinement (40k iterations)
+
+```bash
+python train.py --eval \
+    -s <data_path> \
+    -m <output_path>/stage2 \
+    -c <output_path>/stage1/checkpoint/chkpnt30000.pth \
+    --occlusion_path <output_path>/stage1/checkpoint/occlusion_volumes.pth \
+    --iterations 40000 \
+    --ref_map \
+    -t render_ref_pbr \
+    --compute_with_prt
+```
+
+### ODGS: Omnidirectional Training
+
+ODGS is located at `submodules/odgs/`. Run training from the repo root:
+
+```bash
+# Train
+cd submodules/odgs
+python train.py -s <dataset_path> -m <output_path> --eval
+cd ../..
+
+# Render omnidirectional (equirectangular)
+cd submodules/odgs
+python render.py -m <output_path> --iteration <N>
+cd ../..
+
+# Render perspective (pinhole projection)
+cd submodules/odgs
+python render_perspective.py -m <output_path> --iteration <N>
+cd ../..
+```
+
+## Environment Details
+
+| Component | Version |
+|-----------|---------|
+| Python | 3.10 |
+| PyTorch | 2.1.2 (CUDA 11.8) |
+| CUDA Toolkit | 11.8 |
+| simple-knn | Compiled from source |
+| odgs-gaussian-rasterization | Compiled from source |
+| rtr_gs-rasterization | Compiled from source |
+| gs-ir | Compiled from source |
+| diff-gaussian-rasterization | Compiled from source |
+| nvdiffrast | Compiled from source |
+
+## Citation
+
+If you use RTR-GS, please cite:
+
+```bibtex
 @inproceedings{10.1145/3746027.3755197,
-author = {Zhou, Yongyang and Zhang, Fanglue and Wang, Zichen and Zhang, Lei},
-title = {RTR-GS: 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection},
-year = {2025},
-isbn = {9798400720352},
-publisher = {Association for Computing Machinery},
-address = {New York, NY, USA},
-url = {https://doi.org/10.1145/3746027.3755197},
-doi = {10.1145/3746027.3755197},
-abstract = {3D Gaussian Splatting (3DGS) has demonstrated impressive capabilities in novel view synthesis. However, rendering reflective objects remains a significant challenge, particularly in inverse rendering and relighting. We introduce RTR-GS, a novel inverse rendering framework capable of robustly rendering objects with arbitrary reflectance properties, decomposing BRDF and lighting, and delivering credible relighting results. Given a collection of multi-view images, our method effectively recovers geometric structure through a hybrid rendering model that combines forward rendering for radiance transfer with deferred rendering for reflections. This approach successfully separates high-frequency and low-frequency appearances, mitigating floating artifacts caused by spherical harmonic overfitting when handling high-frequency details. We further refine BRDF and lighting decomposition using an additional physically-based deferred rendering branch. Experimental results show that our method enhances novel view synthesis, normal estimation, decomposition, and relighting while maintaining efficient training inference process.},
-booktitle = {Proceedings of the 33rd ACM International Conference on Multimedia},
-pages = {6888–6897},
-numpages = {10},
-keywords = {gaussian splatting, novel view synthesis, relighting},
-location = {Dublin, Ireland},
-series = {MM '25}
+    author = {Zhou, Yongyang and Zhang, Fanglue and Wang, Zichen and Zhang, Lei},
+    title = {RTR-GS: 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection},
+    year = {2025},
+    booktitle = {Proceedings of the 33rd ACM International Conference on Multimedia},
+    pages = {6888–6897}
 }
 ```
+
+If you use ODGS, please cite the ODGS NeurIPS 2024 paper accordingly.
