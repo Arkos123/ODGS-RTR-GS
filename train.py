@@ -491,13 +491,12 @@ if __name__ == "__main__":
     print(f"Current rendering type:  {args.type}")
     print("Optimizing " + args.model_path)
 
-    # Equirect mode: force forward_shading, disable densification, skip CUDA pseudo-normal losses
+    # Equirect mode: force forward_shading, disable densification
     if args.type in ['render_ref_equirect', 'render_ref_pbr_equirect']:
         args.equirect = True
         args.forward_shading = True
         args.densify_until_iter = 0
         args.densify_from_iter = 30000
-        args.lambda_normal_render_depth = 0.0
         print("Equirectangular mode enabled: forward_shading=True, densification disabled")
 
     # Initialize system state (RNG)

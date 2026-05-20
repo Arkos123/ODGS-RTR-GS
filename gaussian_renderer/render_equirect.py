@@ -2,12 +2,13 @@ import math
 import torch
 import torch.nn.functional as F
 from arguments import OptimizationParams
+from kornia.filters import spatial_gradient
 from pbr.shade import get_reflectance_color_forward, pbr_shading
 from scene.gaussian_model import GaussianModel
 from scene.cameras import Camera
 from utils.prt_utils import PRTutils
 from utils.sh_utils import eval_sh
-from utils.loss_utils import ssim, first_order_edge_aware_loss, est_wsmap
+from utils.loss_utils import ssim, tv_loss, first_order_edge_aware_loss, est_wsmap
 from utils.image_utils import psnr
 from utils.graphics_utils import linear2srgb_torch
 from odgs_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -42,6 +43,17 @@ def _run_odgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, ro
         rotations=rotations,
         cov3D_precomp=cov3D_precomp,
     )
+
+
+def _compute_pseudo_normal(depth, rendered_opacity, c2w):
+    depth_exp = depth / rendered_opacity.clamp_min(1e-5)
+    depth_exp = torch.nan_to_num(depth_exp, 0, 0)
+    grad = spatial_gradient(depth_exp.unsqueeze(0), order=1)[0, 0]
+    dzdx, dzdy = grad[1], grad[0]
+    n_cam = torch.stack([-dzdx, -dzdy, torch.ones_like(dzdx)], dim=0)
+    n_cam = F.normalize(n_cam, dim=0)
+    n_world = (c2w[:3, :3] @ n_cam.reshape(3, -1)).reshape(3, depth.shape[-2], depth.shape[-1])
+    return F.normalize(n_world, dim=0)
 
 
 def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
@@ -150,6 +162,9 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     )
     rendered_opacity = acc
     visibility_filter = radii > 0
+
+    # ---- Pseudo-normal from depth gradient ----
+    pseudo_normal = _compute_pseudo_normal(depth, rendered_opacity, c2w)
 
     # ---- Alpha normalization mask for multi-pass outputs ----
     alpha_mask = (rendered_opacity > 0).float()  # [1, H, W]
@@ -283,6 +298,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         "depth": depth,
         "normal": rendered_normal,
         "opacity": rendered_opacity,
+        "pseudo_normal": pseudo_normal,
         "ref_roughness": rendered_ref_roughness_map,
         "ref_strength": rendered_ref_strength_map,
         "viewspace_points": screenspace_points,
@@ -369,6 +385,19 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
                 rendered_ref_strength * image_mask, gt_image)
             tb_dict["loss_ref_strength_smooth"] = loss_ref_strength_smooth.item()
             loss = loss + opt.lambda_ref_strength_smooth * loss_ref_strength_smooth
+
+    if opt.lambda_normal_render_depth > 0:
+        rendered_normal = results["normal"]
+        pseudo_normal = results["pseudo_normal"]
+        loss_normal_render_depth = F.mse_loss(rendered_normal, pseudo_normal.detach())
+        tb_dict["loss_normal_render_depth"] = loss_normal_render_depth.item()
+        loss = loss + opt.lambda_normal_render_depth * loss_normal_render_depth
+
+    if opt.lambda_normal_smooth > 0:
+        rendered_normal = results["normal"]
+        loss_normal_smooth = tv_loss(rendered_normal)
+        tb_dict["loss_normal_smooth"] = loss_normal_smooth.item()
+        loss = loss + opt.lambda_normal_smooth * loss_normal_smooth
 
     if pc.use_pbr:
         rendered_pbr = results["pbr"]
