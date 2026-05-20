@@ -7,7 +7,7 @@ from scene.gaussian_model import GaussianModel
 from scene.cameras import Camera
 from utils.prt_utils import PRTutils
 from utils.sh_utils import eval_sh
-from utils.loss_utils import ssim, tv_loss, first_order_edge_aware_loss, est_wsmap
+from utils.loss_utils import ssim, first_order_edge_aware_loss, est_wsmap
 from utils.image_utils import psnr
 from utils.graphics_utils import linear2srgb_torch
 from odgs_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -30,8 +30,6 @@ def _compute_equirect_ray_dirs(H, W, device='cuda'):
 
 def _run_odgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, rotations,
                          rasterizer, shs=None, cov3D_precomp=None):
-    if shs is None:
-        shs = torch.Tensor([]).cuda()
     if cov3D_precomp is None:
         cov3D_precomp = torch.Tensor([]).cuda()
     return rasterizer(
@@ -161,18 +159,17 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     colors_precomp_normal = normal * 0.5 + 0.5
     rendered_normal_img, _, _, _, _, _, _ = _run_odgs_rasterizer(
         means3D, means2D, colors_precomp_normal, opacity, scales_odgs, rotations,
-        rasterizer, shs=torch.Tensor([]).cuda(), cov3D_precomp=cov3D_precomp,
+        rasterizer, cov3D_precomp=cov3D_precomp,
     )
     rendered_normal_img = rendered_normal_img / opacity_for_div * alpha_mask
     rendered_normal = rendered_normal_img * 2.0 - 1.0
     rendered_normal = F.normalize(rendered_normal, dim=0)
 
     # ---- Pass 3: Ref_strength map (for reflection smoothness loss) ----
-    # Ensure ref_strength is in [0,1] range (it's sigmoid activated, safe as colors_precomp)
     colors_precomp_refs = torch.cat([ref_strength, ref_roughness, torch.zeros_like(ref_strength)], dim=-1)
     rendered_refs, _, _, _, _, _, _ = _run_odgs_rasterizer(
         means3D, means2D, colors_precomp_refs, opacity, scales_odgs, rotations,
-        rasterizer, shs=torch.Tensor([]).cuda(), cov3D_precomp=cov3D_precomp,
+        rasterizer, cov3D_precomp=cov3D_precomp,
     )
     rendered_refs = rendered_refs / opacity_for_div * alpha_mask
     rendered_ref_strength_map = rendered_refs[0:1]
@@ -188,7 +185,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         colors_precomp_base = base_color
         rendered_base_color_img, _, _, _, _, _, _ = _run_odgs_rasterizer(
             means3D, means2D, colors_precomp_base, opacity, scales_odgs, rotations,
-            rasterizer, shs=torch.Tensor([]).cuda(), cov3D_precomp=cov3D_precomp,
+            rasterizer, cov3D_precomp=cov3D_precomp,
         )
         rendered_base_color_img = rendered_base_color_img / opacity_for_div * alpha_mask
 
@@ -201,7 +198,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         ], dim=-1)
         rendered_packed, _, _, _, _, _, _ = _run_odgs_rasterizer(
             means3D, means2D, colors_precomp_packed, opacity, scales_odgs, rotations,
-            rasterizer, shs=torch.Tensor([]).cuda(), cov3D_precomp=cov3D_precomp,
+            rasterizer, cov3D_precomp=cov3D_precomp,
         )
         rendered_packed = rendered_packed / opacity_for_div * alpha_mask
 
