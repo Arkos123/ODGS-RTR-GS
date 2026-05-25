@@ -2,12 +2,12 @@
 
 This repository integrates two projects in a single unified environment:
 
-| Project | Description | Reference |
-|---------|-------------|-----------|
-| **RTR-GS** | 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection | MM 2025 |
-| **ODGS** (submodule) | Omnidirectional 3D Gaussian Splatting for 360-degree equirectangular images | NeurIPS 2024 |
+| Project              | Description                                                                       | Reference    |
+| -------------------- | --------------------------------------------------------------------------------- | ------------ |
+| **RTR-GS**           | 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection | MM 2025      |
+| **ODGS** (submodule) | Omnidirectional 3D Gaussian Splatting for 360-degree equirectangular images       | NeurIPS 2024 |
 
-- Original RTR-GS README: [README_orig_RTR-GS.md](README_orig_RTR-GS.md)
+- Original RTR-GS README: [README\_orig\_RTR-GS.md](README_orig_RTR-GS.md)
 - Original ODGS README/CLAUDE: [submodules/odgs/CLAUDE.md](submodules/odgs/CLAUDE.md)
 
 ## Directory Structure
@@ -75,6 +75,41 @@ pip install torch-scatter -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
 
 #### nvdiffrast (needed by RTR-GS for differentiable rendering)
 
+> **⚠️ CUDA 版本确认**
+> 编译 nvdiffrast 等 CUDA 扩展时，需要系统 nvcc 版本与 PyTorch 编译用的 CUDA 版本一致（本项目使用 **CUDA 11.8**）。
+>
+> 安装前确认：
+>
+> ```bash
+> nvcc --version               # 查看系统 CUDA 编译器版本
+> python -c "import torch; print(torch.version.cuda)"  # 查看 PyTorch 对应的 CUDA 版本
+> ```
+>
+> 如果系统 nvcc 版本不是 11.8，在创建并激活 conda 环境后，先安装 CUDA 11.8 工具包：
+>
+> ```bash
+> # 2. 从 conda-forge 安装完整的 CUDA 11.8 工具包
+> conda install -c conda-forge cudatoolkit=11.8
+>
+> # 3. 重新安装 nvcc 11.8（因为 conda-forge 的 cudatoolkit 可能不带 nvcc）
+> conda install -c nvidia cuda-nvcc=11.8
+> # 1. 安装 CCCL（CUB + Thrust + libcudacxx 头文件）
+> conda install -c conda-forge cccl
+> export CUDA_HOME=$CONDA_PREFIX
+>
+> conda install nvidia/label/cuda-11.8.0::cuda-cudart-dev -y
+> conda install nvidia/label/cuda-11.8.0::libcurand-dev -y
+>
+> # 验证 11.8
+> nvcc --version
+>
+> # 如果遇到错误：/usr/include/crt/host_config.h:138:2: error: #error -- unsupported GNU version! gcc versions later than 8 are not supported!
+> # 这时可安装 gcc 8 和 g++ 8 到 conda 环境
+> conda install -c conda-forge gxx_linux-64=8.5.0
+> ```
+>
+> 之后安装的包不受 conda 环境的 CUDA 编译器影响。
+
 > **Compatibility note**: PyTorch 2.1.2 requires `setuptools<70` for its CUDA extension build system.
 > The `pip install "setuptools<70"` step below ensures this.
 
@@ -131,7 +166,7 @@ cd submodules/odgs/submodules
 git clone https://github.com/Cekavis/diff-gaussian-rasterization-pinhole.git
 cd diff-gaussian-rasterization-pinhole
 pip install . --no-build-isolation
-cd ../..
+cd ../../../..
 
 ```
 
@@ -166,12 +201,46 @@ from torch_scatter import scatter
 print('torch_scatter: OK')
 "
 ```
+### CUDA Environment (required for renderutils_plugin compilation)
+
+`pbr/renderutils/` 的 CUDA 扩展编译需要以下条件。这部分代码在 [ops.py](./pbr/renderutils/ops.py#L49-L54) 中通过 `CUDA_HOME` 环境变量自动寻找 CUDA 库。
+
+**方案 A：系统 CUDA（推荐）**
+- 安装 CUDA toolkit 到标准路径（如 `/usr/local/cuda-11.8`），并创建 `/usr/local/cuda` 符号链接指向它
+- `ops.py` 默认以 `/usr/local/cuda` 为 fallback，无需额外配置
+
+**方案 B：conda CUDA 包 + 手动设 CUDA_HOME**
+如果使用 conda 安装的 CUDA toolkit（`cuda-nvcc` 等包）：
+```bash
+# 每次激活环境时手动设置
+export CUDA_HOME=/usr/local/cuda-11.8
+
+# 或用 conda activate 钩子自动设置（推荐）：
+mkdir -p $CONDA_PREFIX/etc/conda/activate.d
+cat > $CONDA_PREFIX/etc/conda/activate.d/cuda_env.sh << 'EOF'
+export CUDA_HOME=/usr/local/cuda-11.8
+export PATH=$CUDA_HOME/bin:$PATH
+EOF
+
+mkdir -p $CONDA_PREFIX/etc/conda/deactivate.d
+cat > $CONDA_PREFIX/etc/conda/deactivate.d/cuda_env.sh << 'EOF'
+export PATH=${PATH#$CUDA_HOME/bin:}
+unset CUDA_HOME
+EOF
+```
+
+验证是否生效：
+```bash
+conda activate odgs-rtr
+echo $CUDA_HOME     # 应显示 CUDA 安装路径
+which nvcc          # 应显示 CUDA 11.8 的 nvcc
+```
 
 ## Usage
 
 ### RTR-GS: Training + Inverse Rendering
 
-Refer to the original documentation in [README_orig_RTR-GS.md](README_orig_RTR-GS.md) for full details.
+Refer to the original documentation in [README\_orig\_RTR-GS.md](README_orig_RTR-GS.md) for full details.
 
 #### Stage 1 – Geometry and Reflection (30k iterations)
 
@@ -233,17 +302,17 @@ cd ../..
 
 ## Environment Details
 
-| Component | Version |
-|-----------|---------|
-| Python | 3.10 |
-| PyTorch | 2.1.2 (CUDA 11.8) |
-| CUDA Toolkit | 11.8 |
-| simple-knn | Compiled from source |
+| Component                   | Version              |
+| --------------------------- | -------------------- |
+| Python                      | 3.10                 |
+| PyTorch                     | 2.1.2 (CUDA 11.8)    |
+| CUDA Toolkit                | 11.8                 |
+| simple-knn                  | Compiled from source |
 | odgs-gaussian-rasterization | Compiled from source |
-| rtr_gs-rasterization | Compiled from source |
-| gs-ir | Compiled from source |
+| rtr\_gs-rasterization       | Compiled from source |
+| gs-ir                       | Compiled from source |
 | diff-gaussian-rasterization | Compiled from source |
-| nvdiffrast | Compiled from source |
+| nvdiffrast                  | Compiled from source |
 
 ## Citation
 

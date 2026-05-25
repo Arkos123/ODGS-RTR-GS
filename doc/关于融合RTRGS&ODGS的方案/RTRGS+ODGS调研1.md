@@ -19,7 +19,7 @@
         ▼
    RTR-GS 逆渲染训练 ───► 材质/光照分解结果
         │
-        └── GT 来源: 方案A 透视NVS / 方案B 全景图
+        └── GT 来源: 方案A 透视 / 方案B 全景图
 ```
 
 ### 二、可行性评估：3 个关键环节
@@ -79,7 +79,7 @@ ODGS 的 CUDA rasterizer 完全无视 `projmatrix` [ODGS forward.cu](file:///hom
 
 | 方案 | 做法 | 工作量 | 推荐度 |
 |------|------|:---:|:---:|
-| **A. 只用 ODGS 重建几何，RTR-GS 仍用透视 GT** | ODGS→PLY→RTR-GS 加载，但训练时 RTR-GS 仍使用原有的透视 NVS 图像做 GT | **低** | ⭐⭐⭐ |
+| **A. 只用 ODGS 重建几何，RTR-GS 仍用透视 GT** | ODGS→PLY→RTR-GS 加载，但训练时 RTR-GS 仍使用原有的透视图像做 GT | **低** | ⭐⭐⭐ |
 | **B. 新增 equirectangular 渲染分支** | 在 RTR-GS 中增加一个分支，检测到全景图时使用 ODGS 的 CUDA rasterizer 渲染，其余 PRT/反射/PBR 逻辑保持不变 | **中高** | ⭐⭐ |
 | **C. 全景图→Cubemap 分片** | 把全景图展开为 6 张透视面片，每个面片用标准透视光栅化，损失在各面片上计算 | **中** | ⭐ |
 
@@ -102,7 +102,7 @@ ODGS 的 CUDA rasterizer 完全无视 `projmatrix` [ODGS forward.cu](file:///hom
   输出: 材质分解 (albedo, roughness, metallic) + 光照
   功能: BRDF/光照逆渲染
   ⚠️ 可选的 GT 来源:
-       - 方案A: 用已有的透视 NVS 图像 (最简单)
+       - 方案A: 用已有的透视图像 (最简单)
        - 方案B: 用全景图 (需做渲染管线的修改)
 ```
 
@@ -119,7 +119,7 @@ ODGS 的 CUDA rasterizer 完全无视 `projmatrix` [ODGS forward.cu](file:///hom
 
 ```
 第一阶段 (低工作量, 立即可用):
-  ODGS 训练 → 转换脚本 → RTR-GS 加载几何 → 用已有透视 NVS 继续材质分解
+  ODGS 训练 → 转换脚本 → RTR-GS 加载几何 → 用已有透视图像 继续材质分解
   └── 不改任何 CUDA 代码，不改渲染管线
 
 第二阶段 (可选, 更高整合度):
@@ -142,7 +142,7 @@ ODGS 的 CUDA rasterizer 完全无视 `projmatrix` [ODGS forward.cu](file:///hom
 ### 下一步做什么（按顺序）
 
 1. **先写转换脚本**（简单的开始）：将 ODGS 的 .ply 转为 RTR-GS 格式，并修复 `load_ply` 中的两个变量名 bug
-2. **试跑全流程**：ODGS 训练 → 转换 → RTR-GS 加载几何 → RTR-GS 用现有透视 NVS 做材质分解
+2. **试跑全流程**：ODGS 训练 → 转换 → RTR-GS 加载几何 → RTR-GS 用现有透视图像 继续材质分解
 3. **验证效果**：对比直接 RTR-GS 训练 vs ODGS+转换+RTR-GS 的结果
 
 要开始做步骤 1 吗？

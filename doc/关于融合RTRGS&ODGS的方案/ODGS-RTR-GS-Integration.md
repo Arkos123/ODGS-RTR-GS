@@ -2,7 +2,7 @@
 
 **Goal**: Use ODGS to reconstruct 3DGS geometry from equirectangular (360°) image sequences, then feed the reconstruction into RTR-GS for inverse rendering (BRDF/lighting decomposition).
 
-**Constraint**: All input data is equirectangular panoramas — there are no perspective NVS images available as ground truth.
+**Constraint**: All input data is equirectangular panoramas — there are no perspective images available as ground truth.
 
 ---
 

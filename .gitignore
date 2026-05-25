@@ -10,3 +10,11 @@ datasets
 log
 point
 nvdiffrast
+data
+# **/*.png
+# **/*.jpg
+lab_output
+# submodules
+misc
+paper/images
+*.pdf
