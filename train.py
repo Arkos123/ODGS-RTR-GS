@@ -313,7 +313,6 @@ def training_report(tb_writer, iteration, tb_dict, scene: Scene, renderFunc, pip
                     depth = render_pkg["depth"]
                     depth = (depth - depth.min()) / (depth.max() - depth.min())
 
-                    
                     write_image_dict.update({
                         "image": image, "gt_image": gt_image,
                         "opacity": opacity, "depth": depth, 

@@ -48,6 +48,10 @@ def _get_plugin():
     # Linker options.
     if os.name == 'posix':
         ldflags = ['-lcuda', '-lnvrtc']
+        cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+        stubs_path = os.path.join(cuda_home, 'lib64/stubs')
+        if os.path.isdir(stubs_path):
+            ldflags.insert(0, f'-L{stubs_path}')
     elif os.name == 'nt':
         ldflags = ['cuda.lib', 'advapi32.lib', 'nvrtc.lib']
 

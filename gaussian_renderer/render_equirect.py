@@ -31,9 +31,7 @@ def _compute_equirect_ray_dirs(H, W, device='cuda'):
 
 def _run_odgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, rotations,
                          rasterizer, shs=None, cov3D_precomp=None):
-    if cov3D_precomp is None:
-        cov3D_precomp = torch.Tensor([]).cuda()
-    return rasterizer(
+    rendered_image, depth, acc, radii, psi, lat, lon = rasterizer(
         means3D=means3D,
         means2D=means2D,
         shs=shs,
@@ -43,6 +41,7 @@ def _run_odgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, ro
         rotations=rotations,
         cov3D_precomp=cov3D_precomp,
     )
+    return rendered_image, depth.unsqueeze(0), acc.unsqueeze(0), radii, psi, lat, lon
 
 
 def _compute_pseudo_normal(depth, rendered_opacity, c2w):
@@ -130,7 +129,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
-    scales_odgs = scales.mean(dim=-1, keepdim=True) if scales is not None else None
+    scales_odgs = scales.mean(dim=-1, keepdim=True).repeat(1, 3) if scales is not None else None
 
     shs = None
     colors_precomp = None
