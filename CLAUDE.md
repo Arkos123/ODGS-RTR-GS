@@ -10,6 +10,7 @@ RTR-GS is a 3D Gaussian Splatting framework for inverse rendering with radiance 
 
 This repository also includes **ODGS** (NeurIPS 2024) as a submodule at `submodules/odgs/`. ODGS extends 3DGS to omnidirectional (equirectangular) 360° images with latitude-adaptive densification and equirectangular CUDA rasterizer. See [README.md](README.md) for unified environment setup and [submodules/odgs/CLAUDE.md](submodules/odgs/CLAUDE.md) for ODGS usage.
 - see doc/关于融合RTRGS&ODGS的方案/implement/*.md for implementation details
+- `scripts/equi2blender.py`: Convert ODGS OpenMVG equirect datasets to RTR-GS Blender format (see [doc](doc/关于融合RTRGS&ODGS的方案/implement/5-26-001-equi2blender转换工具.md))
 
 ## Documentation
 
@@ -20,6 +21,8 @@ The [doc/](doc/) directory contains detailed documentation for this project, inc
 - **Historical commit explanations**: Context and rationale behind important changes
 
 Check the `doc/` folder for details if you need more information.
+
+**IMPORTANT — Codebase Exploration Protocol**: Before launching sub-agents to explore the codebase, always check `./doc/` first for existing documentation that may already cover the topic. If relevant docs exist, use them directly instead of re-exploring. If no relevant docs exist, after exploration, evaluate whether the findings are reusable beyond the current task — if so, save them as a new document in `./doc/` so future agents can reuse the results and avoid repeated investigation.
 
 ## RTR-GS Key Algorithmic Concepts
 
@@ -195,11 +198,6 @@ Key losses defined in paper Section 3.5:
   - `lambda_normal_render_depth`: 0.02 (normal consistency)
   - `lambda_white_light`: 0.003 (light regularization)
   - `lambda_reflect_strength_equal_metallic`: 0.1 (metal prior)
-
-### Resuming Training
-```bash
-python train.py -c <checkpoint_path>/chkpntXXXXX.pth ...
-```
 
 ## Output Structure
 

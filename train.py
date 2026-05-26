@@ -105,13 +105,14 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 print("Successfully loaded!")
             else:
                 print("Failed to load!")
+        cubemap.build_mips()
         cubemap.training_setup(opt)
         pbr_kwargs["cubemap"] = cubemap
         
     if pipe.ref_map:
         refmap = CubemapLight(base_res=128).cuda()
         refmap.train()
-    
+
         if args.checkpoint:
             refmap_checkpoint = os.path.dirname(args.checkpoint) + "/refmap_" + os.path.basename(args.checkpoint)
             if os.path.exists(refmap_checkpoint):
@@ -120,6 +121,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             else:
                 print("Failed to load!")
 
+        refmap.build_mips()
         refmap.training_setup(opt, light_type="ref")
         pbr_kwargs["refmap"] = refmap
 
@@ -133,6 +135,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
 
     start_time = time.time()
+
+    """ Save initial state visualization """
+    with torch.no_grad():
+        save_vis_images(scene, render_fn, pipe, background,
+                        iteration=0, dict_params=pbr_kwargs, is_pbr=is_pbr)
 
     """ Training """
     viewpoint_stack = None
@@ -200,6 +207,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             training_report(tb_writer, iteration, tb_dict,
                             scene, render_fn, pipe=pipe,
                             bg_color=background, dict_params=pbr_kwargs)
+
+            # Save visualization images to disk
+            if iteration % args.vis_interval == 0:
+                save_vis_images(scene, render_fn, pipe, background,
+                                iteration, pbr_kwargs, is_pbr)
 
             # densification
             if iteration < opt.densify_until_iter:
@@ -274,6 +286,55 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs)
 
     
+
+
+def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, is_pbr, num_views=4):
+    """Lightweight visualization: render first N test views and save images to disk.
+    No metrics computed -- intended for quick visual inspection during training."""
+    test_cameras = scene.getTestCameras()
+    if not test_cameras or len(test_cameras) == 0:
+        return
+
+    n_views = min(num_views, len(test_cameras))
+    vis_dir = os.path.join(scene.model_path, "vis", f"iteration_{iteration:05d}")
+
+    for idx in range(n_views):
+        viewpoint = test_cameras[idx]
+        render_pkg = render_fn(viewpoint, scene.gaussians, pipe, background,
+                               is_training=False, dict_params=dict_params)
+
+        render_img = torch.clamp(render_pkg["render"], 0.0, 1.0)
+        gt_img = torch.clamp(viewpoint.original_image.cuda(), 0.0, 1.0)
+
+        depth = render_pkg["depth"]
+        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+
+        opacity = torch.clamp(render_pkg["opacity"], 0.0, 1.0)
+        normal = torch.clamp(render_pkg["normal"] * 0.5 + 0.5, 0.0, 1.0)
+        pseudo_normal = torch.clamp(render_pkg["pseudo_normal"] * 0.5 + 0.5, 0.0, 1.0)
+
+        view_dir = os.path.join(vis_dir, f"view_{viewpoint.image_name}")
+        os.makedirs(view_dir, exist_ok=True)
+
+        save_image(render_img, os.path.join(view_dir, "render.png"))
+        save_image(gt_img, os.path.join(view_dir, "gt.png"))
+        save_image(depth, os.path.join(view_dir, "depth.png"))
+        save_image(opacity, os.path.join(view_dir, "opacity.png"))
+        save_image(normal, os.path.join(view_dir, "normal.png"))
+        save_image(pseudo_normal, os.path.join(view_dir, "pseudo_normal.png"))
+
+        if is_pbr and "pbr" in render_pkg:
+            pbr_img = torch.clamp(render_pkg["pbr"], 0.0, 1.0)
+            save_image(pbr_img, os.path.join(view_dir, "pbr.png"))
+
+            vis_dict = render_pkg.get("vis_dict", {})
+            for key in ["roughness", "metallic", "base_color"]:
+                if key in vis_dict:
+                    save_image(
+                        torch.clamp(vis_dict[key], 0.0, 1.0),
+                        os.path.join(view_dir, f"{key}.png"))
+
+    torch.cuda.empty_cache()
 
 
 def training_report(tb_writer, iteration, tb_dict, scene: Scene, renderFunc, pipe,
@@ -483,6 +544,8 @@ if __name__ == "__main__":
     parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast',
                                                    'render_ref_equirect', 'render_ref_pbr_equirect'], default='render_ref')
     parser.add_argument("--test_interval", type=int, default=4000)
+    parser.add_argument("--vis_interval", type=int, default=2000,
+                        help="Interval for saving visualization images (first 4 test views) to disk during training")
     parser.add_argument("--save_interval", type=int, default=30000)
     parser.add_argument("--skip_eval", action="store_true", default=False)
     parser.add_argument("--quiet", action="store_true")
