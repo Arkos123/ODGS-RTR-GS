@@ -84,10 +84,10 @@ def main():
                         help="Cube faces to extract (default: F B L R)")
     parser.add_argument("--step", type=int, default=1,
                         help="Only process every N-th camera view (default: 1 = all)")
-    parser.add_argument("--pitch", type=float, default=0,
-                        help="Pitch offset in degrees (positive = look up, default: 0)")
-    parser.add_argument("--yaw", type=float, default=0,
-                        help="Yaw offset in degrees (positive = look right, default: 0)")
+    parser.add_argument("--pitch", nargs="*", type=float, default=[0],
+                        help="Pitch offset(s) in degrees. Multiple values cycle per view.")
+    parser.add_argument("--yaw", nargs="*", type=float, default=[0],
+                        help="Yaw offset(s) in degrees. Multiple values cycle per view.")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing output directory")
     args = parser.parse_args()
@@ -147,19 +147,11 @@ def main():
     print(f"  Train: {len(train_names)}, Test: {len(test_names)}")
     print(f"  Step: {args.step} (every {args.step}-th view)")
 
-    # ── Build view rotation offset ──────────────────────────────────────
-    pitch_rad = np.deg2rad(args.pitch)
-    yaw_rad = np.deg2rad(args.yaw)
-    R_pitch = np.array([[1, 0, 0],
-                        [0, np.cos(pitch_rad), np.sin(pitch_rad)],
-                        [0, -np.sin(pitch_rad), np.cos(pitch_rad)]], dtype=np.float64)
-    R_yaw = np.array([[np.cos(yaw_rad), 0, np.sin(yaw_rad)],
-                      [0, 1, 0],
-                      [-np.sin(yaw_rad), 0, np.cos(yaw_rad)]], dtype=np.float64)
-    R_offset = R_pitch @ R_yaw
-    if args.pitch != 0 or args.yaw != 0:
-        print(f"  Pitch: {args.pitch}°, Yaw: {args.yaw}°")
-        print(f"  R_offset:\n{R_offset}")
+    if any(p != 0 for p in args.pitch) or any(y != 0 for y in args.yaw):
+        pitch_str = ", ".join(f"{p}°" for p in args.pitch)
+        yaw_str = ", ".join(f"{y}°" for y in args.yaw)
+        print(f"  Pitch pattern: [{pitch_str}] (cycling per view)")
+        print(f"  Yaw pattern: [{yaw_str}] (cycling per view)")
 
     # ── 2. Collect and sort valid camera views ──────────────────────────
     valid_views = []
@@ -237,6 +229,18 @@ def main():
 
         print(f"  [{view_idx + 1}/{len(valid_views)}] {image_name} ({rgb.shape[1]}x{rgb.shape[0]})")
 
+        pitch = args.pitch[view_idx % len(args.pitch)]
+        yaw = args.yaw[view_idx % len(args.yaw)]
+        pitch_rad = np.deg2rad(pitch)
+        yaw_rad = np.deg2rad(yaw)
+        R_pitch = np.array([[1, 0, 0],
+                            [0, np.cos(pitch_rad), np.sin(pitch_rad)],
+                            [0, -np.sin(pitch_rad), np.cos(pitch_rad)]], dtype=np.float64)
+        R_yaw = np.array([[np.cos(yaw_rad), 0, np.sin(yaw_rad)],
+                          [0, 1, 0],
+                          [-np.sin(yaw_rad), 0, np.cos(yaw_rad)]], dtype=np.float64)
+        R_offset = R_pitch @ R_yaw
+
         for face_name in selected_faces:
             face_rot = R_offset @ face_rots[face_name]
 
@@ -287,14 +291,35 @@ def main():
             json.dump(test_json, f, indent=2)
         print(f"Written transforms_test.json with {len(test_frames)} entries")
 
-    # ── 5. Copy point cloud ─────────────────────────────────────────────
+    # ── 5. Copy and convert point cloud (with normals) ──────────────────
+    from plyfile import PlyData, PlyElement
+
     ply_candidates = ["colorized.ply", "pcd.ply", "scene_dense.ply", "scene_dense_SGM.ply"]
     ply_copied = False
     for ply_name in ply_candidates:
         ply_src = src / ply_name
         if ply_src.exists():
-            shutil.copy2(ply_src, dst / "points3d.ply")
-            print(f"Copied {ply_name} → points3d.ply")
+            src_ply = PlyData.read(str(ply_src))
+            verts = src_ply["vertex"]
+            xyz = np.column_stack([verts["x"], verts["y"], verts["z"]])
+            rgb = np.column_stack([verts["red"], verts["green"], verts["blue"]])
+            if rgb.dtype == np.float32 or rgb.dtype == np.float64:
+                rgb = np.clip(rgb * 255.0, 0, 255).astype(np.uint8)
+
+            normals = np.random.randn(*xyz.shape).astype(np.float32)
+            normals /= np.linalg.norm(normals, axis=-1, keepdims=True)
+
+            ply_dtype = [
+                ("x", "f4"), ("y", "f4"), ("z", "f4"),
+                ("nx", "f4"), ("ny", "f4"), ("nz", "f4"),
+                ("red", "u1"), ("green", "u1"), ("blue", "u1"),
+            ]
+            elements = np.empty(xyz.shape[0], dtype=ply_dtype)
+            attributes = np.column_stack([xyz, normals, rgb])
+            elements[:] = list(map(tuple, attributes))
+            PlyData([PlyElement.describe(elements, "vertex")]).write(str(dst / "points3d.ply"))
+
+            print(f"Converted {ply_name} → points3d.ply ({len(xyz)} points)")
             ply_copied = True
             break
     if not ply_copied:
