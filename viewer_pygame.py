@@ -30,8 +30,8 @@ import math
 source E:/Anaconda/etc/profile.d/conda.sh
 conda activate odgs-rtr
 python viewer_pygame.py \
-    -c lab_output/tensoIR/lego/stage2/checkpoint/chkpnt40000.pth \
-    --occlusion_path lab_output/tensoIR/lego/stage1/checkpoint/occlusion_volumes.pth \
+    -c lab_output/360Roam/base/stage2/checkpoint/chkpnt40000.pth \
+    --occlusion_path lab_output/360Roam/base/stage1/checkpoint/occlusion_volumes.pth \
     --envmap_path "./data/env_maps/directional_front_top.hdr" \
     --image_width 512 \
     --image_height 512
@@ -315,15 +315,30 @@ def load_scene_data(checkpoint_path, occlusion_path, envmap_path, resolution=2):
     occlusion_volumes = torch.load(occlusion_path)
     bound = occlusion_volumes["bound"]
     
-    # 加载环境光
+    # 加载环境光：指定了 --envmap_path 就用指定的 HDR，否则用训练分解的 cubemap
     from utils.graphics_utils import read_hdr, latlong_to_cubemap
-    hdri = read_hdr(envmap_path)
-    hdri = torch.from_numpy(hdri).cuda()
-    res = 256
-    cubemap = CubemapLight(base_res=res).cuda()
-    cubemap.base.data = latlong_to_cubemap(hdri, [res, res])
-    cubemap.build_mips()
-    cubemap.eval()
+    if envmap_path is not None and os.path.exists(envmap_path):
+        hdri = read_hdr(envmap_path)
+        hdri = torch.from_numpy(hdri).cuda()
+        res = 256
+        cubemap = CubemapLight(base_res=res).cuda()
+        cubemap.base.data = latlong_to_cubemap(hdri, [res, res])
+        cubemap.build_mips()
+        cubemap.eval()
+        print(f"Loaded envmap from {envmap_path}")
+    else:
+        cubemap_checkpoint_path = os.path.dirname(checkpoint_path) + "/cubemap_" + os.path.basename(checkpoint_path)
+        if os.path.exists(cubemap_checkpoint_path):
+            cubemap = CubemapLight(base_res=128).cuda()
+            cubemap.create_from_ckpt(cubemap_checkpoint_path, restore_optimizer=False)
+            cubemap.build_mips()
+            cubemap.eval()
+            print(f"Loaded trained cubemap from {cubemap_checkpoint_path}")
+        else:
+            raise FileNotFoundError(
+                f"No envmap path specified and trained cubemap not found at {cubemap_checkpoint_path}. "
+                "Please provide --envmap_path."
+            )
     # if pipe.transfer_light:  # 不需要，因为我们用纯 PBR 模式
     # cubemap.build_sh(3)
     # gaussians.incident_to_transfer(cubemap.shs)
@@ -512,8 +527,7 @@ def main():
                         help="Path to scene source directory")
     parser.add_argument("--occlusion_path", type=str, required=True,
                         help="Path to occlusion volumes")
-    parser.add_argument("--envmap_path", type=str, 
-                        default="d:/localSpace/relighting/data/env_maps/big-studio-01_4K.exr",
+    parser.add_argument("--envmap_path", type=str, default=None,
                         help="Path to environment map")
     parser.add_argument("--resolution", type=int, default=2,
                         help="Resolution scale")
@@ -561,7 +575,7 @@ def main():
         args.resolution
     )
     
-    # 初始化相机（从场景上方开始，默认 Orbit 模式）
+    # 初始化相机
     gaussians = scene_data['gaussians']
     scene_data['enable_occlusion'] = True
     scene_center = gaussians.get_xyz.detach().mean(dim=0).cpu().numpy()
@@ -572,21 +586,19 @@ def main():
     scene_size = np.maximum(scene_max - scene_min, 0.1)
     scene_radius = np.linalg.norm(scene_size) / 2.0
     
-    # FPS 模式：在场景中心前方一点的位置
-    # Orbit 模式：在场景上方
-    # if fps_cam.mode == 'fps':
-    # camera_distance = 0  # 更近一些
-    # initial_position = scene_center + np.array([0, 0, camera_distance])  # 从 Z 轴前方开始
-    # else:
-    # Orbit 模式：在场景上方开始
-    camera_distance = max(2.0, scene_radius * 2.5)
-    initial_position = scene_center + np.array([0, 0, camera_distance])
+    # 如果有相机数据，初始位置默认为第一个相机位置
+    if test_cams is not None and len(test_cams) > 0 and not is_colmap:
+        first_cam = test_cams[0]
+        first_cam_center = -first_cam.R @ first_cam.T
+        initial_position = first_cam_center
+        print(f"Initial position set to first camera: {initial_position}")
+    else:
+        camera_distance = max(2.0, scene_radius * 2.5)
+        initial_position = scene_center + np.array([0, 0, camera_distance])
     
     print(f"Scene center: {scene_center}")
     print(f"Scene radius: {scene_radius:.2f}")
-    print(f"Camera distance: {camera_distance:.2f}")
     
-    # ref_camera = scene.train_cameras[1.0][0]
     fps_cam = FPSCamera(
         position=initial_position,
         target=scene_center,

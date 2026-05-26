@@ -300,6 +300,137 @@ python render_perspective.py -m <output_path> --iteration <N>
 cd ../..
 ```
 
+### Interactive Viewer
+
+This project includes a Pygame-based interactive viewer (`viewer_pygame.py`) for exploring 3D scenes with WASD/free-look or Orbit controls.
+
+- **If you have a desktop environment** (e.g., running locally or via a remote desktop like VNC/RDP): simply run `python viewer_pygame.py` directly with the appropriate arguments — a Pygame window will open on your desktop.
+- **If you are on a headless server** (no physical display, e.g., a remote Linux server): follow the guide below to stream the visuals to your browser using **Xvfb** + **x11vnc** + **noVNC**.
+
+#### Prerequisites
+
+These tools can be installed without root/sudo permissions:
+
+| Tool | Description | Install method |
+|------|-------------|---------------|
+| **Xvfb** | Virtual framebuffer (provides a fake display) | Usually pre-installed; check `/usr/bin/Xvfb` |
+| **x11vnc** + **libvncserver1** | VNC server that captures the virtual display | Extract from official Ubuntu `.deb` packages |
+| **noVNC** | Web-based VNC client | Clone from GitHub |
+| **pygame** | Python GUI library for the viewer | `pip install` in the conda environment |
+
+#### Installation
+
+**Step 1: Install x11vnc and its library dependency** (no sudo required)
+
+```bash
+# Download both .deb packages
+cd /tmp
+apt download x11vnc libvncserver1
+
+# Extract both into the same tools directory
+mkdir -p ~/tools/x11vnc
+dpkg -x x11vnc_*.deb ~/tools/x11vnc/
+dpkg -x libvncserver1_*.deb ~/tools/x11vnc/
+
+# Verify
+ls ~/tools/x11vnc/usr/bin/x11vnc
+ls ~/tools/x11vnc/usr/lib/x86_64-linux-gnu/libvncserver.so.1
+```
+
+**Step 2: Install noVNC** (no sudo required)
+
+```bash
+git clone https://github.com/novnc/noVNC.git ~/tools/noVNC
+```
+
+**Step 3: Install pygame** (in the conda environment)
+
+```bash
+conda activate odgs-rtr
+pip install pygame
+```
+
+**Step 4: Verify Xvfb**
+
+Xvfb is usually pre-installed on Ubuntu servers. Verify it exists:
+
+```bash
+ls /usr/bin/Xvfb
+```
+
+If missing, ask your administrator to install it (`sudo apt install xvfb`).
+
+#### Usage
+
+1. Edit the checkpoint paths in `scripts/start_viewer_novnc.sh`:
+
+```bash
+CHECKPOINT="lab_output/your_scene/stage2/checkpoint/chkpnt40000.pth"
+OCCLUSION_PATH="lab_output/your_scene/stage1/checkpoint/occlusion_volumes.pth"
+ENVMAP_PATH="./data/env_maps/your_envmap.hdr"
+# Optional: set SOURCE_PATH to your scene data directory to load camera information.
+# When set, the initial view will start at the first camera's position.
+SOURCE_PATH="./data/your_scene"
+IMAGE_WIDTH=1024
+IMAGE_HEIGHT=1024
+```
+
+> **Note on environment lighting**: The viewer loads the environment lighting in the following priority:
+> 1. If `ENVMAP_PATH` is set (non-empty), the specified HDR file is used.
+> 2. Otherwise, the viewer looks for a trained cubemap checkpoint (`cubemap_chkpntXXXXX.pth`) next to the main checkpoint file — this is the lighting decomposed during training.
+> 3. If neither is available, an error is raised.
+>
+> So if you want to use the **trained lighting**, simply leave `ENVMAP_PATH` empty (`""`).
+
+2. Run the script:
+
+```bash
+bash scripts/start_viewer_novnc.sh
+```
+
+3. Open your local browser to the URL printed by the script (e.g., `http://<server_ip>:6080/vnc.html`).
+
+4. (Recommended) For security, use an SSH tunnel:
+
+```bash
+# On your local machine:
+ssh -L 6080:localhost:6080 user@server_ip
+# eg. ssh -L 6080:localhost:6080 huangpengyue@10.108.11.10
+# Then open http://localhost:6080/vnc.html
+```
+
+#### Viewer Controls
+
+| Key/Input | Action |
+|-----------|--------|
+| **M** | Toggle between FPS and Orbit mode |
+| **W/A/S/D** | Move forward/left/backward/right (FPS mode) |
+| **Q/E** | Move up/down (FPS mode) |
+| **Right mouse + drag** | Rotate camera / look around |
+| **Mouse wheel** | Zoom in/out (Orbit mode) |
+| **←/→/↑/↓** | Rotate environment map |
+| **R** | Reset environment rotation |
+| **B** | Toggle environment map background |
+| **O** | Toggle occlusion (AO) |
+| **P** | Play test camera transforms |
+| **ESC** | Exit |
+
+#### How It Works
+
+```
+Your browser (noVNC client)
+    ↓ WebSocket
+noVNC proxy (port 6080)
+    ↓ VNC protocol
+x11vnc (port 5900)
+    ↓ captures
+Xvfb (virtual display :99)
+    ↓ Pygame renders to
+viewer_pygame.py
+```
+
+All keyboard and mouse events from your browser are transparently forwarded to the Pygame application, providing a full interactive experience.
+
 ## Environment Details
 
 | Component                   | Version              |
