@@ -8,8 +8,8 @@ RTR-GS is a 3D Gaussian Splatting framework for inverse rendering with radiance 
 
 **Paper**: "RTR-GS: 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection" (MM 2025). Full text available at `paper/full.md`.
 
-This repository also includes **ODGS** (NeurIPS 2024) as a submodule at `submodules/odgs/`. ODGS extends 3DGS to omnidirectional (equirectangular) 360° images with latitude-adaptive densification and equirectangular CUDA rasterizer. See [README.md](README.md) for unified environment setup and [submodules/odgs/CLAUDE.md](submodules/odgs/CLAUDE.md) for ODGS usage.
-- see doc/关于融合RTRGS&ODGS的方案/implement/*.md for implementation details
+This repository also includes **Spherical Gaussian Splatting (SGS)** as a submodule at `submodules/spherical-gaussian-splatting/`. SGS extends 3DGS to omnidirectional (equirectangular) 360° images with a custom spherical CUDA rasterizer, building on ODGS (NeurIPS 2024) and omniGS features. See [README.md](README.md) for unified environment setup and [submodules/spherical-gaussian-splatting/CLAUDE.md](submodules/spherical-gaussian-splatting/CLAUDE.md) for SGS usage.
+- The original ODGS submodule (`submodules/odgs/`) has been replaced by the new SGS submodule (`submodules/spherical-gaussian-splatting/`). See `doc/关于融合RTRGS&ODGS的方案/implement/*.md` for historical integration details.
 - `scripts/equi2blender.py`: Convert ODGS OpenMVG equirect datasets to RTR-GS Blender format (see [doc](doc/关于融合RTRGS&ODGS的方案/implement/5-26-001-equi2blender转换工具.md))
 
 ## Documentation
@@ -17,12 +17,10 @@ This repository also includes **ODGS** (NeurIPS 2024) as a submodule at `submodu
 The [doc/](doc/) directory contains detailed documentation for this project, including:
 - **Technical deep dives**: In-depth analysis of rendering internals, occlusion baking, and key features (e.g. `ref_map`)
 - **Training pipeline overview**: Complete walkthrough of the two-stage training process
-- **Integration notes**: RTR-GS & ODGS fusion analysis and research records
+- **Integration notes**: RTR-GS & ODGS/SGS fusion analysis and research records
 - **Historical commit explanations**: Context and rationale behind important changes
 
 Check the `doc/` folder for details if you need more information.
-
-**IMPORTANT — Codebase Exploration Protocol**: Before launching sub-agents to explore the codebase, always check `./doc/` first for existing documentation that may already cover the topic. If relevant docs exist, use them directly instead of re-exploring. If no relevant docs exist, after exploration, evaluate whether the findings are reusable beyond the current task — if so, save them as a new document in `./doc/` so future agents can reuse the results and avoid repeated investigation.
 
 ## RTR-GS Key Algorithmic Concepts
 

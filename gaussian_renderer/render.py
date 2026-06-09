@@ -177,6 +177,8 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
         scales = pc.get_scaling
+        if dict_params and dict_params.get('equirect_model', False):
+            scales = scales.mean(dim=-1, keepdim=True).repeat(1, 3)
         rotations = pc.get_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors

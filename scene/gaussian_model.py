@@ -820,7 +820,8 @@ class GaussianModel:
             self._incidents_rest = nn.Parameter(
                 torch.tensor(incidents_extra, dtype=torch.float, device="cuda").transpose(
                     1, 2).contiguous().requires_grad_(True))
-            
+
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}

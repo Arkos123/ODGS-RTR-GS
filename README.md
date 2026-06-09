@@ -1,14 +1,14 @@
-# RTR-GS + ODGS Unified Workspace
+# RTR-GS + SGS Unified Workspace
 
 This repository integrates two projects in a single unified environment:
 
-| Project              | Description                                                                       | Reference    |
-| -------------------- | --------------------------------------------------------------------------------- | ------------ |
-| **RTR-GS**           | 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection | MM 2025      |
-| **ODGS** (submodule) | Omnidirectional 3D Gaussian Splatting for 360-degree equirectangular images       | NeurIPS 2024 |
+| Project                           | Description                                                                                 | Reference    |
+| --------------------------------- | ------------------------------------------------------------------------------------------- | ------------ |
+| **RTR-GS**                        | 3D Gaussian Splatting for Inverse Rendering with Radiance Transfer and Reflection           | MM 2025      |
+| **SGS** (submodule)               | Omnidirectional Spherical Gaussian Splatting for 360° equirectangular images                | Based on ODGS (NeurIPS 2024) + omniGS |
 
 - Original RTR-GS README: [README\_orig\_RTR-GS.md](README_orig_RTR-GS.md)
-- Original ODGS README/CLAUDE: [submodules/odgs/CLAUDE.md](submodules/odgs/CLAUDE.md)
+- SGS module CLAUDE: [submodules/spherical-gaussian-splatting/CLAUDE.md](submodules/spherical-gaussian-splatting/CLAUDE.md)
 
 ## Directory Structure
 
@@ -19,9 +19,9 @@ RTR-GS/
 │   ├── rtr_gs-rasterization/           # RTR-GS CUDA rasterizer (PRT + reflection)
 │   ├── gs-ir/                          # Irradiance / occlusion CUDA kernels
 │   ├── diff-gaussian-rasterization/    # RTR-GS's modified diff rasterizer
-│   └── odgs/                           # ODGS submodule
+│   └── spherical-gaussian-splatting/           # SGS submodule
 │       └── submodules/
-│           ├── odgs-gaussian-rasterization/  # ODGS equirectangular CUDA rasterizer
+│           ├── spherical-gaussian-rasterization/  # SGS spherical CUDA rasterizer
 │           └── simple-knn/                   # (ignored, use the shared one above)
 ├── environment.yml                     # Unified conda environment (name: odgs-rtr)
 ├── README.md                           # This file
@@ -48,7 +48,7 @@ cd RTR-GS
 git submodule update --init --recursive
 ```
 
-Note: ODGS's `submodules/simple-knn/` is intentionally left empty. The shared `simple-knn` at `submodules/simple-knn/` is used instead.
+Note: SGS's `submodules/simple-knn/` is intentionally left empty. The shared `simple-knn` at `submodules/simple-knn/` is used instead.
 
 ### Step 2: Create conda environment
 
@@ -123,7 +123,7 @@ rm -rf /tmp/nvdiffrast
 #### protobuf (fix tensorboard compatibility)
 
 > `environment.yml` installs `tensorboard=2.10.0`, which requires an older protobuf version.
-> Without this fix, running ODGS or RTR-GS training will fail with:
+> Without this fix, running SGS or RTR-GS training will fail with:
 > `TypeError: Descriptors cannot be created directly.`
 
 ```bash
@@ -156,17 +156,10 @@ cd submodules/diff-gaussian-rasterization
 pip install . --no-build-isolation
 cd ../..
 
-# (4c) ODGS extension – equirectangular rasterizer
-cd submodules/odgs/submodules/odgs-gaussian-rasterization
+# (4c) SGS extension – spherical equirectangular rasterizer
+cd submodules/spherical-gaussian-splatting/submodules/spherical-gaussian-rasterization
 pip install . --no-build-isolation
 cd ../../..
-
-cd submodules/odgs/submodules
-# 如果没有需下载
-git clone https://github.com/Cekavis/diff-gaussian-rasterization-pinhole.git
-cd diff-gaussian-rasterization-pinhole
-pip install . --no-build-isolation
-cd ../../../..
 
 ```
 
@@ -191,8 +184,8 @@ print('gs_ir: OK')
 import diff_gaussian_rasterization
 print('diff_gaussian_rasterization: OK')
 
-import odgs_gaussian_rasterization
-print('odgs_gaussian_rasterization: OK')
+import spherical_gaussian_rasterization
+print('spherical_gaussian_rasterization: OK')
 
 import nvdiffrast.torch as dr
 print('nvdiffrast: OK')
@@ -279,24 +272,29 @@ python train.py --eval \
     --compute_with_prt
 ```
 
-### ODGS: Omnidirectional Training
+### SGS: Omnidirectional Training (Spherical Gaussian Splatting)
 
-ODGS is located at `submodules/odgs/`. Run training from the repo root:
+SGS is located at `submodules/spherical-gaussian-splatting/`. Run training from the repo root:
 
 ```bash
 # Train
-cd submodules/odgs
+cd submodules/spherical-gaussian-splatting
 python train.py -s <dataset_path> -m <output_path> --eval
 cd ../..
 
 # Render omnidirectional (equirectangular)
-cd submodules/odgs
+cd submodules/spherical-gaussian-splatting
 python render.py -m <output_path> --iteration <N>
 cd ../..
 
 # Render perspective (pinhole projection)
-cd submodules/odgs
+cd submodules/spherical-gaussian-splatting
 python render_perspective.py -m <output_path> --iteration <N>
+cd ../..
+
+# Render pinhole (custom intrinsics)
+cd submodules/spherical-gaussian-splatting
+python render_pinhole.py -m <output_path> --iteration <N>
 cd ../..
 ```
 
@@ -439,7 +437,7 @@ All keyboard and mouse events from your browser are transparently forwarded to t
 | PyTorch                     | 2.1.2 (CUDA 11.8)    |
 | CUDA Toolkit                | 11.8                 |
 | simple-knn                  | Compiled from source |
-| odgs-gaussian-rasterization | Compiled from source |
+| spherical-gaussian-rasterization | Compiled from source |
 | rtr\_gs-rasterization       | Compiled from source |
 | gs-ir                       | Compiled from source |
 | diff-gaussian-rasterization | Compiled from source |
@@ -459,4 +457,4 @@ If you use RTR-GS, please cite:
 }
 ```
 
-If you use ODGS, please cite the ODGS NeurIPS 2024 paper accordingly.
+If you use the SGS omnidirectional module, please cite ODGS (NeurIPS 2024) and omniGS accordingly.

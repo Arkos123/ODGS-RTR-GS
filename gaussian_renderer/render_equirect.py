@@ -2,7 +2,6 @@ import math
 import torch
 import torch.nn.functional as F
 from arguments import OptimizationParams
-from kornia.filters import spatial_gradient
 from pbr.shade import get_reflectance_color_forward, pbr_shading
 from scene.gaussian_model import GaussianModel
 from scene.cameras import Camera
@@ -11,27 +10,42 @@ from utils.sh_utils import eval_sh
 from utils.loss_utils import ssim, tv_loss, first_order_edge_aware_loss, est_wsmap
 from utils.image_utils import psnr
 from utils.graphics_utils import linear2srgb_torch
-from odgs_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+from spherical_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from gs_ir import recon_occlusion
 
 
-def _compute_equirect_ray_dirs(H, W, device='cuda'):
-    row = torch.arange(H, device=device).float()
-    col = torch.arange(W, device=device).float()
-    y, x = torch.meshgrid(row, col, indexing='ij')
-    lon = (x / W) * 2 * math.pi - math.pi
-    lat = math.pi / 2 - (y / H) * math.pi
-    cos_lat = torch.cos(lat)
+def _equirect_ray_dirs(H, W, device='cuda'):
+    """Equirectangular pixel → world-space ray directions (view-space)."""
+    ys = torch.linspace(0.5 * math.pi, -0.5 * math.pi, H, device=device)
+    xs = torch.linspace(-math.pi, math.pi, W, device=device)
+    lat, lon = torch.meshgrid(ys, xs, indexing='ij')
     return torch.stack([
-        cos_lat * torch.sin(lon),
+        torch.sin(lon) * torch.cos(lat),
         torch.sin(lat),
-        cos_lat * torch.cos(lon),
+        torch.cos(lon) * torch.cos(lat),
     ], dim=-1)
 
 
-def _run_odgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, rotations,
-                         rasterizer, shs=None, cov3D_precomp=None):
-    rendered_image, depth, acc, radii, psi, lat, lon = rasterizer(
+def _project_lat_lon(means3D, viewmatrix):
+    """Per-Gaussian lon/lat in ERP convention (for densification only)."""
+    with torch.no_grad():
+        if means3D.numel() == 0:
+            z = torch.empty(0, device=means3D.device, dtype=means3D.dtype)
+            return z, z, z
+        ones = torch.ones((means3D.shape[0], 1), dtype=means3D.dtype, device=means3D.device)
+        pts_h = torch.cat([means3D, ones], dim=-1)
+        p_view = pts_h @ viewmatrix.to(device=means3D.device, dtype=means3D.dtype)
+        x, y, z = p_view[:, 0], p_view[:, 1], p_view[:, 2]
+        dist_xz = torch.sqrt(torch.clamp(x * x + z * z, min=1e-12))
+        lat = torch.atan2(y, dist_xz)
+        lon = torch.atan2(x, z)
+        psi = torch.zeros_like(lat)
+    return psi, lat, lon
+
+
+def _run_sgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, rotations,
+                        rasterizer, shs=None, cov3D_precomp=None):
+    rendered_image, radii, depth_raw, alpha, normal_raw = rasterizer(
         means3D=means3D,
         means2D=means2D,
         shs=shs,
@@ -41,18 +55,16 @@ def _run_odgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, ro
         rotations=rotations,
         cov3D_precomp=cov3D_precomp,
     )
-    return rendered_image, depth.unsqueeze(0), acc.unsqueeze(0), radii, psi, lat, lon
+    return rendered_image, depth_raw, alpha, radii, normal_raw
 
 
-def _compute_pseudo_normal(depth, rendered_opacity, c2w):
-    depth_exp = depth / rendered_opacity.clamp_min(1e-5)
-    depth_exp = torch.nan_to_num(depth_exp, 0, 0)
-    grad = spatial_gradient(depth_exp.unsqueeze(0), order=1)[0, 0]
-    dzdx, dzdy = grad[1], grad[0]
-    n_cam = torch.stack([-dzdx, -dzdy, torch.ones_like(dzdx)], dim=0)
-    n_cam = F.normalize(n_cam, dim=0)
-    n_world = (c2w[:3, :3] @ n_cam.reshape(3, -1)).reshape(3, depth.shape[-2], depth.shape[-1])
-    return F.normalize(n_world, dim=0)
+def _normal_from_raw(normal_raw, alpha, eps=1e-8):
+    """Normalize raw rasterizer normal output and mask with alpha."""
+    opacity_for_div = alpha.clamp_min(1e-5)
+    normal = F.normalize(normal_raw / opacity_for_div, dim=0, eps=eps)
+    alpha_mask = (alpha > 0).float()
+    normal = normal * alpha_mask
+    return normal
 
 
 def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
@@ -88,16 +100,22 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     c2w = viewpoint_camera.c2w
     H, W = int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)
 
+    # SGS rasterizer settings for equirect mode (camera_type=3)
     raster_settings = GaussianRasterizationSettings(
         image_height=H,
         image_width=W,
+        tanfovx=0.0,
+        tanfovy=0.0,
         bg=torch.zeros(3, device='cuda'),
         scale_modifier=scaling_modifier,
         viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
+        camera_type=3,
+        render_depth=False,
     )
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
@@ -129,7 +147,6 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     else:
         scales = pc.get_scaling
         rotations = pc.get_rotation
-    scales_odgs = scales.mean(dim=-1, keepdim=True).repeat(1, 3) if scales is not None else None
 
     shs = None
     colors_precomp = None
@@ -155,39 +172,46 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     else:
         colors_precomp_pass1 = colors_precomp
 
-    rendered_image, depth, acc, radii, psi, lat, lon = _run_odgs_rasterizer(
-        means3D, means2D, colors_precomp_pass1, opacity, scales_odgs, rotations,
+    rendered_image, depth, acc, radii, pass1_normal_raw = _run_sgs_rasterizer(
+        means3D, means2D, colors_precomp_pass1, opacity, scales, rotations,
         rasterizer, shs=shs, cov3D_precomp=cov3D_precomp,
     )
     rendered_opacity = acc
     visibility_filter = radii > 0
 
-    # ---- Pseudo-normal from depth gradient ----
-    pseudo_normal = _compute_pseudo_normal(depth, rendered_opacity, c2w)
+    # ---- Pseudo-normal from rasterizer normal_raw ----
+    pseudo_normal = _normal_from_raw(pass1_normal_raw, rendered_opacity)
 
     # ---- Alpha normalization mask for multi-pass outputs ----
-    alpha_mask = (rendered_opacity > 0).float()  # [1, H, W]
+    alpha_mask = (rendered_opacity > 0).float()
     opacity_for_div = rendered_opacity.clamp_min(1e-5)
 
     # ---- Pass 2: Normal map (encode as n*0.5+0.5 → [0,1] range) ----
     colors_precomp_normal = normal * 0.5 + 0.5
-    rendered_normal_img, _, _, _, _, _, _ = _run_odgs_rasterizer(
-        means3D, means2D, colors_precomp_normal, opacity, scales_odgs, rotations,
+    rendered_normal_img, _, _, _, _ = _run_sgs_rasterizer(
+        means3D, means2D, colors_precomp_normal, opacity, scales, rotations,
         rasterizer, cov3D_precomp=cov3D_precomp,
     )
     rendered_normal_img = rendered_normal_img / opacity_for_div * alpha_mask
     rendered_normal = rendered_normal_img * 2.0 - 1.0
     rendered_normal = F.normalize(rendered_normal, dim=0)
 
-    # ---- Pass 3: Ref_strength map (for reflection smoothness loss) ----
+    # ---- Pass 3: Ref_strength + ref_roughness + ref_tint (for visualization) ----
     colors_precomp_refs = torch.cat([ref_strength, ref_roughness, torch.zeros_like(ref_strength)], dim=-1)
-    rendered_refs, _, _, _, _, _, _ = _run_odgs_rasterizer(
-        means3D, means2D, colors_precomp_refs, opacity, scales_odgs, rotations,
+    rendered_refs, _, _, _, _ = _run_sgs_rasterizer(
+        means3D, means2D, colors_precomp_refs, opacity, scales, rotations,
         rasterizer, cov3D_precomp=cov3D_precomp,
     )
     rendered_refs = rendered_refs / opacity_for_div * alpha_mask
     rendered_ref_strength_map = rendered_refs[0:1]
     rendered_ref_roughness_map = rendered_refs[1:2]
+
+    # ---- Pass 3b: Ref_tint map (RGB) ----
+    rendered_ref_tint, _, _, _, _ = _run_sgs_rasterizer(
+        means3D, means2D, ref_tint, opacity, scales, rotations,
+        rasterizer, cov3D_precomp=cov3D_precomp,
+    )
+    rendered_ref_tint = rendered_ref_tint / opacity_for_div * alpha_mask
 
     # ---- Pass 4,5: PBR attributes (PBR mode only) ----
     if pc.use_pbr:
@@ -197,8 +221,8 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
 
         # Pass 4: Base color (3 channels)
         colors_precomp_base = base_color
-        rendered_base_color_img, _, _, _, _, _, _ = _run_odgs_rasterizer(
-            means3D, means2D, colors_precomp_base, opacity, scales_odgs, rotations,
+        rendered_base_color_img, _, _, _, _ = _run_sgs_rasterizer(
+            means3D, means2D, colors_precomp_base, opacity, scales, rotations,
             rasterizer, cov3D_precomp=cov3D_precomp,
         )
         rendered_base_color_img = rendered_base_color_img / opacity_for_div * alpha_mask
@@ -210,16 +234,16 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             metallic,
             depth_attr,
         ], dim=-1)
-        rendered_packed, _, _, _, _, _, _ = _run_odgs_rasterizer(
-            means3D, means2D, colors_precomp_packed, opacity, scales_odgs, rotations,
+        rendered_packed, _, _, _, _ = _run_sgs_rasterizer(
+            means3D, means2D, colors_precomp_packed, opacity, scales, rotations,
             rasterizer, cov3D_precomp=cov3D_precomp,
         )
         rendered_packed = rendered_packed / opacity_for_div * alpha_mask
 
     # ---- Background blending for main render ----
-    opacity_map = rendered_opacity.permute(1, 2, 0)  # [H, W, 1]
-    radiance_map = rendered_image.permute(1, 2, 0)    # [H, W, 3], pre-multiplied by alpha
-    # ODGS rasterizer with bg=0 outputs sum(T_i * alpha_i * c_i).
+    opacity_map = rendered_opacity.permute(1, 2, 0)
+    radiance_map = rendered_image.permute(1, 2, 0)
+    # SGS rasterizer with bg=0 outputs sum(T_i * alpha_i * c_i).
     # Correct final: sum(T_i * alpha_i * c_i) + T_final * bg
     # = rendered_image + (1 - rendered_opacity) * bg_color
     ref_rgb = radiance_map + (1.0 - opacity_map) * bg_color
@@ -234,7 +258,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         metallic_map = rendered_packed[1:2].permute(1, 2, 0)
 
         # Equirect-specific view direction
-        ray_dirs = _compute_equirect_ray_dirs(H, W)
+        ray_dirs = _equirect_ray_dirs(H, W)
         view_dirs = F.normalize(
             -(ray_dirs.reshape(-1, 3) @ c2w[:3, :3].T).reshape(H, W, 3), dim=-1)
 
@@ -272,8 +296,9 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         diffuse_pbr = pbr_result["diffuse_rgb"]
         specular_pbr = pbr_result["specular_rgb"]
 
-        # PBR output is NOT pre-multiplied; blend with background via opacity
-        rendered_pbr = rendered_pbr * opacity_map + (1.0 - opacity_map) * bg_color
+        # PBR output is NOT pre-multiplied; blend with background via opacity.
+        # Detach opacity from PBR gradient — PBR should not optimize opacity.
+        rendered_pbr = rendered_pbr * opacity_map.detach() + (1.0 - opacity_map.detach()) * bg_color
 
         if pipe.tone_mapping:
             rendered_pbr = torch.clamp(rendered_pbr, 0.0, 1.0)
@@ -289,7 +314,11 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     out_feature_dict.update({
         "ref_roughness": rendered_ref_roughness_map,
         "ref_strength": rendered_ref_strength_map,
+        "ref_tint": rendered_ref_tint,
     })
+
+    # ---- psi, lat, lon for densification ----
+    psi, lat, lon = _project_lat_lon(means3D, viewpoint_camera.world_view_transform)
 
     # ---- Results assembly ----
     results = {
@@ -304,6 +333,10 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         "visibility_filter": visibility_filter,
         "radii": radii,
         "num_rendered": 0,
+        "weights": opacity,
+        "psi": psi,
+        "lat": lat,
+        "lon": lon,
     }
     results.update(out_feature_dict)
 
@@ -317,6 +350,9 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             "normal": rendered_normal * 0.5 + 0.5,
             "radiance_color": rendered_image,
         }
+        vis_dict["ref_strength"] = rendered_ref_strength_map
+        vis_dict["ref_roughness"] = rendered_ref_roughness_map
+        vis_dict["ref_tint"] = rendered_ref_tint
         if refmap is not None:
             vis_dict["ref_export_base"] = refmap.export_envmap(return_img=True).permute(2, 0, 1)
         if pc.use_pbr:

@@ -1,3 +1,4 @@
-[submodule "submodules/odgs"]
-	path = submodules/odgs
-	url = ./submodules/odgs
+[submodule "submodules/spherical-gaussian-splatting"]
+	path = submodules/spherical-gaussian-splatting
+	url = ./submodules/spherical-gaussian-splatting
+

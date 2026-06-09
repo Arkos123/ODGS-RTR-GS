@@ -10,6 +10,7 @@ from gaussian_renderer import render_fn_dict
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
+from utils.graphics_utils import latlong_to_cubemap_equirect
 from tqdm import tqdm
 from utils.image_utils import psnr
 from utils.system_utils import prepare_output_and_logger
@@ -59,6 +60,18 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         gaussians.create_from_pcd(scene.scene_info.point_cloud, scene.cameras_extent)
 
     gaussians.training_setup(opt)
+
+    # When loading from a pre-trained checkpoint (PLY or full) in equirect mode,
+    # freeze positions and disable densification to preserve the good SGS geometry.
+    freeze_geometry = args.ply_checkpoint is not None or (args.checkpoint is not None and pipe.equirect)
+    if freeze_geometry:
+        for param_group in gaussians.optimizer.param_groups:
+            if param_group["name"] in ("xyz", "scaling", "rotation", "opacity"):
+                param_group['lr'] = 0
+        gaussians.xyz_scheduler_args = lambda iteration: 0
+        opt.densify_from_iter = opt.iterations + 1
+        opt.densify_until_iter = 0
+        print("Geometry frozen: xyz/scaling/rotation/opacity locked, densification disabled")
 
 
     """
@@ -242,7 +255,30 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                         gaussians.reset_opacity1(exclusive_msk=outside_msk)
                         gaussians.reset_scale(exclusive_msk=outside_msk)
 
-                    
+
+            # Equirect mode: standalone pruning and resets after densification ends
+            # (skipped when geometry is frozen as the pre-trained geometry is already good)
+            if pipe.equirect and not freeze_geometry and iteration >= opt.densify_until_iter:
+                if iteration > 500 and iteration % opt.densification_interval == 0:
+                    if gaussians.max_radii2D.numel() != gaussians.get_xyz.shape[0]:
+                        gaussians.max_radii2D = torch.zeros(
+                            (gaussians.get_xyz.shape[0]), device="cuda")
+                    gaussians.prune(min_opacity=0.005, extent=scene.cameras_extent,
+                                    max_screen_size=None, weights_threshold=0) # max_screen_size= size_threshold
+
+                if iteration % opt.opacity_reset_interval == 0:
+                    outside_msk = get_outside_msk()
+                    gaussians.reset_opacity()
+                    if not opt.without_normal_propagation:
+                        gaussians.reset_refl(exclusive_msk=outside_msk)
+
+                if (opt.init_iter < iteration <= opt.propagation_until_iter) and iteration % 1000 == 0 and pipe.ref_map:
+                    if not opt.without_normal_propagation:
+                        outside_msk = get_outside_msk()
+                        gaussians.reset_opacity1(exclusive_msk=outside_msk)
+                        gaussians.reset_scale(exclusive_msk=outside_msk)
+
+
             # Optimizer step
             gaussians.step()
             for component in pbr_kwargs.values():
@@ -300,8 +336,10 @@ def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, 
 
     for idx in range(n_views):
         viewpoint = test_cameras[idx]
+        render_kwargs = dict(dict_params)
+        render_kwargs["iteration"] = iteration
         render_pkg = render_fn(viewpoint, scene.gaussians, pipe, background,
-                               is_training=False, dict_params=dict_params)
+                               is_training=False, dict_params=render_kwargs)
 
         render_img = torch.clamp(render_pkg["render"], 0.0, 1.0)
         gt_img = torch.clamp(viewpoint.original_image.cuda(), 0.0, 1.0)
@@ -333,6 +371,25 @@ def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, 
                     save_image(
                         torch.clamp(vis_dict[key], 0.0, 1.0),
                         os.path.join(view_dir, f"{key}.png"))
+
+        # Save reflection visualization maps
+        vis_dict = render_pkg.get("vis_dict", {})
+        for key in ["ref_strength", "ref_roughness", "ref_tint"]:
+            if key in vis_dict:
+                save_image(
+                    torch.clamp(vis_dict[key], 0.0, 1.0),
+                    os.path.join(view_dir, f"{key}.png"))
+
+        if getattr(pipe, 'equirect', False):
+            cubemap_dir = os.path.join(view_dir, "cubemap")
+            os.makedirs(cubemap_dir, exist_ok=True)
+            face_names = ["posx", "negx", "posy", "negy", "posz", "negz"]
+            cubemap = latlong_to_cubemap_equirect(
+                render_img.permute(1, 2, 0), [512, 512])
+            for face_idx in range(6):
+                face_img = cubemap[face_idx].permute(2, 0, 1)
+                save_image(face_img, os.path.join(
+                    cubemap_dir, f"{face_names[face_idx]}.png"))
 
     torch.cuda.empty_cache()
 
@@ -552,7 +609,7 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_interval", type=int, default=30000)
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
     parser.add_argument("--ply_checkpoint", type=str, default=None,
-                        help="Path to a .ply file with pre-trained Gaussian geometry (e.g. converted from ODGS)")
+                        help="Path to a .ply file with pre-trained Gaussian geometry (e.g. converted from SGS/ODGS)")
     parser.add_argument("--occlusion_path", type=str, default=None)
 
     args = parser.parse_args(sys.argv[1:])
@@ -560,13 +617,11 @@ if __name__ == "__main__":
     print(f"Current rendering type:  {args.type}")
     print("Optimizing " + args.model_path)
 
-    # Equirect mode: force forward_shading, disable densification
+    # Equirect mode: force forward_shading
     if args.type in ['render_ref_equirect', 'render_ref_pbr_equirect']:
         args.equirect = True
         args.forward_shading = True
-        args.densify_until_iter = 0
-        args.densify_from_iter = 30000
-        print("Equirectangular mode enabled: forward_shading=True, densification disabled")
+        print("Equirectangular mode enabled: forward_shading=True")
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
