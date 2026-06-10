@@ -186,12 +186,19 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     incident_light_map = rendered_incident_lights.permute(1, 2, 0)                      # [H, W, 3]
 
     # get occulsion
+    aabb = dict_params.get("aabb")
+    if aabb is not None:
+        clamp_min, clamp_max = aabb[:3], aabb[3:]
+    else:
+        cbound = dict_params.get("occlusion_volumes", {}).get("bound", 1.5)
+        clamp_min, clamp_max = -cbound, cbound
+        aabb = torch.tensor([-cbound, -cbound, -cbound, cbound, cbound, cbound], device="cuda")
     points = (
         (-view_dirs.reshape(-1, 3) * rendered_depth.reshape(-1, 1) + c2w[:3, 3])
-            .clamp(min=-1.5, max=1.5)
+            .clamp(min=clamp_min, max=clamp_max)
                 .contiguous()
             )  # [HW, 3]
-        
+
     if "occlusion_volumes" in dict_params.keys() and dict_params.get("enable_occlusion", True):
         occlusion_volumes = dict_params["occlusion_volumes"]
         aabb = dict_params["aabb"]

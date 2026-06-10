@@ -12,12 +12,12 @@ Usage:
         --num_views 4
 
     # PBR equirect (Stage2):
-    python render_checkpoint.py \\
-        -s <dataset_path> \\
-        -m <output_path> \\
-        -c <output_path>/checkpoint/chkpnt40000.pth \\
-        -t render_ref_pbr_equirect \\
-        --occlusion_path <output_path>/checkpoint/occlusion_volumes.pth \\
+    python render_checkpoint.py \
+        -s /home/huangpengyue/projects/RTR-GS/data/OmniBlender/barbershop \
+        -m ./lab_output/OmniBlender/barbershop/stage2_test \
+        -c ./lab_output/OmniBlender/barbershop/stage2_test/checkpoint/chkpnt40000.pth \
+        -t render_ref_pbr_equirect \
+        --occlusion_path ./lab_output/OmniBlender/barbershop/stage1/checkpoint/occlusion_volumes.pth \
         --num_views 4
 
 Output:
@@ -181,8 +181,11 @@ def main():
         if args.occlusion_path is not None:
             print(f"  Loading occlusion volumes from {args.occlusion_path}")
             occlusion_volumes = torch.load(args.occlusion_path)
-            bound = occlusion_volumes["bound"]
-            aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
+            if "aabb" in occlusion_volumes:
+                aabb = occlusion_volumes["aabb"].clone().cuda()
+            else:
+                bound = occlusion_volumes["bound"]
+                aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
             pbr_kwargs["occlusion_volumes"] = occlusion_volumes
             pbr_kwargs["aabb"] = aabb
 
@@ -232,7 +235,10 @@ def main():
             torchvision.utils.save_image(pbr_img, os.path.join(view_dir, "pbr.png"))
 
         vis_dict = render_pkg.get("vis_dict", {})
-        for key in ["roughness", "metallic", "base_color"]:
+        for key in ["roughness", "metallic", "base_color", "visibility",
+                     "incidents_light", "incident_light_raw",
+                     "diffuse_pbr", "specular_pbr", "image_pbr",
+                     "env_export_base", "env_export_diffuse"]:
             if key in vis_dict:
                 torchvision.utils.save_image(
                     torch.clamp(vis_dict[key], 0.0, 1.0),

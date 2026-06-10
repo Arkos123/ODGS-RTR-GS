@@ -69,8 +69,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     if is_pbr:
         if args.occlusion_path is not None:
             occlusion_volumes = torch.load(args.occlusion_path)
-            bound = occlusion_volumes["bound"]
-            aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
+            if "aabb" in occlusion_volumes:
+                aabb = occlusion_volumes["aabb"].clone().cuda()
+            else:
+                bound = occlusion_volumes["bound"]
+                aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
             pbr_kwargs["occlusion_volumes"] = occlusion_volumes
             pbr_kwargs["aabb"] = aabb
 
@@ -349,7 +352,7 @@ if __name__ == "__main__":
     parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast'], default='render_ref')
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
     parser.add_argument("--occlusion_path", type=str, default=None)
-    parser.add_argument('-e', '--envmap_path', default="/data/zhouyongyang/dataset/tensorIR/env_maps/high_res_envmaps_1k/", help="Env map path")
+    parser.add_argument('-e', '--envmap_path', default="/home/huangpengyue/projects/RTR-GS/data/env_maps/", help="Env map path")
     parser.add_argument("--save_video", action="store_true", default=False)
 
     args = parser.parse_args(sys.argv[1:])

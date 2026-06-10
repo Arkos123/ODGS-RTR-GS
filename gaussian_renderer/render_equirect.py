@@ -240,6 +240,33 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         )
         rendered_packed = rendered_packed / opacity_for_div * alpha_mask
 
+        # ---- Pass 6: Incident light (3 channels) ----
+        if not getattr(pipe, 'relight', False):
+            incidents = pc.get_incidents
+            incidents_rgb = torch.clamp(eval_sh(
+                pc.active_sh_degree,
+                incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2),
+                normal,
+            ), 0.0, 1.0)
+        elif getattr(pipe, 'transfer_light', False) and cubemap is not None:
+            transfer_shs = pc.get_incidents.permute(0, 2, 1)
+            light_shs = cubemap.shs
+            incidents = light_shs * transfer_shs
+            incidents = incidents.permute(0, 2, 1)
+            incidents_rgb = torch.clamp(eval_sh(
+                pc.active_sh_degree,
+                incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2),
+                normal,
+            ), 0.0, 1.0)
+        else:
+            incidents_rgb = torch.zeros_like(base_color)
+
+        rendered_incident_img, _, _, _, _ = _run_sgs_rasterizer(
+            means3D, means2D, incidents_rgb, opacity, scales, rotations,
+            rasterizer, cov3D_precomp=cov3D_precomp,
+        )
+        rendered_incident_img = rendered_incident_img / opacity_for_div * alpha_mask
+
     # ---- Background blending for main render ----
     opacity_map = rendered_opacity.permute(1, 2, 0)
     radiance_map = rendered_image.permute(1, 2, 0)
@@ -262,14 +289,23 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         view_dirs = F.normalize(
             -(ray_dirs.reshape(-1, 3) @ c2w[:3, :3].T).reshape(H, W, 3), dim=-1)
 
+        if aabb is not None:
+            clamp_min, clamp_max = aabb[:3], aabb[3:]
+        else:
+            cbound = dict_params.get("occlusion_volumes", {}).get("bound", 1.5)
+            clamp_min, clamp_max = -cbound, cbound
+
         points = (
             (-view_dirs.reshape(-1, 3) * depth.reshape(-1, 1) + c2w[:3, 3])
-            .clamp(min=-1.5, max=1.5)
+            .clamp(min=clamp_min, max=clamp_max)
             .contiguous()
         )
 
         occlusion_map = None
         if occlusion_volumes is not None:
+            if aabb is None:
+                cbound = occlusion_volumes["bound"]
+                aabb = torch.tensor([-cbound, -cbound, -cbound, cbound, cbound, cbound], device="cuda")
             occlusion_map = recon_occlusion(
                 H=H, W=W,
                 bound=occlusion_volumes["bound"],
@@ -282,6 +318,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
                 degree=occlusion_volumes["degree"],
             ).reshape(H, W, 1)
 
+        incident_light_map = rendered_incident_img.permute(1, 2, 0)  # [H, W, 3]
         pbr_result = pbr_shading(
             light=cubemap,
             normals=normal_map,
@@ -290,6 +327,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             roughness=roughness_map,
             metallic=metallic_map if pipe.metallic else None,
             occlusion=occlusion_map,
+            irradiance=incident_light_map,
             brdf_lut=brdf_lut,
         )
         rendered_pbr = pbr_result["render_rgb"]
@@ -309,7 +347,16 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             "metallic": metallic_map.permute(2, 0, 1),
             "visibility": occlusion_map.permute(2, 0, 1) if occlusion_map is not None
                           else torch.zeros_like(roughness_map).permute(2, 0, 1),
+            "incidents_light": pbr_result.get("incidents_light", torch.zeros_like(roughness_map)).permute(2, 0, 1),
+            "incident_light_raw": incident_light_map.permute(2, 0, 1),
+            "diffuse_pbr": diffuse_pbr.permute(2, 0, 1),
+            "specular_pbr": specular_pbr.permute(2, 0, 1),
+            "image_pbr": rendered_pbr.permute(2, 0, 1),
         })
+
+        if cubemap is not None:
+            out_feature_dict["env_export_base"] = cubemap.export_envmap(return_img=True).permute(2, 0, 1)
+            out_feature_dict["env_export_diffuse"] = cubemap.export_envmap(return_img=True, base=False).permute(2, 0, 1)
 
     out_feature_dict.update({
         "ref_roughness": rendered_ref_roughness_map,

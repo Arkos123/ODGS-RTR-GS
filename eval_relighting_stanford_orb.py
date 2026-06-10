@@ -68,7 +68,7 @@ if __name__ == '__main__':
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
-    parser.add_argument('-e', '--envmap_path', default="/data/zhouyongyang/dataset/tensorIR/env_maps/high_res_envmaps_1k/", help="Env map path")
+    parser.add_argument('-e', '--envmap_path', default="/home/huangpengyue/projects/RTR-GS/data/env_maps/", help="Env map path")
     parser.add_argument('-bg', "--background_color", type=float, default=1,
                         help="If set, use it as background color")
     parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast'], default='render_ref')
@@ -105,10 +105,13 @@ if __name__ == '__main__':
                 print("Failed to load transfer net!")
         
         occlusion_volumes = torch.load(args.occlusion_path)
-        bound = occlusion_volumes["bound"]
+        if "aabb" in occlusion_volumes:
+            aabb = occlusion_volumes["aabb"].clone().cuda()
+        else:
+            bound = occlusion_volumes["bound"]
+            aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
         scene = Scene(dataset, gaussians)
         canonical_rays = scene.get_canonical_rays()
-        aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
         brdf_lut = get_brdf_lut().cuda()
     else:
         raise NotImplementedError

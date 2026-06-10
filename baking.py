@@ -48,6 +48,42 @@ def get_envmap_dirs(res: List[int] = [256, 512]) -> Tuple[torch.Tensor, torch.Te
     return solid_angles, reflvec
 
 
+def compute_ray_aabb_tmax(
+    origin: torch.Tensor,
+    directions: torch.Tensor,
+    aabb_min: torch.Tensor,
+    aabb_max: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Compute the maximum distance from origin to AABB boundary along each direction.
+
+    Args:
+        origin: [3] voxel position
+        directions: [H, W, 3] unit direction vectors
+        aabb_min: [3] scene AABB minimum
+        aabb_max: [3] scene AABB maximum
+        eps: epsilon to avoid division by zero
+    Returns:
+        t_out: [H, W, 1] exit distance for each direction
+    """
+    safe_d = directions.clone()
+    safe_d[directions.abs() < eps] = eps
+
+    # For each axis, compute distance to exit the AABB along that direction
+    t_per_axis = torch.where(
+        safe_d > 0,
+        (aabb_max - origin) / safe_d,
+        (aabb_min - origin) / safe_d,
+    )
+    # Where direction ~ 0, the ray is parallel to that axis.
+    # Since origin is inside the AABB, this axis doesn't constrain t_out.
+    t_per_axis[directions.abs() < eps] = 1e10
+
+    t_out = t_per_axis.min(dim=-1, keepdim=True).values  # [H, W, 1]
+    return t_out
+
+
 def lookAt(eye: torch.Tensor, center: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     Z = F.normalize(eye - center, dim=0)
     Y = up
@@ -106,6 +142,11 @@ if __name__ == "__main__":
     parser.add_argument("--cubemap_res", default=256, type=int, help="The resolution of the cubemap produced during baking.")
     parser.add_argument("--occlusion", default=0.4, type=float, help="The occlusion threshold to control visible area, the smaller the bound, the lighter the ambient occlusion.")
     parser.add_argument("--checkpoint", type=str, default=None, help="The path to the checkpoint to load.")
+    parser.add_argument("--skip_walls", action="store_true", default=False, help="Skip wall surfaces during occlusion baking: treat the furthest surface along each direction as unoccluded (useful for sealed indoor scenes).")
+    parser.add_argument("--wall_threshold", type=float, default=0.8, help="Depth ratio threshold for wall detection. A surface at depth > t_out * threshold is considered a wall (if --skip_walls enabled).")
+    parser.add_argument("--extent_percentile", type=float, default=0.01, help="Percentile (0~1) used to compute robust scene extent from Gaussian positions. E.g. 0.01 means 1st/99th percentile. Used with --skip_walls and --auto_bound.")
+    parser.add_argument("--auto_bound", action="store_true", default=False, help="Automatically compute occlusion volume bound from scene extent (with --bound_padding margin), overriding --bound.")
+    parser.add_argument("--bound_padding", type=float, default=1.1, help="Padding factor for --auto_bound. E.g. 1.1 means 10%% margin beyond scene extent.")
     args = get_combined_args(parser)
 
     model_path = os.path.dirname(args.checkpoint)
@@ -206,11 +247,37 @@ if __name__ == "__main__":
         .cuda()
     )
 
-    # positions = torch.ones([1, 3]).cuda()
-    prods = list(itertools.product(range(args.occlu_res), range(args.occlu_res), range(args.occlu_res)))
-    aabb_min = torch.tensor([-args.bound] * 3).cuda()
-    aabb_max = torch.tensor([args.bound] * 3).cuda()
+    # compute scene extent from Gaussian positions (used by --auto_bound and --skip_walls)
+    if args.auto_bound or args.skip_walls:
+        p = args.extent_percentile
+        scene_min = torch.quantile(gaussians.get_xyz, p, dim=0)
+        scene_max = torch.quantile(gaussians.get_xyz, 1.0 - p, dim=0)
+        print(f"Scene extent ({p*100:.1f}th-{(1.0-p)*100:.1f}th percentile): min={scene_min.detach().cpu().numpy()}, max={scene_max.detach().cpu().numpy()}")
+        print(f"  (raw min/max: min={gaussians.get_xyz.min(dim=0).values.detach().cpu().numpy()}, max={gaussians.get_xyz.max(dim=0).values.detach().cpu().numpy()})")
 
+    if args.auto_bound:
+        scene_extent = max(scene_max.max().item(), (-scene_min).max().item())
+        pad = scene_extent * (args.bound_padding - 1.0) / 2.0
+
+        # Non-symmetric AABB with per-axis padding
+        auto_aabb_min = scene_min - pad
+        auto_aabb_max = scene_max + pad
+
+        # Backward-compat symmetric bound = max half-extent
+        sym_bound = max(auto_aabb_max.max().item(), (-auto_aabb_min).max().item())
+        print(f"[auto_bound] scene_extent={scene_extent:.3f}, aabb_min={auto_aabb_min.detach().cpu().numpy()}, aabb_max={auto_aabb_max.detach().cpu().numpy()}, bound(sym)={sym_bound:.3f}")
+        args.bound = sym_bound
+        args.valid = sym_bound
+
+    # Create voxel grid
+    if args.auto_bound:
+        aabb_min = auto_aabb_min.clone().cuda()
+        aabb_max = auto_aabb_max.clone().cuda()
+    else:
+        aabb_min = torch.tensor([-args.bound] * 3).cuda()
+        aabb_max = torch.tensor([args.bound] * 3).cuda()
+
+    prods = list(itertools.product(range(args.occlu_res), range(args.occlu_res), range(args.occlu_res)))
     grid = (aabb_max - aabb_min) / (args.occlu_res - 1)
     positions = torch.tensor(prods).cuda() * grid + aabb_min  # [bs, 3]
 
@@ -280,6 +347,13 @@ if __name__ == "__main__":
     # get canonical ray and its norm to normalize depth
     canonical_rays = get_canonical_rays(H=res, W=res, tan_fovx=1.0, tan_fovy=1.0)  # [HW, 3]
     norm = torch.norm(canonical_rays, p=2, dim=-1).reshape(res, res, 1)  # [H, W]
+
+    # scene_min/max already computed above (for --auto_bound and/or --skip_walls)
+    if args.skip_walls:
+        if args.auto_bound:
+            print(f"  Using scene extent as reference for wall detection (grid covers [{aabb_min[0]:.3f}, {aabb_max[0]:.3f}] x [{aabb_min[1]:.3f}, {aabb_max[1]:.3f}] x [{aabb_min[2]:.3f}, {aabb_max[2]:.3f}])")
+        else:
+            print(f"  Using scene extent as reference for wall detection (bound={args.bound})")
 
     with torch.no_grad():
         for grid_id in trange(num_grid):
@@ -367,7 +441,15 @@ if __name__ == "__main__":
             # use SH to store the HDRI
             # occlu_mask = (1 - (depth_envmap < occlusion_threshold).float()) + (depth_envmap == 0).float()  # [H, W, 1]
             # occlu_mask = (rgb_envmap > 0.5).float()
-            occlu_mask = torch.where(rgb_envmap > 0.5, 1.0, 0.0)
+            is_bg = (rgb_envmap > 0.5)  # [H, W, 1] — no surface hit, fully visible
+            if args.skip_walls:
+                # Compute max distance from voxel to scene boundary along each direction
+                t_out = compute_ray_aabb_tmax(position, envmap_dirs, scene_min, scene_max)
+                # A surface close to the scene boundary is a "wall" → treat as visible
+                is_wall = (~is_bg) & (depth_envmap > t_out * args.wall_threshold)
+                occlu_mask = (is_bg | is_wall).float()
+            else:
+                occlu_mask = is_bg.float()
 
             weighted_color = occlu_mask * solid_angles  # [H, W, 1]
             temp_coefficients = (weighted_color * components).sum(0).sum(0)  # [d2]
@@ -377,16 +459,16 @@ if __name__ == "__main__":
         while (occlusion_ids == -1).sum() > 0:
             gs_ir_ext.dialate_occlusion_ids(occlusion_ids)
 
+    save_dict = {
+        "occlusion_ids": occlusion_ids,
+        "occlusion_coefficients": occlusion_coefficients,
+        "bound": args.bound,
+        "degree": occlu_sh_degree,
+        "occlusion_threshold": occlusion_threshold,
+    }
+    if args.auto_bound:
+        save_dict["aabb"] = torch.cat([auto_aabb_min.cpu(), auto_aabb_max.cpu()])  # [6]
     save_file = os.path.join(os.path.dirname(args.checkpoint), "occlusion_volumes.pth")
-    torch.save(
-        {
-            "occlusion_ids": occlusion_ids,
-            "occlusion_coefficients": occlusion_coefficients,
-            "bound": args.bound,
-            "degree": occlu_sh_degree,
-            "occlusion_threshold": occlusion_threshold,
-        },
-        save_file,
-    )
+    torch.save(save_dict, save_file)
     print(f"save occlusion volumes as {save_file}")
 

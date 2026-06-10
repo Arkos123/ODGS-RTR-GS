@@ -315,8 +315,11 @@ def evaling(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams,
     if is_pbr:
         if args.occlusion_path is not None:
             occlusion_volumes = torch.load(args.occlusion_path)
-            bound = occlusion_volumes["bound"]
-            aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
+            if "aabb" in occlusion_volumes:
+                aabb = occlusion_volumes["aabb"].clone().cuda()
+            else:
+                bound = occlusion_volumes["bound"]
+                aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
             pbr_kwargs["occlusion_volumes"] = occlusion_volumes
             pbr_kwargs["aabb"] = aabb
 

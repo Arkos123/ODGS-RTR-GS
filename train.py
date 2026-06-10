@@ -104,8 +104,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     if is_pbr:
         if args.occlusion_path is not None:
             occlusion_volumes = torch.load(args.occlusion_path)
-            bound = occlusion_volumes["bound"]
-            aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
+            if "aabb" in occlusion_volumes:
+                aabb = occlusion_volumes["aabb"].clone().cuda()
+            else:
+                bound = occlusion_volumes["bound"]
+                aabb = torch.tensor([-bound, -bound, -bound, bound, bound, bound]).cuda()
             pbr_kwargs["occlusion_volumes"] = occlusion_volumes
             pbr_kwargs["aabb"] = aabb
 
@@ -543,9 +546,16 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs):
 
             vis_dict = results["vis_dict"]  
             write_image_dict.update(vis_dict)
-            ban_image_keys = ["env_export_base", "env_export_diffuse", "base_color", "ref_export_base", "ref_tint",\
+            ban_image_keys = ["base_color", "ref_export_base", "ref_tint",\
                               "radiance_color", "ref_roughness", "ref_strength", "ref_color"]
             # ban_image_keys = []
+
+            # Save global env maps / incident light once
+            if not mkdir_flag:
+                for key in ["env_export_base", "env_export_diffuse", "incidents_light", "incident_light_raw"]:
+                    if key in write_image_dict:
+                        save_image(torch.clamp(write_image_dict[key], 0.0, 1.0),
+                                   os.path.join(args.model_path, f"{key}.png"))
 
             if not mkdir_flag:
                 mkdir_flag = True
