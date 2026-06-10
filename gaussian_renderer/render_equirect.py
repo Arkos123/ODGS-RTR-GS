@@ -411,9 +411,15 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
                 "metallic": rendered_packed[1:2],
                 "diffuse_pbr": diffuse_pbr.permute(2, 0, 1),
                 "specular_pbr": specular_pbr.permute(2, 0, 1),
+                "visibility": occlusion_map.permute(2, 0, 1) if occlusion_map is not None
+                              else torch.zeros_like(roughness_map).permute(2, 0, 1),
+                "incidents_light": pbr_result.get("incidents_light", torch.zeros_like(roughness_map)).permute(2, 0, 1),
+                "incident_light_raw": incident_light_map.permute(2, 0, 1),
+                "image_pbr": rendered_pbr.permute(2, 0, 1),
             })
             if cubemap is not None:
                 vis_dict["env_export_base"] = cubemap.export_envmap(return_img=True).permute(2, 0, 1)
+                vis_dict["env_export_diffuse"] = cubemap.export_envmap(return_img=True, base=False).permute(2, 0, 1)
         results["vis_dict"] = vis_dict
 
     return results
