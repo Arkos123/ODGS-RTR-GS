@@ -169,11 +169,12 @@ def safe_state(silent):
     torch.cuda.set_device(torch.device("cuda:0"))
 
 def get_minimum_axis(scales, rotations):
-    sorted_idx = torch.argsort(scales, descending=False, dim=-1)
-    R = build_rotation(rotations)
-    R_sorted = torch.gather(R, dim=2, index=sorted_idx[:,None,:].repeat(1, 3, 1)).squeeze()
-    x_axis = R_sorted[:,0,:] # normalized by defaut
-
+    # CUDA rasterizer convention: Σ = (S @ R)^T @ (S @ R) = R^T @ S² @ R
+    # → eigenvectors = ROWS of R. Extract row at the smallest scale index.
+    R = build_rotation(rotations)  # [N, 3, 3]
+    min_axis_id = torch.argmin(scales, dim=-1)  # [N]
+    batch_idx = torch.arange(R.shape[0], device=R.device)
+    x_axis = R[batch_idx, min_axis_id, :]  # [N, 3] — row at min_axis_id
     return x_axis
 
 def flip_align_view(normal, viewdir):

@@ -218,7 +218,9 @@ class GaussianModel:
         min_axis = torch.zeros_like(scales).scatter(1, min_axis_id, 1)
 
         rot_matrix = build_rotation(self.get_rotation)
-        ndir = torch.bmm(rot_matrix, min_axis.unsqueeze(-1)).squeeze(-1)
+        # CUDA rasterizer convention: Σ = (S @ R)^T @ (S @ R) = R^T @ S² @ R
+        # → eigenvectors = ROWS of R. Extract row = R^T @ onehot.
+        ndir = torch.bmm(rot_matrix.transpose(1, 2), min_axis.unsqueeze(-1)).squeeze(-1)
 
         neg_msk = torch.sum(p2o*ndir, dim=-1) < 0
         ndir[neg_msk] = -ndir[neg_msk] # make sure normal orient to camera

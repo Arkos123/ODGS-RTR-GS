@@ -413,6 +413,43 @@ if __name__ == "__main__":
         equi_dirs = _equirect_ray_dirs(H, W).cuda()  # [H, W, 3]
         hit_pos = dummy_cam.camera_center.view(1, 1, 3) + equi_dirs * depth  # [H, W, 3]
 
+        # ---- Normal-facing debug: check if normals point toward or away from camera ----
+        def save_img(tensor, path):
+            imageio.imwrite(path, (tensor.clamp(0, 1).detach().cpu().numpy() * 255).astype(np.uint8))
+
+        # normal_raw is [3, H, W] from the SGS rasterizer → permute to [H, W, 3]
+        normal_img = normal_raw.permute(1, 2, 0)  # [H, W, 3]
+        normal_len = normal_img.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        normal_unit = normal_img / normal_len  # [H, W, 3] unit-length world-space normals
+
+        # view_dir = hit_pos - camera (direction from camera → hit point), equi_dirs is already unit.
+        # cos_angle = dot(normal, view_dir):
+        #   > 0 → same direction → normal points AWAY from camera (back-facing, "背向视野")
+        #   < 0 → opposite → normal points TOWARD camera (front-facing, "朝向视野")
+        cos_angle = (normal_unit * equi_dirs).sum(dim=-1)  # [H, W], range ≈ [-1, 1]
+
+        # 1) Binary facing map: red = back-facing (normal away from camera), blue = front-facing
+        facing_vis = torch.where(
+            cos_angle.unsqueeze(-1) > 0,
+            torch.tensor([1.0, 0.1, 0.1], device="cuda"),  # red: back-facing
+            torch.tensor([0.1, 0.3, 1.0], device="cuda"),  # blue: front-facing
+        )
+        facing_vis = torch.where(alpha > 0.5, facing_vis, rendered_image * 0.3 + 0.5)
+
+        # 2) Cos heatmap: white(cos=+1,back) → gray(cos=0) → black(cos=-1,front)
+        cos_heat = ((cos_angle + 1) / 2).clamp(0, 1)  # [H, W] mapped to 0~1
+        cos_heat_rgb = cos_heat.unsqueeze(-1).expand(-1, -1, 3)
+        cos_heat_rgb = torch.where(alpha > 0.5, cos_heat_rgb, rendered_image * 0.3 + 0.5)
+
+        # 3) Raw normal map for reference (world-space normal encoded as RGB)
+        normal_map = normal_unit * 0.5 + 0.5  # [-1,1] → [0,1]
+
+        save_img(facing_vis.squeeze(), os.path.join(model_path, "vis_walls_normal_facing.png"))
+        save_img(cos_heat_rgb.squeeze(), os.path.join(model_path, "vis_walls_normal_cos.png"))
+        save_img(normal_map.squeeze(), os.path.join(model_path, "vis_walls_normal_map.png"))
+        print(f"[vis_walls] Saved normal-facing debug: vis_walls_normal_facing.png (red=back, blue=front)")
+        print(f"[vis_walls]   Also saved: vis_walls_normal_cos.png (heatmap), vis_walls_normal_map.png")
+
         # Wall detection with per-face margins
         is_bg = (alpha < 0.5)
         dist_to_min = hit_pos - scene_min.cuda()  # [H, W, 3] — (dist_to_min_x, dist_to_min_y, dist_to_min_z)
@@ -432,9 +469,6 @@ if __name__ == "__main__":
         if is_wall.any() and wall_margins.max() > 0:
             wmask = is_wall.squeeze().unsqueeze(-1).expand(-1, -1, 3)  # [H, W, 3]
             overlay = torch.where(wmask, overlay * 0.3 + torch.tensor([0.7, 0.1, 0.0], device="cuda") * 0.7, overlay)
-
-        def save_img(tensor, path):
-            imageio.imwrite(path, (tensor.clamp(0, 1).detach().cpu().numpy() * 255).astype(np.uint8))
 
         save_img(rendered_image, os.path.join(model_path, "vis_walls_rgb.png"))
         save_img(overlay, os.path.join(model_path, "vis_walls_overlay.png"))

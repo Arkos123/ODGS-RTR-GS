@@ -58,13 +58,145 @@ def _run_sgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, rot
     return rendered_image, depth_raw, alpha, radii, normal_raw
 
 
-def _normal_from_raw(normal_raw, alpha, eps=1e-8):
-    """Normalize raw rasterizer normal output and mask with alpha."""
-    opacity_for_div = alpha.clamp_min(1e-5)
-    normal = F.normalize(normal_raw / opacity_for_div, dim=0, eps=eps)
-    alpha_mask = (alpha > 0).float()
-    normal = normal * alpha_mask
-    return normal
+
+# ── ERP depth-to-normal helpers (from SGS gaussian_renderer) ────────────────
+
+def _erp_edge_aware_smooth_depth(depth: torch.Tensor, alpha: torch.Tensor | None,
+                                 iters: int = 2, rel_sigma: float = 0.035,
+                                 eps: float = 1.0e-6):
+    if depth is None or depth.numel() == 0:
+        return depth
+    d = depth
+    valid = torch.ones_like(d, dtype=d.dtype)
+    if alpha is not None:
+        valid = (alpha > 1.0e-5).to(dtype=d.dtype, device=d.device)
+    sigma = max(float(rel_sigma), 1.0e-4)
+    for _ in range(max(0, int(iters))):
+        acc = d * valid
+        wsum = valid.clone()
+        for shift, dim, cyclic in [(-1, -1, True), (1, -1, True), (-1, -2, False), (1, -2, False)]:
+            dn = torch.roll(d, shifts=shift, dims=dim)
+            vn = torch.roll(valid, shifts=shift, dims=dim)
+            if not cyclic:
+                if dim == -2 and shift < 0:
+                    vn[..., -1:, :] = 0.0
+                elif dim == -2 and shift > 0:
+                    vn[..., :1, :] = 0.0
+            rel = (dn.detach() - d.detach()).abs() / (0.5 * (dn.detach().abs() + d.detach().abs()) + eps)
+            w = vn * valid / (1.0 + (rel / sigma) ** 2)
+            acc = acc + w * dn
+            wsum = wsum + w
+        d = acc / wsum.clamp_min(eps)
+    return d
+
+
+def _shift_with_spatial_mask(t: torch.Tensor, shift: int, dim: int, cyclic: bool):
+    out = torch.roll(t, shifts=shift, dims=dim)
+    mask = torch.ones_like(t[:1])
+    if not cyclic and dim == -2 and shift != 0:
+        k = abs(int(shift))
+        if shift < 0:
+            mask[..., -k:, :] = 0.0
+        else:
+            mask[..., :k, :] = 0.0
+    return out, mask
+
+
+def _relative_depth_gate(d0: torch.Tensor, d1: torch.Tensor, sigma: float, eps: float = 1.0e-6):
+    sig = max(float(sigma), 1.0e-4)
+    rel = (d1.detach() - d0.detach()).abs() / (0.5 * (d1.detach().abs() + d0.detach().abs()) + eps)
+    return 1.0 / (1.0 + (rel / sig) ** 4)
+
+
+def _erp_tangent_from_same_surface_neighbors(pts: torch.Tensor, depth: torch.Tensor,
+                                             valid: torch.Tensor, step: int, dim: int,
+                                             edge_sigma: float):
+    st = max(1, int(step))
+    cyclic = (dim == -1)
+    p_f, mf = _shift_with_spatial_mask(pts, -st, dim, cyclic)
+    p_b, mb = _shift_with_spatial_mask(pts, st, dim, cyclic)
+    d_f, _ = _shift_with_spatial_mask(depth, -st, dim, cyclic)
+    d_b, _ = _shift_with_spatial_mask(depth, st, dim, cyclic)
+    v_f, _ = _shift_with_spatial_mask(valid, -st, dim, cyclic)
+    v_b, _ = _shift_with_spatial_mask(valid, st, dim, cyclic)
+
+    wf = valid * v_f * mf * _relative_depth_gate(depth, d_f, edge_sigma)
+    wb = valid * v_b * mb * _relative_depth_gate(depth, d_b, edge_sigma)
+    tangent = (wf * (p_f - pts) + wb * (pts - p_b)) / (wf + wb).clamp_min(1.0e-8)
+    confidence = (wf + wb).clamp(0.0, 1.0)
+    return tangent, confidence
+
+
+def _erp_smooth_normals_same_surface(normal: torch.Tensor, depth: torch.Tensor,
+                                     confidence: torch.Tensor, iters: int,
+                                     edge_sigma: float, eps: float = 1.0e-8):
+    if normal is None or normal.numel() == 0:
+        return normal
+    n = normal
+    c = confidence.clamp(0.0, 1.0)
+    for _ in range(max(0, int(iters))):
+        acc = n * c
+        wsum = c.clone()
+        for shift, dim, cyclic in [(-1, -1, True), (1, -1, True), (-1, -2, False), (1, -2, False)]:
+            nn, mm = _shift_with_spatial_mask(n, shift, dim, cyclic)
+            dn, _ = _shift_with_spatial_mask(depth, shift, dim, cyclic)
+            cn, _ = _shift_with_spatial_mask(c, shift, dim, cyclic)
+            dg = _relative_depth_gate(depth, dn, edge_sigma)
+            ng = ((n.detach() * nn.detach()).sum(dim=0, keepdim=True).clamp_min(0.0)) ** 2
+            w = c * cn * mm * dg * ng
+            acc = acc + w * nn
+            wsum = wsum + w
+        n = F.normalize(acc / wsum.clamp_min(eps), dim=0, eps=eps)
+    return n
+
+
+def _erp_depth_to_normal(depth: torch.Tensor, alpha: torch.Tensor,
+                         eps: float = 1.0e-8, step: int = 8,
+                         smooth_iters: int = 3,
+                         smooth_rel_sigma: float = 0.055,
+                         edge_rel_sigma: float = 0.075,
+                         min_confidence: float = 0.035):
+    if depth is None or depth.numel() == 0 or depth.ndim != 3:
+        return None, None
+    _, H, W = depth.shape
+    valid = torch.ones_like(depth, dtype=depth.dtype)
+    if alpha is not None:
+        valid = (alpha > 1.0e-5).to(dtype=depth.dtype, device=depth.device)
+
+    d = _erp_edge_aware_smooth_depth(depth, alpha, iters=int(smooth_iters), rel_sigma=float(smooth_rel_sigma))
+    device, dtype = d.device, d.dtype
+
+    ys = torch.linspace(0.5 * math.pi, -0.5 * math.pi, H, device=device, dtype=dtype)
+    xs = torch.linspace(-math.pi, math.pi, W, device=device, dtype=dtype)
+    lat, lon = torch.meshgrid(ys, xs, indexing='ij')
+    rays = torch.stack([torch.sin(lon) * torch.cos(lat), torch.sin(lat), torch.cos(lon) * torch.cos(lat)], dim=0)
+    pts = rays * d.clamp_min(1.0e-6)
+
+    st = max(1, min(int(step), max(1, min(H, W) // 8)))
+    steps = sorted(set([1, max(1, st // 4), max(1, st // 2), st]))
+    n_acc = torch.zeros_like(pts)
+    c_acc = torch.zeros_like(d)
+    scale_w_sum = 0.0
+    for s in steps:
+        tx, cx = _erp_tangent_from_same_surface_neighbors(pts, d, valid, s, -1, edge_rel_sigma)
+        ty, cy = _erp_tangent_from_same_surface_neighbors(pts, d, valid, s, -2, edge_rel_sigma)
+        cross = torch.cross(tx, ty, dim=0)
+        cross_norm = torch.linalg.norm(cross, dim=0, keepdim=True)
+        n = F.normalize(cross, dim=0, eps=eps)
+        n = torch.where((n * rays).sum(dim=0, keepdim=True) > 0.0, -n, n)
+        c = (cx * cy * (cross_norm.detach() / (cross_norm.detach() + 1.0e-6))).clamp(0.0, 1.0)
+        sw = math.sqrt(float(s))
+        n_acc = n_acc + sw * c * n
+        c_acc = c_acc + sw * c
+        scale_w_sum += sw
+
+    confidence = (c_acc / max(scale_w_sum, 1.0e-6)).clamp(0.0, 1.0)
+    n = F.normalize(n_acc / c_acc.clamp_min(eps), dim=0, eps=eps)
+    post_iters = max(1, int(smooth_iters) // 3)
+    n = _erp_smooth_normals_same_surface(n, d, confidence, post_iters, edge_rel_sigma)
+    keep = (valid > 0.0) & (confidence > float(min_confidence))
+    n = torch.where(keep.expand_as(n), n, torch.zeros_like(n))
+    return n
 
 
 def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
@@ -172,15 +304,15 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     else:
         colors_precomp_pass1 = colors_precomp
 
-    rendered_image, depth, acc, radii, pass1_normal_raw = _run_sgs_rasterizer(
+    rendered_image, depth, acc, radii, _ = _run_sgs_rasterizer(
         means3D, means2D, colors_precomp_pass1, opacity, scales, rotations,
         rasterizer, shs=shs, cov3D_precomp=cov3D_precomp,
     )
     rendered_opacity = acc
     visibility_filter = radii > 0
 
-    # ---- Pseudo-normal from rasterizer normal_raw ----
-    pseudo_normal = _normal_from_raw(pass1_normal_raw, rendered_opacity)
+    # ---- Pseudo-normal from depth (geometrically correct, like SGS normal_depth) ----
+    pseudo_normal = _erp_depth_to_normal(depth, rendered_opacity)
 
     # ---- Alpha normalization mask for multi-pass outputs ----
     alpha_mask = (rendered_opacity > 0).float()
@@ -195,6 +327,27 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     rendered_normal_img = rendered_normal_img / opacity_for_div * alpha_mask
     rendered_normal = rendered_normal_img * 2.0 - 1.0
     rendered_normal = F.normalize(rendered_normal, dim=0)
+
+    # ---- Normal-facing visualization (red=back-facing, blue=front-facing) ----
+    out_feature_dict = {}
+    # rendered_normal is [3, H, W] world-space normal
+    # Camera-to-point direction in world space
+    ray_dirs_vis = _equirect_ray_dirs(H, W)  # [H, W, 3]
+    cam_to_point = F.normalize(
+        (ray_dirs_vis.reshape(-1, 3) @ c2w[:3, :3].T).reshape(H, W, 3), dim=-1)
+    normal_hw = rendered_normal.permute(1, 2, 0)  # [H, W, 3]
+    cos_angle_nml = (normal_hw * cam_to_point).sum(dim=-1)  # [H, W], >0 back-facing
+    facing_vis = torch.where(
+        cos_angle_nml.unsqueeze(-1) > 0,
+        torch.tensor([1.0, 0.1, 0.1], device="cuda"),  # red: back-facing
+        torch.tensor([0.1, 0.3, 1.0], device="cuda"),  # blue: front-facing
+    )
+    facing_vis = torch.where(
+        (rendered_opacity > 0.5).permute(1, 2, 0).expand(-1, -1, 3),
+        facing_vis,
+        torch.tensor([0.5, 0.5, 0.5], device="cuda"),  # gray: background
+    )
+    out_feature_dict["normal_facing"] = facing_vis.permute(2, 0, 1)
 
     # ---- Pass 3: Ref_strength + ref_roughness + ref_tint (for visualization) ----
     colors_precomp_refs = torch.cat([ref_strength, ref_roughness, torch.zeros_like(ref_strength)], dim=-1)
@@ -275,7 +428,6 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     # = rendered_image + (1 - rendered_opacity) * bg_color
     ref_rgb = radiance_map + (1.0 - opacity_map) * bg_color
 
-    out_feature_dict = {}
 
     # ---- PBR shading ----
     if pc.use_pbr:
@@ -399,6 +551,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             "depth": depth_norm,
             "normal": rendered_normal * 0.5 + 0.5,
             "radiance_color": rendered_image,
+            "normal_facing": facing_vis.permute(2, 0, 1),
         }
         vis_dict["ref_strength"] = rendered_ref_strength_map
         vis_dict["ref_roughness"] = rendered_ref_roughness_map
