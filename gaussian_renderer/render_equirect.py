@@ -295,8 +295,11 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             cbound = dict_params.get("occlusion_volumes", {}).get("bound", 1.5)
             clamp_min, clamp_max = -cbound, cbound
 
+        # SGS rasterizer outputs raw Σ(T_i * α_i * z_i); normalise by opacity
+        # to obtain true surface depth before computing 3D points.
+        surf_depth = depth / rendered_opacity.clamp_min(1e-5)
         points = (
-            (-view_dirs.reshape(-1, 3) * depth.reshape(-1, 1) + c2w[:3, 3])
+            (-view_dirs.reshape(-1, 3) * surf_depth.reshape(-1, 1) + c2w[:3, 3])
             .clamp(min=clamp_min, max=clamp_max)
             .contiguous()
         )
@@ -504,6 +507,28 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
                 loss_roughness_smooth = first_order_edge_aware_loss(rendered_roughness * image_mask, gt_image)
                 tb_dict["loss_roughness_smooth"] = loss_roughness_smooth.item()
                 loss = loss + opt.lambda_roughness_smooth * loss_roughness_smooth
+
+        if opt.lambda_base_color_smooth > 0:
+            image_mask = viewpoint_camera.image_mask.cuda()
+            rendered_base_color = results.get("base_color")
+            if rendered_base_color is not None:
+                loss_base_color_smooth = first_order_edge_aware_loss(rendered_base_color * image_mask, gt_image)
+                tb_dict["loss_base_color_smooth"] = loss_base_color_smooth.item()
+                loss = loss + opt.lambda_base_color_smooth * loss_base_color_smooth
+
+        if opt.lambda_metallic_smooth > 0:
+            image_mask = viewpoint_camera.image_mask.cuda()
+            rendered_metallic = results.get("metallic")
+            if rendered_metallic is not None:
+                loss_metallic_smooth = first_order_edge_aware_loss(rendered_metallic * image_mask, gt_image)
+                tb_dict["loss_metallic_smooth"] = loss_metallic_smooth.item()
+                loss = loss + opt.lambda_metallic_smooth * loss_metallic_smooth
+
+        if opt.lambda_env_smooth > 0 and env_map is not None:
+            env = env_map.get_env_map()
+            loss_env_smooth = tv_loss(env.permute(2, 0, 1))
+            tb_dict["loss_env_smooth"] = loss_env_smooth
+            loss = loss + opt.lambda_env_smooth * loss_env_smooth
 
         if opt.lambda_white_light > 0 and env_map is not None:
             env_base = env_map.base
