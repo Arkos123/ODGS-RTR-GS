@@ -1,9 +1,10 @@
 import os
+import json
 import itertools
 import math
 from argparse import ArgumentParser
 from os import makedirs
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 import imageio.v2 as imageio
 import numpy as np
@@ -16,8 +17,10 @@ from gs_ir import _C as gs_ir_ext
 
 from arguments import ModelParams, PipelineParams, get_combined_args
 from scene.gaussian_model import GaussianModel
+from scene.cameras import Camera
 from utils.graphics_utils import getProjectionMatrix
-from utils.sh_utils import components_from_spherical_harmonics
+from utils.sh_utils import components_from_spherical_harmonics, eval_sh
+from spherical_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
 
 def getWorld2ViewTorch(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -46,42 +49,6 @@ def get_envmap_dirs(res: List[int] = [256, 512]) -> Tuple[torch.Tensor, torch.Te
     print(f"solid_angles_sum error: {solid_angles.sum() - 4 * np.pi}")
 
     return solid_angles, reflvec
-
-
-def compute_ray_aabb_tmax(
-    origin: torch.Tensor,
-    directions: torch.Tensor,
-    aabb_min: torch.Tensor,
-    aabb_max: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """
-    Compute the maximum distance from origin to AABB boundary along each direction.
-
-    Args:
-        origin: [3] voxel position
-        directions: [H, W, 3] unit direction vectors
-        aabb_min: [3] scene AABB minimum
-        aabb_max: [3] scene AABB maximum
-        eps: epsilon to avoid division by zero
-    Returns:
-        t_out: [H, W, 1] exit distance for each direction
-    """
-    safe_d = directions.clone()
-    safe_d[directions.abs() < eps] = eps
-
-    # For each axis, compute distance to exit the AABB along that direction
-    t_per_axis = torch.where(
-        safe_d > 0,
-        (aabb_max - origin) / safe_d,
-        (aabb_min - origin) / safe_d,
-    )
-    # Where direction ~ 0, the ray is parallel to that axis.
-    # Since origin is inside the AABB, this axis doesn't constrain t_out.
-    t_per_axis[directions.abs() < eps] = 1e10
-
-    t_out = t_per_axis.min(dim=-1, keepdim=True).values  # [H, W, 1]
-    return t_out
 
 
 def lookAt(eye: torch.Tensor, center: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
@@ -131,6 +98,19 @@ def get_canonical_rays(H: int, W: int, tan_fovx: float, tan_fovy: float) -> torc
 
 MIN_DEPTH = 1e-6
 
+
+def _equirect_ray_dirs(H: int, W: int, device: str = "cuda") -> torch.Tensor:
+    """Equirectangular pixel → world-space ray direction vectors [H, W, 3]."""
+    ys = torch.linspace(0.5 * math.pi, -0.5 * math.pi, H, device=device)
+    xs = torch.linspace(-math.pi, math.pi, W, device=device)
+    lat, lon = torch.meshgrid(ys, xs, indexing="ij")
+    return torch.stack([
+        torch.sin(lon) * torch.cos(lat),
+        torch.sin(lat),
+        torch.cos(lon) * torch.cos(lat),
+    ], dim=-1)
+
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Testing script parameters")
@@ -142,15 +122,31 @@ if __name__ == "__main__":
     parser.add_argument("--cubemap_res", default=256, type=int, help="The resolution of the cubemap produced during baking.")
     parser.add_argument("--occlusion", default=0.4, type=float, help="The occlusion threshold to control visible area, the smaller the bound, the lighter the ambient occlusion.")
     parser.add_argument("--checkpoint", type=str, default=None, help="The path to the checkpoint to load.")
-    parser.add_argument("--skip_walls", action="store_true", default=False, help="Skip wall surfaces during occlusion baking: treat the furthest surface along each direction as unoccluded (useful for sealed indoor scenes).")
-    parser.add_argument("--wall_threshold", type=float, default=0.8, help="Depth ratio threshold for wall detection. A surface at depth > t_out * threshold is considered a wall (if --skip_walls enabled).")
+    parser.add_argument("--skip_walls", action="store_true", default=False, help="Skip wall surfaces during occlusion baking: treat surfaces near the scene boundary as unoccluded (useful for sealed indoor scenes).")
+    parser.add_argument("--wall_margin", type=str, default="0.3", help="Distance threshold(s) for wall detection. Single float (e.g. 0.3) applies to all 6 faces. 6 comma-separated values (e.g. 0.1,0.1,0.3,0.2,0.1,0.1) for min_x,max_x,min_y,max_y,min_z,max_z.")
+    parser.add_argument("--vis_walls", action="store_true", default=False, help="Visualize wall detection: save wall/non-wall Gaussians as PLY files and exit (requires --skip_walls).")
     parser.add_argument("--extent_percentile", type=float, default=0.01, help="Percentile (0~1) used to compute robust scene extent from Gaussian positions. E.g. 0.01 means 1st/99th percentile. Used with --skip_walls and --auto_bound.")
     parser.add_argument("--auto_bound", action="store_true", default=False, help="Automatically compute occlusion volume bound from scene extent (with --bound_padding margin), overriding --bound.")
     parser.add_argument("--bound_padding", type=float, default=1.1, help="Padding factor for --auto_bound. E.g. 1.1 means 10%% margin beyond scene extent.")
     args = get_combined_args(parser)
 
+    # Parse wall_margin: single float → 6 identical values, or "a,b,c,d,e,f"
+    raw = str(args.wall_margin)
+    parts = [float(p.strip()) for p in raw.split(",")]
+    if len(parts) == 1:
+        parts = parts * 6
+    elif len(parts) != 6:
+        parser.error("--wall_margin must be a single float or 6 comma-separated values (min_x,max_x,min_y,max_y,min_z,max_z)")
+    wall_margins = torch.tensor(parts, device="cuda")  # [6]
+
     model_path = os.path.dirname(args.checkpoint)
     print("Rendering " + model_path)
+
+    # Save command-line args to checkpoint directory
+    os.makedirs(model_path, exist_ok=True)
+    with open(os.path.join(model_path, "args_baking.json"), "w") as f:
+        json.dump(vars(args), f, indent=2, default=str)
+    print(f"Saved baking args to {os.path.join(model_path, 'args_baking.json')}")
 
     # dataset = model.extract(args)
     pipeline = pipeline.extract(args)
@@ -355,6 +351,100 @@ if __name__ == "__main__":
         else:
             print(f"  Using scene extent as reference for wall detection (bound={args.bound})")
 
+    # --vis_walls: render equirect panorama using SGS rasterizer for wall detection verification
+    if args.vis_walls:
+        center = ((scene_min + scene_max) / 2)
+        print(f"\n[vis_walls] Rendering from scene center: {center.detach().cpu().numpy()}")
+        print(f"[vis_walls] scene_min={scene_min.detach().cpu().numpy()}, scene_max={scene_max.detach().cpu().numpy()}")
+        print(f"[vis_walls] wall_margin={args.wall_margin} → per-face: min_x={parts[0]}, max_x={parts[1]}, min_y={parts[2]}, max_y={parts[3]}, min_z={parts[4]}, max_z={parts[5]}")
+
+        # Build a dummy Camera at scene center for the SGS equirect rasterizer
+        H, W = 256, 512  # equirect resolution
+        R = np.eye(3, dtype=np.float32)
+        T = -center.detach().cpu().numpy().astype(np.float32)
+        dummy_cam = Camera(colmap_id=0, R=R, T=T, FoVx=1.0, FoVy=1.0,
+                           fx=1.0, fy=1.0, cx=W / 2, cy=H / 2,
+                           image=None, image_name="vis", uid=0,
+                           height=H, width=W, data_device="cuda")
+
+        # SGS equirect rasterizer settings (camera_type=3)
+        raster_settings = GaussianRasterizationSettings(
+            image_height=H,
+            image_width=W,
+            tanfovx=0.0,
+            tanfovy=0.0,
+            bg=torch.zeros(3, device="cuda"),
+            scale_modifier=1.0,
+            viewmatrix=dummy_cam.world_view_transform,
+            projmatrix=dummy_cam.full_proj_transform,
+            sh_degree=gaussians.active_sh_degree,
+            campos=dummy_cam.camera_center,
+            prefiltered=False,
+            debug=False,
+            camera_type=3,
+            render_depth=False,
+        )
+        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+        screenspace_points = torch.zeros_like(means3D, requires_grad=True, device="cuda") + 0
+        try:
+            screenspace_points.retain_grad()
+        except:
+            pass
+
+        # Render with SH
+        shs = gaussians.get_shs
+        rendered_image, radii, depth_raw, acc, normal_raw = rasterizer(
+            means3D=means3D,
+            means2D=screenspace_points,
+            shs=shs,
+            colors_precomp=None,
+            opacities=opacity,
+            scales=scales,
+            rotations=rots,
+            cov3D_precomp=None,
+        )  # rendered_image: [3, H, W], depth_raw: [1, H, W], acc: [1, H, W]
+
+        rendered_image = rendered_image.permute(1, 2, 0)  # [H, W, 3]
+        depth = (depth_raw.squeeze(0) / acc.squeeze(0).clamp_min(1e-6)).unsqueeze(-1)  # [H, W, 1]
+        alpha = acc.unsqueeze(-1)  # [H, W, 1]
+
+        # Equirect ray directions for hit position computation
+        equi_dirs = _equirect_ray_dirs(H, W).cuda()  # [H, W, 3]
+        hit_pos = dummy_cam.camera_center.view(1, 1, 3) + equi_dirs * depth  # [H, W, 3]
+
+        # Wall detection with per-face margins
+        is_bg = (alpha < 0.5)
+        dist_to_min = hit_pos - scene_min.cuda()  # [H, W, 3] — (dist_to_min_x, dist_to_min_y, dist_to_min_z)
+        dist_to_max = scene_max.cuda() - hit_pos  # [H, W, 3] — (dist_to_max_x, dist_to_max_y, dist_to_max_z)
+        is_wall_faces = torch.cat([
+            dist_to_min[..., 0:1] < wall_margins[0],  # near min_x
+            dist_to_max[..., 0:1] < wall_margins[1],  # near max_x
+            dist_to_min[..., 1:2] < wall_margins[2],  # near min_y
+            dist_to_max[..., 1:2] < wall_margins[3],  # near max_y
+            dist_to_min[..., 2:3] < wall_margins[4],  # near min_z
+            dist_to_max[..., 2:3] < wall_margins[5],  # near max_z
+        ], dim=-1)  # [H, W, 6]
+        is_wall = (~is_bg) & is_wall_faces.any(dim=-1, keepdim=True)  # [H, W, 1]
+
+        # Build overlay visualization
+        overlay = rendered_image.clone()
+        if is_wall.any() and wall_margins.max() > 0:
+            wmask = is_wall.squeeze().unsqueeze(-1).expand(-1, -1, 3)  # [H, W, 3]
+            overlay = torch.where(wmask, overlay * 0.3 + torch.tensor([0.7, 0.1, 0.0], device="cuda") * 0.7, overlay)
+
+        def save_img(tensor, path):
+            imageio.imwrite(path, (tensor.clamp(0, 1).detach().cpu().numpy() * 255).astype(np.uint8))
+
+        save_img(rendered_image, os.path.join(model_path, "vis_walls_rgb.png"))
+        save_img(overlay, os.path.join(model_path, "vis_walls_overlay.png"))
+
+        n_wall = is_wall.sum().item()
+        n_surface = (~is_bg).sum().item()
+        print(f"[vis_walls] Stats: wall={n_wall}, non-wall={n_surface - n_wall}, bg={is_bg.sum().item()}")
+        print(f"[vis_walls] Saved to {model_path}/vis_walls_rgb.png and vis_walls_overlay.png")
+        # exit(0)
+
     with torch.no_grad():
         for grid_id in trange(num_grid):
             quat = torch.cat(torch.where(occlusion_ids == grid_id))
@@ -443,10 +533,19 @@ if __name__ == "__main__":
             # occlu_mask = (rgb_envmap > 0.5).float()
             is_bg = (rgb_envmap > 0.5)  # [H, W, 1] — no surface hit, fully visible
             if args.skip_walls:
-                # Compute max distance from voxel to scene boundary along each direction
-                t_out = compute_ray_aabb_tmax(position, envmap_dirs, scene_min, scene_max)
-                # A surface close to the scene boundary is a "wall" → treat as visible
-                is_wall = (~is_bg) & (depth_envmap > t_out * args.wall_threshold)
+                # Compute hit positions and check proximity to scene AABB boundary (per-face)
+                hit_pos = position + envmap_dirs * depth_envmap  # [H, W, 3]
+                dist_to_min = hit_pos - scene_min  # [H, W, 3]
+                dist_to_max = scene_max - hit_pos  # [H, W, 3]
+                is_wall_faces = torch.cat([
+                    dist_to_min[..., 0:1] < wall_margins[0],  # near min_x
+                    dist_to_max[..., 0:1] < wall_margins[1],  # near max_x
+                    dist_to_min[..., 1:2] < wall_margins[2],  # near min_y
+                    dist_to_max[..., 1:2] < wall_margins[3],  # near max_y
+                    dist_to_min[..., 2:3] < wall_margins[4],  # near min_z
+                    dist_to_max[..., 2:3] < wall_margins[5],  # near max_z
+                ], dim=-1)  # [H, W, 6]
+                is_wall = (~is_bg) & is_wall_faces.any(dim=-1, keepdim=True)  # [H, W, 1]
                 occlu_mask = (is_bg | is_wall).float()
             else:
                 occlu_mask = is_bg.float()
