@@ -66,10 +66,13 @@ def extract_cube_face(equi_img, face_size, face_rot):
 
 
 def save_face_as_png(face, output_path):
-    """Save cube face as RGBA PNG (fully opaque alpha)."""
-    h, w = face.shape[:2]
-    rgba = np.concatenate([face, np.full((h, w, 1), 255, dtype=np.uint8)], axis=-1)
-    cv2.imwrite(output_path, rgba, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+    """Save cube face as RGBA PNG (fully opaque alpha).
+
+    Note: face is in RGB order, but cv2.imwrite expects BGR/BGRA.
+    We convert RGB→BGRA first so the saved PNG has correct color channels.
+    """
+    bgra = cv2.cvtColor(face, cv2.COLOR_RGB2BGRA)
+    cv2.imwrite(output_path, bgra, [cv2.IMWRITE_PNG_COMPRESSION, 3])
 
 
 def main():
