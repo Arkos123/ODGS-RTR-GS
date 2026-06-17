@@ -184,15 +184,10 @@ if __name__ == "__main__":
     bg_colors[4][:2, ...] = 1
 
     # NOTE: capture 6 views with fov=90
+    # Order must match nvdiffrast cubemap convention: +X(0), -X(1), +Y(2), -Y(3), +Z(4), -Z(5)
+    # (see nvdiffrast texture_kernel.cu indexCubeMap → idx 0:+X,1:-X,2:+Y,3:-Y,4:+Z,5:-Z)
     rotations: List[torch.Tensor] = [
-        torch.tensor(
-            [
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, -1.0, 0.0, 0.0],
-                [-1.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([-1.0, 0.0, 0.0]), torch.tensor([0.0, -1.0, 0.0]))  [eye, center, up]
+        # Face 0: +X (looking at +X direction)
         torch.tensor(
             [
                 [0.0, 0.0, -1.0, 0.0],
@@ -200,7 +195,26 @@ if __name__ == "__main__":
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.0, -1.0, 0.0]))  [eye, center, up]
+        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.0, -1.0, 0.0]))
+        # Face 1: -X (looking at -X direction)
+        torch.tensor(
+            [
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([-1.0, 0.0, 0.0]), torch.tensor([0.0, -1.0, 0.0]))
+        # Face 2: +Y (looking at +Y direction, i.e. upward)
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 1.0, 0.0]), torch.tensor([0.0, 0.0, 1.0]))
+        # Face 3: -Y (looking at -Y direction, i.e. downward)
         torch.tensor(
             [
                 [1.0, 0.0, 0.0, 0.0],
@@ -208,23 +222,8 @@ if __name__ == "__main__":
                 [0.0, 1.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, -1.0, 0.0]), torch.tensor([0.0, 0.0, -1.0]))  [eye, center, up]
-        torch.tensor(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, -1.0, 0.0],
-                [0.0, -1.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 1.0, 0.0]), torch.tensor([0.0, 0.0, 1.0]))  [eye, center, up]
-        torch.tensor(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 0.0, -1.0]), torch.tensor([0.0, 1.0, 0.0]))  [eye, center, up]
+        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, -1.0, 0.0]), torch.tensor([0.0, 0.0, -1.0]))
+        # Face 4: +Z (looking at +Z direction)
         torch.tensor(
             [
                 [-1.0, 0.0, 0.0, 0.0],
@@ -232,7 +231,16 @@ if __name__ == "__main__":
                 [0.0, 0.0, -1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 0.0, 1.0]), torch.tensor([0.0, -1.0, 0.0]))  [eye, center, up]
+        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 0.0, 1.0]), torch.tensor([0.0, -1.0, 0.0]))
+        # Face 5: -Z (looking at -Z direction)
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 0.0, -1.0]), torch.tensor([0.0, 1.0, 0.0]))
     ]
 
     zfar = 100.0
@@ -483,7 +491,6 @@ if __name__ == "__main__":
         n_surface = (~is_bg).sum().item()
         print(f"[vis_walls] Stats: wall={n_wall}, non-wall={n_surface - n_wall}, bg={is_bg.sum().item()}")
         print(f"[vis_walls] Saved to {model_path}/vis_walls_rgb.png and vis_walls_overlay.png")
-        # exit(0)
 
     with torch.no_grad():
         for grid_id in trange(num_grid):
@@ -574,7 +581,12 @@ if __name__ == "__main__":
             is_bg = (rgb_envmap > 0.5)  # [H, W, 1] — no surface hit, fully visible
             if args.skip_walls:
                 # Compute hit positions and check proximity to scene AABB boundary (per-face)
-                hit_pos = position + envmap_dirs * depth_envmap  # [H, W, 3]
+                # envmap_dirs uses reflvec convention (+Y up, -Z forward, nvdiffrast cubemap).
+                # position/scene_min/scene_max are in COLMAP world space (+Y down, +Z forward).
+                # Convert direction to world space before computing hit_pos:
+                #   n_world = diag(1, -1, -1) @ n_reflvec
+                world_dirs = envmap_dirs * envmap_dirs.new_tensor([1.0, -1.0, -1.0])
+                hit_pos = position + world_dirs * depth_envmap  # [H, W, 3]
                 dist_to_min = hit_pos - scene_min  # [H, W, 3]
                 dist_to_max = scene_max - hit_pos  # [H, W, 3]
                 is_wall_faces = torch.cat([
