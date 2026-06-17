@@ -301,6 +301,8 @@ if __name__ == "__main__":
     valid_mask[qx1, qy1, qz0] = True
     valid_mask[qx1, qy1, qz1] = True
     xyz_ids = torch.where(valid_mask)
+    # Precompute grid_id → voxel coordinate lookup (avoids scanning occlusion_ids per iteration)
+    coords_of_id = torch.stack(xyz_ids, dim=-1).cuda()  # [num_grid, 3]
     num_grid = valid_mask.sum()
     occlusion_ids = (
         torch.ones(
@@ -309,7 +311,7 @@ if __name__ == "__main__":
         )
         * -1
     ).cuda()
-    occlusion_ids[xyz_ids[0].tolist(), xyz_ids[1].tolist(), xyz_ids[2].tolist()] = torch.arange(
+    occlusion_ids[xyz_ids[0], xyz_ids[1], xyz_ids[2]] = torch.arange(
         num_grid, dtype=torch.int32
     ).cuda()
     occlusion_coefficients = torch.zeros(
@@ -485,8 +487,8 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         for grid_id in trange(num_grid):
-            quat = torch.cat(torch.where(occlusion_ids == grid_id))
-            position = positions[(quat[0] * args.occlu_res**2 + quat[1] * args.occlu_res + quat[2],)]
+            quat = coords_of_id[grid_id]  # [3] voxel coords, O(1) vs O(res³)
+            position = positions[quat[0] * args.occlu_res**2 + quat[1] * args.occlu_res + quat[2]]
             # position = torch.tensor([0.0, 1.5, 0.0]).to(position.device)
             rgb_cubemap = []
             opacity_cubemap = []
