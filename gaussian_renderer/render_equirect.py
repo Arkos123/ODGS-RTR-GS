@@ -314,6 +314,23 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     # ---- Pseudo-normal from depth (geometrically correct, like SGS normal_depth) ----
     pseudo_normal = _erp_depth_to_normal(depth, rendered_opacity)
 
+    # Convert pseudo_normal from equirect camera-centric space to COLMAP world space
+    # to match rendered_normal's coordinate system (+Y=down).
+    #
+    # _erp_depth_to_normal constructs rays from lat/lon:
+    #   rays = [sin(lon)*cos(lat), sin(lat), cos(lon)*cos(lat)]
+    # where lat=+π/2 (top of image) → sin(lat)=+1 → +Y = up.
+    #
+    # COLMAP view space has +Y = down, so the equirect space's +Y is the
+    # OPPOSITE of view space's +Y.  The C2W rotation then maps view→world:
+    #   n_world = C2W @ diag(1,-1,1) @ n_equirect
+    if isinstance(pseudo_normal, torch.Tensor):
+        c2w_rot = c2w[:3, :3].to(device=pseudo_normal.device, dtype=pseudo_normal.dtype)
+        # Y flip: equirect (+Y up) → COLMAP view space (+Y down)
+        pseudo_normal = (pseudo_normal.permute(1, 2, 0) * pseudo_normal.new_tensor([1.0, -1.0, 1.0])).permute(2, 0, 1)
+        pseudo_normal = c2w_rot @ pseudo_normal.reshape(3, -1)              # view → world
+        pseudo_normal = F.normalize(pseudo_normal.reshape(3, H, W), dim=0)
+
     # ---- Alpha normalization mask for multi-pass outputs ----
     alpha_mask = (rendered_opacity > 0).float()
     opacity_for_div = rendered_opacity.clamp_min(1e-5)
@@ -331,8 +348,11 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     # ---- Normal-facing visualization (red=back-facing, blue=front-facing) ----
     out_feature_dict = {}
     # rendered_normal is [3, H, W] world-space normal
-    # Camera-to-point direction in world space
-    ray_dirs_vis = _equirect_ray_dirs(H, W)  # [H, W, 3]
+    # Camera-to-point direction in world space.
+    # _equirect_ray_dirs returns rays in equirect space (+Y up).  c2w transforms
+    # from COLMAP view space (+Y down), so flip Y before multiplying by C2W^T.
+    ray_dirs_vis = _equirect_ray_dirs(H, W)  # [H, W, 3] equirect space (+Y up)
+    ray_dirs_vis = ray_dirs_vis * ray_dirs_vis.new_tensor([1.0, -1.0, 1.0])  # → COLMAP view space
     cam_to_point = F.normalize(
         (ray_dirs_vis.reshape(-1, 3) @ c2w[:3, :3].T).reshape(H, W, 3), dim=-1)
     normal_hw = rendered_normal.permute(1, 2, 0)  # [H, W, 3]
@@ -436,8 +456,11 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         roughness_map = rendered_packed[0:1].permute(1, 2, 0).clamp(0.04, 1.0)
         metallic_map = rendered_packed[1:2].permute(1, 2, 0)
 
-        # Equirect-specific view direction
+        # Equirect-specific view direction.
+        # _equirect_ray_dirs returns rays in equirect space (+Y up).  Flip Y to
+        # match COLMAP view space (+Y down) before the C2W transform.
         ray_dirs = _equirect_ray_dirs(H, W)
+        ray_dirs = ray_dirs * ray_dirs.new_tensor([1.0, -1.0, 1.0])  # → COLMAP view space
         view_dirs = F.normalize(
             -(ray_dirs.reshape(-1, 3) @ c2w[:3, :3].T).reshape(H, W, 3), dim=-1)
 
