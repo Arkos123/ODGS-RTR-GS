@@ -1,4 +1,4 @@
-# RTR-GS 完整训练流程介绍
+# RTR-GS 完整训练流程介绍 （原版/perspective mode）
 
 > RTR-GS: 基于3D高斯泼溅（3D Gaussian Splatting）的逆渲染框架，支持辐射传输与反射建模
 

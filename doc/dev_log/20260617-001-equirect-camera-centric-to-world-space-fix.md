@@ -89,3 +89,66 @@ r_equirect  → Y-flip → r_view(COLMAP)  → r_view @ C2W^T → r_world
 
 - `gaussian_renderer/render_equirect.py` — 修复文件
 - `submodules/rtr_gs-rasterization/cuda_rasterizer/forward.cu:488-490` — 透视版正确实现参考
+
+
+## 附：坐标系问题修复（2026-06-17）
+
+### 问题
+
+Stage 2 visibility 图出现大范围黑色（表示遮挡），即使 `--skip_walls` 正确标记了墙壁和地板。
+
+根本原因：**Baking 与 Stage 2 之间使用的坐标系不一致。**
+
+### 坐标系对应关系
+
+| 模块 | 空间 | +Y 方向 | φ=0 方向 |
+|------|------|--------|---------|
+| `get_envmap_dirs()` 的 reflvec | cubemap 采样空间 | **上** | **-Z**（nvdiffrast 约定） |
+| `get_min_axis` normals | COLMAP 世界空间 | **下** | **+Z** |
+| `positions` / `scene_min/max` | COLMAP 世界空间 | **下** | **+Z** |
+
+二者相差 `diag(1, -1, -1)` 变换。
+
+### 修复 1：`baking.py` hit_pos 墙壁检测
+
+`hit_pos = position + envmap_dirs * depth_envmap` 混用了两个坐标系：
+- `position` 在 COLMAP 世界空间（+Y=下）
+- `envmap_dirs` 在 reflvec 空间（+Y=上，-Z=前）
+
+导致墙壁检测的 `hit_pos` 坐标不对，部分墙/地板可能未被正确标记为"墙壁"→ 被计入遮挡。
+
+**修复**：先将 `envmap_dirs` 转换到世界空间：
+```python
+world_dirs = envmap_dirs * [1.0, -1.0, -1.0]  # reflvec → COLMAP
+hit_pos = position + world_dirs * depth_envmap
+```
+
+### 修复 2：`gs_ir/__init__.py` SH 重建方向
+
+`recon_occlusion` 内部用 `normals`（COLMAP 世界空间）作为 SH 求值方向，但烘焙的 SH 系数是在 `envmap_dirs` 的 reflvec 空间计算的。SH 基函数在错误的方向上求值，导致水平面出现系统性遮挡误判。
+
+**修复**：在 `SH_reconstruction` 前将 normals 从 COLMAP 空间转换到 reflvec 空间：
+```python
+reflvec_normals = normals.clone()
+reflvec_normals[:, 1] *= -1.0  # COLMAP +Y下 → reflvec +Y上
+reflvec_normals[:, 2] *= -1.0  # COLMAP +Z前 → reflvec -Z前
+occlusion = _C.SH_reconstruction(coefficients, reflvec_normals, ...)
+```
+
+注意 `sparse_interpolate_coefficients` 中使用同一 `normals` 的偏移方向和余弦掩码需要世界空间，不受影响。
+
+### 涉及文件
+
+- `submodules/gs-ir/gs_ir/__init__.py` — `recon_occlusion` SH 重建方向修复
+- `baking.py` — hit_pos 墙壁检测坐标修复
+
+不需要 re-baking 即可生效（修复 2 在 stage2 运行时自动生效）。
+
+## 关键文件
+
+- `baking.py` — 主逻辑（墙壁检测 + auto_bound + 非对称 AABB 保存）
+- `gaussian_renderer/render_equirect.py` — Pass 6 incident light + 修复、pseudo_normal 世界空间转换
+- `gaussian_renderer/render.py` — 动态 clamp
+- `gaussian_renderer/render_fast.py` — 动态 clamp
+- `submodules/gs-ir/gs_ir/__init__.py` — `recon_occlusion` 函数，SH 重建坐标系修复
+- `submodules/gs-ir/src/occlusion_kernel.cu` — 自遮挡偏移（cosine mask）和 SH 重建 CUDA 内核
