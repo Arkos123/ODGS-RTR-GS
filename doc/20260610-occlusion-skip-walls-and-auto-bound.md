@@ -18,9 +18,15 @@
 
 **算法**：
 - 从体素位置渲染 cubemap（不变）
-- 对每个方向，计算从体素到场景实际边界的理论出口距离 `t_out`
-- 如果渲染深度 `depth_envmap` 接近 `t_out` → 该方向撞上墙壁 → 视为未被遮挡（`mask=1`）
+- 计算每个方向的命中点坐标 `hit_pos = voxel_pos + dir * depth`
+- 计算命中点到场景 AABB 边界的最短距离
+- 如果该距离 < `wall_margin` → 命中点在场景边界附近 → 是墙壁 → 视为未被遮挡（`mask=1`）
 - 场景实际范围由 Gaussians 位置的百分位数确定（`--extent_percentile`），避免离群点干扰
+
+**相比之前 `t_out * threshold` 方案的改进**：
+- 阈值有明确物理意义：场景单位距离，而非距离比例
+- 不受射线方向影响：同一墙面上不同角度的命中点，距离边界一致
+- 更直观：`wall_margin=0.3` 即"离场景边界 0.3 单位内的表面是墙"
 
 ### 2. `--auto_bound`：自适应网格范围（`baking.py`）
 
@@ -62,7 +68,8 @@
 | 参数 | 默认值 | 所属文件 | 说明 |
 |------|--------|---------|------|
 | `--skip_walls` | False | `baking.py` | 墙壁检测开关 |
-| `--wall_threshold` | 0.8 | `baking.py` | 深度比值阈值，越大越保守 |
+| `--wall_margin` | 0.3 | `baking.py` | 距离阈值（场景单位），命中点距 AABB 边界小于此值则视为墙壁 |
+| `--vis_walls` | False | `baking.py` | 墙壁检测可视化：从场景中心渲染全景图，红色=墙壁、绿色=非墙壁、白色=背景，保存为 PNG 后退出 |
 | `--extent_percentile` | 0.01 | `baking.py` | 场景范围百分位（切掉两端离群点） |
 | `--auto_bound` | False | `baking.py` | 自适应网格范围 |
 | `--bound_padding` | 1.1 | `baking.py` | 网格范围余量因子 |
@@ -83,7 +90,7 @@ python baking.py \
     --auto_bound \
     --occlu_res 96 \
     --skip_walls \
-    --wall_threshold 0.8 \
+    --wall_margin 0.3 \
     --extent_percentile 0.01
 
 # 普通场景（不使用新功能）
