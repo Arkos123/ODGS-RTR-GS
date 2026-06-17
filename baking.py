@@ -409,8 +409,12 @@ if __name__ == "__main__":
         depth = (depth_raw.squeeze(0) / acc.squeeze(0).clamp_min(1e-6)).unsqueeze(-1)  # [H, W, 1]
         alpha = acc.unsqueeze(-1)  # [H, W, 1]
 
-        # Equirect ray directions for hit position computation
-        equi_dirs = _equirect_ray_dirs(H, W).cuda()  # [H, W, 3]
+        # Equirect ray directions for hit position computation.
+        # _equirect_ray_dirs returns rays in equirect space (+Y up) but the rasterizer's
+        # view space uses COLMAP convention (+Y down).  Flip Y to match before computing
+        # world-space hit positions and normal-facing dot products.
+        equi_dirs = _equirect_ray_dirs(H, W).cuda()  # [H, W, 3] equirect space (+Y up)
+        equi_dirs = equi_dirs * equi_dirs.new_tensor([1.0, -1.0, 1.0])  # → COLMAP view space
         hit_pos = dummy_cam.camera_center.view(1, 1, 3) + equi_dirs * depth  # [H, W, 3]
 
         # ---- Normal-facing debug: check if normals point toward or away from camera ----
