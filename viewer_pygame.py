@@ -587,7 +587,7 @@ def render_frame(fps_cam: FPSCamera, scene_data, canonical_rays: torch.Tensor):
     enable_occlusion = scene_data.get('enable_occlusion', True)
     render_mode = scene_data.get('render_mode', 'pbr')
     render_type = scene_data.get('render_type', 0)  # 0=ANISO, 1=ISO, 2=EQUIRECT
-    equirect_model = (render_type == 1)  # ISO模式 = equirect_model=True
+    iso_mode = (render_type == 1)  # ISO模式: 强制scale各向同性化
 
     viewpoint_camera = Camera(
         colmap_id=0,
@@ -649,7 +649,7 @@ def render_frame(fps_cam: FPSCamera, scene_data, canonical_rays: torch.Tensor):
             # "relight": True,
             # "relight": True,
             "enable_occlusion": enable_occlusion,  # 遮挡开关
-            "equirect_model": equirect_model,  # equirect训练模型scale各向同性化
+            "iso_mode": iso_mode,  # ISO模式: scale各向同性化
         },
     }
 

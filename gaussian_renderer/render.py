@@ -177,7 +177,8 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
         scales = pc.get_scaling
-        if dict_params and dict_params.get('equirect_model', False):
+        # 仅 viewer 触发：scale各向同性化模式
+        if dict_params and dict_params.get('iso_mode', False):
             scales = scales.mean(dim=-1, keepdim=True).repeat(1, 3)
         rotations = pc.get_rotation
 
