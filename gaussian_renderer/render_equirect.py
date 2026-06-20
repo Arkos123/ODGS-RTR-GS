@@ -461,9 +461,10 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             cbound = dict_params.get("occlusion_volumes", {}).get("bound", 1.5)
             clamp_min, clamp_max = -cbound, cbound
 
-        # SGS rasterizer outputs raw Σ(T_i * α_i * z_i); normalise by opacity
-        # to obtain true surface depth before computing 3D points.
-        surf_depth = depth / rendered_opacity.clamp_min(1e-5)
+        # Depth from renderGeometryCUDA is already alpha-weighted normalised:
+        #   out_depth = Σ(depth * vis) / Σ(vis)  (radial distance in ERP mode)
+        # No need to divide by opacity again.
+        surf_depth = depth
         points = (
             (-view_dirs.reshape(-1, 3) * surf_depth.reshape(-1, 1) + c2w[:3, 3])
             .clamp(min=clamp_min, max=clamp_max)

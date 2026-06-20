@@ -88,3 +88,45 @@ rays = [sin(lon)*cos(lat), -sin(lat), cos(lon)*cos(lat)]  # +Y down
 ## 修改文件
 
 - `gaussian_renderer/render_equirect.py`: 14 insertions, 23 deletions
+
+---
+
+# Depth 双除 alpha 修复
+
+## 问题
+
+`surf_depth = depth / rendered_opacity` 对 CUDA 已归一化的 depth 再次除以 alpha。
+
+## 根因
+
+`renderGeometryCUDA`（`forward.cu:694`）输出 depth 时已经做了 alpha 归一化：
+
+```c
+out_depth[pix_id] = depth_sum / denom;  // denom = weight_sum = alpha_acc
+```
+
+但 `render_equirect.py:466` 又除了一次 `rendered_opacity`（= `alpha_acc`），导致：
+
+```
+surf_depth = (depth_sum / α) / α = depth_sum / α²
+```
+
+透视模式（`render.py`）没有此问题，因为它的 depth 来自 feature pass（原始 `Σ(depth * vis)`，未归一化）。
+
+## 影响
+
+- 不透明像素（α≈1.0）无影响
+- 半透明边缘（α<1.0）的 3D 点偏向相机 → `recon_occlusion` 在错误位置采样遮挡
+
+## 修复
+
+```python
+# 改前
+surf_depth = depth / rendered_opacity.clamp_min(1e-5)
+# 改后
+surf_depth = depth  # CUDA 已归一化
+```
+
+## 修改文件
+
+- `gaussian_renderer/render_equirect.py`: 1 insertion, 1 deletion
