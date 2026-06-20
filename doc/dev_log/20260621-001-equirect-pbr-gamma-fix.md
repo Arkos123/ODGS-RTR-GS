@@ -52,3 +52,39 @@ vis_dict["image_pbr"]    = gamma_func(rendered_pbr.permute(2, 0, 1))
 | `results["pbr"]` (修后) | sRGB ✅ | `gamma_func()` 转换 |
 
 透视模式 (`render.py`) 一直有 gamma 校正，全景模式遗漏了。
+
+---
+
+# Coordinate Convention Refactoring: Y-down 内聚
+
+## 动机
+
+`_equirect_ray_dirs` 和 `_erp_depth_to_normal` 输出的射线/法线在 equirect 空间（+Y 向上），而 COLMAP view space 约定 +Y 向下。调用处需要重复做 Y flip：
+
+```python
+# 三个地方都有这段
+n = n * [1, -1, 1]   # equirect → COLMAP view space
+```
+
+这既冗余又容易遗漏。
+
+## 方案
+
+把 Y-down 约定下沉到函数内部，修改射线方向的 Y 分量 `sin(lat)` → `-sin(lat)`，使函数直接输出 COLMAP view space 的法线/射线。
+
+```python
+# 改前
+rays = [sin(lon)*cos(lat),  sin(lat), cos(lon)*cos(lat)]  # +Y up
+# 改后
+rays = [sin(lon)*cos(lat), -sin(lat), cos(lon)*cos(lat)]  # +Y down
+```
+
+## 效果
+
+- 删除 3 处 Y-flip 行（`pseudo_normal`、`facing_vis`、PBR `view_dirs`）
+- 删除对应的长注释
+- net -9 行，调用处只保留 C2W 旋转
+
+## 修改文件
+
+- `gaussian_renderer/render_equirect.py`: 14 insertions, 23 deletions
