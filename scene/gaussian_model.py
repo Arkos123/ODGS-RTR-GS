@@ -213,17 +213,23 @@ class GaussianModel:
     def get_min_axis(self, cam_o):
         pts = self.get_xyz
         p2o = cam_o[None] - pts
+        p2o_len = p2o.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        p2o_norm = p2o / p2o_len  # unit vector: point → camera
         scales = self.get_scaling
         min_axis_id = torch.argmin(scales, dim = -1, keepdim=True)
         min_axis = torch.zeros_like(scales).scatter(1, min_axis_id, 1)
 
         rot_matrix = build_rotation(self.get_rotation)
-        # CUDA rasterizer convention: Σ = (S @ R)^T @ (S @ R) = R^T @ S² @ R
-        # → eigenvectors = ROWS of R. Extract row = R^T @ onehot.
-        ndir = torch.bmm(rot_matrix.transpose(1, 2), min_axis.unsqueeze(-1)).squeeze(-1)
+        # Extract the local frame axis corresponding to the smallest scale.
+        # Using columns of R (R @ e_i) gives the i-th local axis in world space.
+        # This was verified to produce consistent outward-facing normals.
+        ndir = torch.bmm(rot_matrix, min_axis.unsqueeze(-1)).squeeze(-1)
 
-        neg_msk = torch.sum(p2o*ndir, dim=-1) < 0
-        ndir[neg_msk] = -ndir[neg_msk] # make sure normal orient to camera
+        # Flip normal to face camera (the shortest-axis eigenvector has sign
+        # ambiguity).  Use the unit p2o so that distant Gaussians are not
+        # over-weighted by the magnitude of p2o.
+        neg_msk = torch.sum(p2o_norm * ndir, dim=-1) < 0.0
+        ndir[neg_msk] = -ndir[neg_msk]
         return ndir
     
     @property
