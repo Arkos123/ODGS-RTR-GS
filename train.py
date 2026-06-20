@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import torch
 import torch.nn.functional as F
@@ -65,9 +66,9 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     # freeze positions and disable densification to preserve the good SGS geometry.
     freeze_geometry = args.ply_checkpoint is not None or (args.checkpoint is not None and pipe.equirect)
     if freeze_geometry:
-        for param_group in gaussians.optimizer.param_groups:
-            if param_group["name"] in ("xyz", "scaling", "rotation", "opacity"):
-                param_group['lr'] = 0
+        # for param_group in gaussians.optimizer.param_groups:
+        #     if param_group["name"] in ("xyz", "scaling", "rotation", "opacity"):
+        #         param_group['lr'] = 0
         gaussians.xyz_scheduler_args = lambda iteration: 0
         opt.densify_from_iter = opt.iterations + 1
         opt.densify_until_iter = 0
@@ -347,8 +348,8 @@ def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, 
         render_img = torch.clamp(render_pkg["render"], 0.0, 1.0)
         gt_img = torch.clamp(viewpoint.original_image.cuda(), 0.0, 1.0)
 
-        depth = render_pkg["depth"]
-        depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+        depth_raw = render_pkg["depth"]
+        depth_norm = (depth_raw - depth_raw.min()) / (depth_raw.max() - depth_raw.min() + 1e-8)
 
         opacity = torch.clamp(render_pkg["opacity"], 0.0, 1.0)
         normal = torch.clamp(render_pkg["normal"] * 0.5 + 0.5, 0.0, 1.0)
@@ -359,30 +360,43 @@ def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, 
 
         save_image(render_img, os.path.join(view_dir, "render.png"))
         save_image(gt_img, os.path.join(view_dir, "gt.png"))
-        save_image(depth, os.path.join(view_dir, "depth.png"))
+        save_image(depth_norm, os.path.join(view_dir, "depth.png"))
         save_image(opacity, os.path.join(view_dir, "opacity.png"))
         save_image(normal, os.path.join(view_dir, "normal.png"))
         save_image(pseudo_normal, os.path.join(view_dir, "pseudo_normal.png"))
 
+        # Save PBR main result
         if is_pbr and "pbr" in render_pkg:
             pbr_img = torch.clamp(render_pkg["pbr"], 0.0, 1.0)
             save_image(pbr_img, os.path.join(view_dir, "pbr.png"))
 
-            vis_dict = render_pkg.get("vis_dict", {})
-            for key in ["roughness", "metallic", "base_color"]:
-                if key in vis_dict:
-                    save_image(
-                        torch.clamp(vis_dict[key], 0.0, 1.0),
-                        os.path.join(view_dir, f"{key}.png"))
-
-        # Save reflection visualization maps
+        # Save all useful vis_dict entries
         vis_dict = render_pkg.get("vis_dict", {})
-        for key in ["ref_strength", "ref_roughness", "ref_tint"]:
+
+        # Keys that are always useful to save when present
+        core_vis_keys = [
+            "radiance_color",
+            "ref_strength", "ref_roughness", "ref_tint",
+            "ref_export_base",
+            "normal_facing",
+        ]
+        # PBR-specific vis keys
+        pbr_vis_keys = [
+            "base_color", "roughness", "metallic",
+            "diffuse_pbr", "specular_pbr", "image_pbr",
+            "visibility",
+            "incidents_light", "incident_light_raw",
+            "env_export_base", "env_export_diffuse",
+        ]
+
+        keys_to_save = core_vis_keys + (pbr_vis_keys if is_pbr else [])
+        for key in keys_to_save:
             if key in vis_dict:
                 save_image(
                     torch.clamp(vis_dict[key], 0.0, 1.0),
                     os.path.join(view_dir, f"{key}.png"))
 
+        # Equirect -> cubemap faces
         if getattr(pipe, 'equirect', False):
             cubemap_dir = os.path.join(view_dir, "cubemap")
             os.makedirs(cubemap_dir, exist_ok=True)
@@ -546,7 +560,7 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs):
 
             vis_dict = results["vis_dict"]  
             write_image_dict.update(vis_dict)
-            ban_image_keys = ["base_color", "ref_export_base", "ref_tint",\
+            ban_image_keys = ["ref_export_base", "ref_tint",\
                               "radiance_color", "ref_roughness", "ref_strength", "ref_color"]
             # ban_image_keys = []
 
@@ -632,6 +646,12 @@ if __name__ == "__main__":
         args.equirect = True
         args.forward_shading = True
         print("Equirectangular mode enabled: forward_shading=True")
+
+    # Save command-line args to output directory
+    os.makedirs(args.model_path, exist_ok=True)
+    with open(os.path.join(args.model_path, "args.json"), "w") as f:
+        json.dump(vars(args), f, indent=2, default=str)
+    print(f"Saved args to {os.path.join(args.model_path, 'args.json')}")
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
