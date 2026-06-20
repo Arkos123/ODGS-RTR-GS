@@ -566,7 +566,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     results.update(out_feature_dict)
 
     if pc.use_pbr:
-        results["pbr"] = rendered_pbr.permute(2, 0, 1)
+        results["pbr"] = gamma_func(rendered_pbr.permute(2, 0, 1))
 
     if not is_training:
         depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
@@ -586,15 +586,16 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             base_color_map = rendered_base_color_img.permute(1, 2, 0) if pc.use_pbr else None
             vis_dict.update({
                 "base_color": gamma_func(base_color_map.permute(2, 0, 1)),
+                "base_color_rgb": base_color_map.permute(2, 0, 1),
                 "roughness": rendered_packed[0:1],
                 "metallic": rendered_packed[1:2],
-                "diffuse_pbr": diffuse_pbr.permute(2, 0, 1),
-                "specular_pbr": specular_pbr.permute(2, 0, 1),
+                "diffuse_pbr": gamma_func(diffuse_pbr.permute(2, 0, 1)),
+                "specular_pbr": gamma_func(specular_pbr.permute(2, 0, 1)),
                 "visibility": occlusion_map.permute(2, 0, 1) if occlusion_map is not None
                               else torch.zeros_like(roughness_map).permute(2, 0, 1),
                 "incidents_light": pbr_result.get("incidents_light", torch.zeros_like(roughness_map)).permute(2, 0, 1),
                 "incident_light_raw": incident_light_map.permute(2, 0, 1),
-                "image_pbr": rendered_pbr.permute(2, 0, 1),
+                "image_pbr": gamma_func(rendered_pbr.permute(2, 0, 1)),
             })
             if cubemap is not None:
                 vis_dict["env_export_base"] = cubemap.export_envmap(return_img=True).permute(2, 0, 1)
