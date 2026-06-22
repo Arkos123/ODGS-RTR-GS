@@ -1,5 +1,7 @@
 # RTR-GS 遮挡体烘焙（Occlusion Baking）说明文档
 
+> Note: 此文档未更新，为原始RTR-GS的实现版本，可能与项目最新版本有差异。
+
 ## 1. 背景与目的
 
 在逆渲染（Inverse Rendering）任务中，从多视角图像分解几何、材质和光照是一个欠约束问题。RTR-GS 在 **Stage 2（PBR 材质-光照分解阶段）** 需要区分直接光照和间接光照，而遮挡（Occlusion/Visibility）是正确分离这两者的关键。
@@ -7,7 +9,7 @@
 **遮挡体烘焙的核心目的**：防止阴影、光照和反照率（albedo）分解中产生混叠伪影（aliasing artifacts）。
 
 > 论文原文（Section 3.4）：
-> *"To prevent aliasing artifacts in shadows, lighting, and albedo, we leverage the recovered geometric structure to bake occlusion information into a voxel grid, following the approach in GS-IR [32]."*
+> *"To prevent aliasing artifacts in shadows, lighting, and albedo, we leverage the recovered geometric structure to bake occlusion information into a voxel grid, following the approach in GS-IR \[32]."*
 
 ### 1.1 问题：为什么需要遮挡体？
 
@@ -16,11 +18,13 @@
 $$L_d(\mathbf{x}) \approx \frac{c}{\pi} \big[ V(\mathbf{x}) \cdot L_d^{dir}(\mathbf{x}) + (1 - V(\mathbf{x})) \cdot L_d^{ind}(\mathbf{x}) \big]$$
 
 其中：
+
 - $V(\mathbf{x})$：可见性（visibility），值为 1 表示直接可见光源，0 表示完全被遮挡
 - $L_d^{dir}(\mathbf{x})$：直接环境光照（仅依赖法线方向 $\mathbf{n}$）
 - $L_d^{ind}(\mathbf{x})$：间接光照（通过每个高斯点上的参数 $L_{ind}$ 混合获得）
 
 **如果没有遮挡体**，所有表面点都会被当作完全可见，导致：
+
 1. 阴影区域的颜色被错误解释为材质（albedo）偏暗
 2. 光照分解时无法区分"暗是因为材质黑"还是"暗是因为有阴影"
 3. 间接光照建模失效
@@ -30,10 +34,11 @@ $$L_d(\mathbf{x}) \approx \frac{c}{\pi} \big[ V(\mathbf{x}) \cdot L_d^{dir}(\mat
 核心思想：**在 3D 空间中预计算每个位置的可见性分布**，以法线方向为查询键，在渲染时快速查找该位置沿该法线方向的遮挡程度。
 
 具体流程：
+
 1. **烘焙阶段**（Stage 1 完成后）：在每个 3D 体素位置渲染 6 面 cubemap，判断每个方向是否被几何体遮挡，将结果投影到球谐（SH）系数并存于体素网格
 2. **渲染阶段**（Stage 2）：对每个像素的 3D 表面点，从体素网格中三线性插值获取 SH 系数，通过重要性采样重建该法线方向的遮挡值
 
----
+***
 
 ## 2. 烘焙流程详解（`baking.py`）
 
@@ -61,14 +66,16 @@ Stage 1 训练完成
 
 ### 2.2 命令行参数
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--bound` | 1.5 | 遮挡体空间范围的半边长，AABB 为 `[-bound, bound]^3` |
-| `--valid` | 1.5 | 烘焙每个体素时，筛选附近高斯的裁剪半径 |
-| `--occlu_res` | 160 | 体素网格分辨率（每维 160 个体素） |
-| `--cubemap_res` | 256 | cubemap 每面的分辨率 |
-| `--occlusion` | 0.4 | 遮挡判定阈值（越小，环境光遮蔽越轻） |
-| `--checkpoint` | None | Stage 1 的 checkpoint 路径 |
+| 参数              | 默认值  | 说明                                     |
+| --------------- | ---- | -------------------------------------- |
+| `--bound`       | 1.5  | 遮挡体空间范围的半边长，AABB 为 `[-bound, bound]^3` |
+| `--valid`       | 1.5  | 烘焙每个体素时，筛选附近高斯的裁剪半径                    |
+| `--occlu_res`   | 160  | 体素网格分辨率（每维 160 个体素）                    |
+| `--cubemap_res` | 256  | cubemap 每面的分辨率                         |
+| `--occlusion`   | 0.4  | 遮挡判定阈值（越小，环境光遮蔽越轻）                     |
+| `--checkpoint`  | None | Stage 1 的 checkpoint 路径                |
+| `--equirect`    | False | 启用 SGS equirect 光栅化器替代 6 面 cubemap |
+| `--equirect_res` | 128 | equirect 渲染高度（宽度 = 2 × 高度），仅 `--equirect` 时有效 |
 
 ### 2.3 核心步骤详解
 
@@ -98,7 +105,9 @@ valid = (diff.abs() < args.valid).all(dim=1)
 
 仅选取该体素周围半径为 `valid`（默认 1.5）范围内的高斯点参与渲染，大幅加速烘焙过程。
 
-**2b. 6 面 Cubemap 渲染**
+**2b. 渲染遮挡图像**（两种模式）
+
+**模式一（默认）：6 面 Cubemap**
 
 ```python
 # [baking.py:L301-L341]
@@ -108,7 +117,24 @@ for r_idx, rotation in enumerate(rotations):
     # 白色背景（bg_color = torch.ones）
 ```
 
-从该体素位置出发，使用 `_C.lite_rasterize_gaussians` 渲染 6 个方向的 RGB 图和深度图。背景设为白色（表示无遮挡），高斯覆盖区域为黑色或深色。
+从该体素位置出发，使用 `_C.lite_rasterize_gaussians` 渲染 6 个方向的 RGB 图和深度图。背景设为白色（表示无遮挡），高斯覆盖区域为黑色或深色。然后通过 `dr.texture(boundary_mode="cube")` 转换为 equirect 环境贴图。
+
+**模式二（`--equirect`）：SGS Equirect 直接渲染**
+
+```python
+# baking.py: --equirect 模式
+rendered_image, radii, depth_raw, acc, normal_raw = rasterizer(
+    means3D=means3D[valid], shs=shs[valid], ...
+)
+```
+
+当 `--equirect` 启用时，使用 SGS equirect 光栅化器（`GaussianRasterizer`, `camera_type=3`）在体素中心**单次渲染**一张 equirect 全景图，替代 6 面 cubemap + nvdiffrast 转换方案。
+
+相比 cubemap 模式：
+- **单次渲染**代替 6 次透视渲染 + nvdiffrast 转换
+- 使用与 SGS 训练**完全相同的光栅化路径**（`LonlatRasterizer`），避免透视光栅化器对 equirect 训练的高斯产生错误的遮挡判断（大块拉伸高斯在透视投影下会错误遮挡）
+- 深度输出为**径向距离**（`p_view.w`），已 alpha 归一化，Python 侧无需再除 `acc`
+- 分辨率由 `--equirect_res` 控制（默认 128，即 128×256）。由于遮挡最终编码为低频 SH 系数（degree=3 → 9 个系数），3600× 像素过采样(SH系数)，不需要高分辨率
 
 **2c. Cubemap → Equirectangular 转换**
 
@@ -134,6 +160,7 @@ occlusion_coefficients[grid_id] = temp_coefficients[:, None]
 ```
 
 核心原理：
+
 - `rgb_envmap > 0.5`：在白色背景上，被几何体遮挡的方向 RGB 值接近 0，未被遮挡的方向接近 1
 - `occlu_mask * solid_angles`：对可见区域进行球面加权
 - 与预计算的 SH 基函数 `components` 逐元素相乘并求和，得到 9 个 SH 系数（degree=3 → d²=9）
@@ -146,7 +173,7 @@ while (occlusion_ids == -1).sum() > 0:
     gs_ir_ext.dialate_occlusion_ids(occlusion_ids)
 ```
 
-核心 CUDA kernel 逻辑（[occlusion_kernel.cu:L247-L294](file://d:/localSpace/relighting/RTR-GS/submodules/gs-ir/src/occlusion_kernel.cu#L247-L294)）：
+核心 CUDA kernel 逻辑（[occlusion_kernel.cu:L247-L294](file://home/huangpengyue/projects/RTR-GS/submodules/gs-ir/src/occlusion_kernel.cu#L247-L294)）：
 
 - 对每个 `occlusion_ids == -1` 的体素
 - 从 6 个面邻居（±X, ±Y, ±Z）中查找有效 ID
@@ -170,19 +197,19 @@ torch.save({
 
 保存为 `occlusion_volumes.pth`，默认路径为 Stage 1 checkpoint 同目录。
 
----
+***
 
 ## 3. 遮挡体数据结构
 
-| 字段 | 形状 | 类型 | 说明 |
-|------|------|------|------|
-| `occlusion_ids` | `[R, R, R]` | int32 | 体素网格索引表。值为 `-1` 时无效，`≥0` 时为 `occlusion_coefficients` 的行索引 |
-| `occlusion_coefficients` | `[num_valid, d², 1]` | float32 | 有效体素的球谐系数，`d² = degree²`（默认 9） |
-| `bound` | scalar | float | 遮挡体的空间半边长 |
-| `degree` | scalar | int | 球谐度数（默认 3） |
-| `occlusion_threshold` | scalar | float | 烘焙时的遮挡判定阈值 |
+| 字段                       | 形状                   | 类型      | 说明                                                        |
+| ------------------------ | -------------------- | ------- | --------------------------------------------------------- |
+| `occlusion_ids`          | `[R, R, R]`          | int32   | 体素网格索引表。值为 `-1` 时无效，`≥0` 时为 `occlusion_coefficients` 的行索引 |
+| `occlusion_coefficients` | `[num_valid, d², 1]` | float32 | 有效体素的球谐系数，`d² = degree²`（默认 9）                            |
+| `bound`                  | scalar               | float   | 遮挡体的空间半边长                                                 |
+| `degree`                 | scalar               | int     | 球谐度数（默认 3）                                                |
+| `occlusion_threshold`    | scalar               | float   | 烘焙时的遮挡判定阈值                                                |
 
----
+***
 
 ## 4. 渲染时的使用流程
 
@@ -205,7 +232,7 @@ if is_pbr:
 
 ### 4.2 渲染时查询
 
-在每个视点的渲染中（[render.py:L334-L366](file://d:/localSpace/relighting/RTR-GS/gaussian_renderer/render.py#L334-L366)）：
+在每个视点的渲染中（[render.py:L334-L366](file://home/huangpengyue/projects/RTR-GS/gaussian_renderer/render.py#L334-L366)）：
 
 ```python
 # 1. 从深度图计算每个像素的 3D 世界坐标
@@ -227,7 +254,7 @@ occlusion_map = recon_occlusion(
 
 ### 4.3 `recon_occlusion` 内部流程
 
-定义在 [gs_ir/\_\_init\_\_.py:L6-L42](file:///d:/localSpace/relighting/RTR-GS/submodules/gs-ir/gs_ir/__init__.py#L6-L42)：
+定义在 [gs_ir/__init__.py:L6-L42](file:///home/huangpengyue/projects/RTR-GS/submodules/gs-ir/gs_ir/__init__.py#L6-L42)：
 
 ```python
 @torch.no_grad()
@@ -253,7 +280,7 @@ def recon_occlusion(H, W, bound, points, normals, roughness,
 
 #### 步骤 1：`sparse_interpolate_coefficients`（CUDA Kernel）
 
-实现在 [occlusion_kernel.cu:L22-L144](file:///d:/localSpace/relighting/RTR-GS/submodules/gs-ir/src/occlusion_kernel.cu#L22-L144)：
+实现在 [occlusion_kernel.cu:L22-L144](file:///home/huangpengyue/projects/RTR-GS/submodules/gs-ir/src/occlusion_kernel.cu#L22-L144)：
 
 1. **量化坐标**：将 3D 世界坐标映射到体素网格索引
 2. **8 角点法线感知掩码**：对 8 个相邻体素角点，仅当方向点积 `dot(dir, normal) > 0`（即在表面上方）时计入贡献
@@ -262,7 +289,7 @@ def recon_occlusion(H, W, bound, points, normals, roughness,
 
 #### 步骤 2：`SH_reconstruction`（CUDA Kernel）
 
-实现在 [occlusion_kernel.cu:L146-L245](file:///d:/localSpace/relighting/RTR-GS/submodules/gs-ir/src/occlusion_kernel.cu#L146-L245)：
+实现在 [occlusion_kernel.cu:L146-L245](file:///home/huangpengyue/projects/RTR-GS/submodules/gs-ir/src/occlusion_kernel.cu#L146-L245)：
 
 1. 以法线为中心方向，`roughness=1`（固定），使用 GGX 重要性采样生成 256 个方向
 2. 对每个采样方向，用 SH 系数重建可见性值
@@ -270,7 +297,7 @@ def recon_occlusion(H, W, bound, points, normals, roughness,
 
 ### 4.4 PBR 着色应用
 
-在 [pbr/shade.py:L255-L308](file:///d:/localSpace/relighting/RTR-GS/pbr/shade.py#L255-L308) 中：
+在 [pbr/shade.py:L255-L308](file:///home/huangpengyue/projects/RTR-GS/pbr/shade.py#L255-L308) 中：
 
 ```python
 def pbr_shading(light, normals, view_dirs, albedo, roughness,
@@ -289,11 +316,12 @@ def pbr_shading(light, normals, view_dirs, albedo, roughness,
 ```
 
 **物理含义**：
+
 - `occlusion → 1`（完全可见）：使用直接环境光照 `diffuse_light`
 - `occlusion → 0`（完全遮挡）：使用间接光照 `irradiance`（来自每个高斯的 $L_{ind}$ 参数 splatting）
 - 中间值平滑混合两种光照
 
----
+***
 
 ## 5. 完整数据流图
 
@@ -345,7 +373,7 @@ def pbr_shading(light, normals, view_dirs, albedo, roughness,
 └─────────────────────────────────────────────────────────────────┘
 ```
 
----
+***
 
 ## 6. 关键设计决策
 
@@ -377,21 +405,34 @@ shift_points = points + normals * half_grid
 
 直接烘焙只在被高斯覆盖的体素处有值。但渲染时像素的 3D 表面点可能落在没有直接烘焙的体素上。通过膨胀，所有体素都获得最近有效体素的 SH 系数，保证查询不会失败。
 
----
+***
 
 ## 7. 运行命令
 
 ```bash
-# Stage 1 训练完成后，运行遮挡体烘焙
+# Stage 1 训练完成后，运行遮挡体烘焙（透视模式，默认）
 python baking.py \
     --checkpoint <output_path>/stage1/checkpoint/chkpnt30000.pth \
     --bound 1.5 \
     --occlu_res 128
+
+# Equirect 模式（SGS 流水线）
+python baking.py \
+    --checkpoint <output_path>/stage1/checkpoint/chkpnt30000.pth \
+    --auto_bound --skip_walls --equirect \
+    --occlu_res 96
+
+# Equirect 模式 + 自定义分辨率
+python baking.py \
+    --checkpoint <output_path>/stage1/checkpoint/chkpnt30000.pth \
+    --auto_bound --skip_walls --equirect \
+    --equirect_res 192 \
+    --occlu_res 96
 ```
 
 输出文件：`<output_path>/stage1/checkpoint/occlusion_volumes.pth`
 
----
+***
 
 ## 8. 调试建议
 
@@ -401,9 +442,8 @@ python baking.py \
    - Stage 1 几何重建不充分，高斯未能覆盖表面
    - `--occlusion` 阈值设置过低
    - `--bound` 设置不合理
-
 2. **遮挡值全为 0（全黑）**：可能原因：
    - 几何膨胀过度（floater 太多）
    - `--valid` 裁剪半径过大
-
 3. **遮挡体不匹配**：如果 Stage 2 中几何发生较大变化，烘焙的遮挡体会失效。确保双分支训练稳定。
+

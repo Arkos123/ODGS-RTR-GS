@@ -128,6 +128,9 @@ if __name__ == "__main__":
     parser.add_argument("--extent_percentile", type=float, default=0.01, help="Percentile (0~1) used to compute robust scene extent from Gaussian positions. E.g. 0.01 means 1st/99th percentile. Used with --skip_walls and --auto_bound.")
     parser.add_argument("--auto_bound", action="store_true", default=False, help="Automatically compute occlusion volume bound from scene extent (with --bound_padding margin), overriding --bound.")
     parser.add_argument("--bound_padding", type=float, default=1.1, help="Padding factor for --auto_bound. E.g. 1.1 means 10%% margin beyond scene extent.")
+    # already defined by PipelineParams class
+    # parser.add_argument("--equirect", action="store_true", default=False, help="Use SGS equirect rasterizer (camera_type=3) instead of 6-face cubemap. Requires the equirect GaussianModel checkpoint.")  
+    parser.add_argument("--equirect_res", type=int, default=128, help="Equirect render height (width = 2 * height). Only used with --equirect.")
     args = get_combined_args(parser)
 
     # Parse wall_margin: single float → 6 identical values, or "a,b,c,d,e,f"
@@ -342,6 +345,13 @@ if __name__ == "__main__":
     ) = get_envmap_dirs()
     components = components_from_spherical_harmonics(occlu_sh_degree, envmap_dirs)  # [H, W, d2]
 
+    # Equirect mode: override envmap resolution (shorter arrays for equirect_res)
+    if args.equirect:
+        eq_H, eq_W = args.equirect_res, args.equirect_res * 2
+        print(f"[equirect] Using equirect rasterizer at resolution {eq_H}×{eq_W}")
+        solid_angles, envmap_dirs = get_envmap_dirs([eq_H, eq_W])
+        components = components_from_spherical_harmonics(occlu_sh_degree, envmap_dirs)
+
     # get canonical ray and its norm to normalize depth
     canonical_rays = get_canonical_rays(H=res, W=res, tan_fovx=1.0, tan_fovy=1.0)  # [HW, 3]
     norm = torch.norm(canonical_rays, p=2, dim=-1).reshape(res, res, 1)  # [H, W]
@@ -408,7 +418,7 @@ if __name__ == "__main__":
         )  # rendered_image: [3, H, W], depth_raw: [1, H, W], acc: [1, H, W]
 
         rendered_image = rendered_image.permute(1, 2, 0)  # [H, W, 3]
-        depth = (depth_raw.squeeze(0) / acc.squeeze(0).clamp_min(1e-6)).unsqueeze(-1)  # [H, W, 1]
+        depth = depth_raw.squeeze(0).unsqueeze(-1)  # [1, H, W] → [H, W, 1]; already alpha-normalized radial distance
         alpha = acc.unsqueeze(-1)  # [H, W, 1]
 
         # Equirect ray directions for hit position computation.
@@ -485,118 +495,193 @@ if __name__ == "__main__":
         print(f"[vis_walls] Saved to {model_path}/vis_walls_rgb.png and vis_walls_overlay.png")
 
     with torch.no_grad():
-        for grid_id in trange(num_grid):
-            quat = coords_of_id[grid_id]  # [3] voxel coords, O(1) vs O(res³)
-            position = positions[quat[0] * args.occlu_res**2 + quat[1] * args.occlu_res + quat[2]]
-            # position = torch.tensor([0.0, 1.5, 0.0]).to(position.device)
-            rgb_cubemap = []
-            opacity_cubemap = []
-            depth_cubemap = []
-            # NOTE: crop by position
-            diff = means3D - position
-            valid = (diff.abs() < args.valid).all(dim=1)
-            valid_means3D = means3D[valid]
-            valid_means2D = means2D[valid]
-            valid_opacity = opacity[valid]
-            valid_shs = shs[valid]
-            valid_scales = scales[valid]
-            valid_rots = rots[valid]
-            for r_idx, rotation in enumerate(rotations):
-                c2w = rotation
+        if args.equirect:
+            bg = torch.ones(3, device="cuda")  # white: unoccluded pixels remain white (>0.5) after alpha blend
+            for grid_id in trange(num_grid):
+                quat = coords_of_id[grid_id]
+                position = positions[quat[0] * args.occlu_res**2 + quat[1] * args.occlu_res + quat[2]]
+
+                # crop by position
+                diff = means3D - position
+                valid = (diff.abs() < args.valid).all(dim=1)
+
+                # Camera at voxel center, identity rotation (equirect covers full sphere)
+                c2w = torch.eye(4, device="cuda")
                 c2w[:3, 3] = position
                 w2c = torch.inverse(c2w)
-                T = w2c[:3, 3]
-                R = w2c[:3, :3].T
-                world_view_transform = getWorld2ViewTorch(R, T).transpose(0, 1)
-                full_proj_transform = (
-                    world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
-                ).squeeze(0)
-                camera_center = world_view_transform.inverse()[3, :3]
+                T_vec = w2c[:3, 3]
+                R_mat = w2c[:3, :3].T  # identity
+                viewmatrix = getWorld2ViewTorch(R_mat, T_vec).transpose(0, 1)
 
-                input_args = (
-                    bg_color,
-                    # bg_colors[r_idx],
-                    valid_means3D,
-                    torch.zeros_like(valid_means3D),
-                    valid_opacity,
-                    valid_scales,
-                    valid_rots,
-                    torch.Tensor([]),
-                    shs,
-                    camera_center,  # campos,
-                    world_view_transform,  # viewmatrix,
-                    full_proj_transform,  # projmatrix,
-                    1.0,  # scale_modifier
-                    1.0,  # tanfovx,
-                    1.0,  # tanfovy,
-                    res,  # image_height,
-                    res,  # image_width,
-                    gaussians.active_sh_degree,
-                    False,  # prefiltered,
-                    False,  # argmax_depth,
+                raster_settings = GaussianRasterizationSettings(
+                    image_height=eq_H,
+                    image_width=eq_W,
+                    tanfovx=0.0,
+                    tanfovy=0.0,
+                    bg=bg,
+                    scale_modifier=1.0,
+                    viewmatrix=viewmatrix,
+                    projmatrix=viewmatrix,  # not used by camera_type=3
+                    sh_degree=gaussians.active_sh_degree,
+                    campos=position,
+                    prefiltered=False,
+                    debug=False,
+                    camera_type=3,
+                    render_depth=False,
                 )
-                (num_rendered, rendered_image, opacity_map, radii, depth_map) = _C.lite_rasterize_gaussians(
-                    *input_args
+                rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+                rendered_image, radii, depth_raw, acc, normal_raw = rasterizer(
+                    means3D=means3D[valid],
+                    means2D=means2D[valid],
+                    shs=shs[valid],
+                    colors_precomp=None,
+                    opacities=opacity[valid],
+                    scales=scales[valid],
+                    rotations=rots[valid],
+                    cov3D_precomp=None,
                 )
-                rgb_cubemap.append(rendered_image.permute(1, 2, 0))
-                opacity_cubemap.append(opacity_map.permute(1, 2, 0))
-                depth_map = depth_map * (opacity_map > 0.5).float()  # NOTE: import to filter out the floater
-                depth_cubemap.append(depth_map.permute(1, 2, 0) * norm)
 
-            # convert cubemap to HDRI
-            depth_envmap = dr.texture(
-                torch.stack(depth_cubemap)[None, ...],
-                envmap_dirs[None, ...].contiguous(),
-                # filter_mode="linear",
-                filter_mode="nearest",
-                boundary_mode="cube",
-            )[
-                0
-            ]  # [H, W, 1]
+                rendered_image = rendered_image.permute(1, 2, 0)  # [eq_H, eq_W, 3]
+                is_bg = rendered_image[..., 0:1] > 0.5  # [eq_H, eq_W, 1]
 
-            rgb_envmap = dr.texture(
-                torch.stack(rgb_cubemap)[None, ...],
-                envmap_dirs[None, ...].contiguous(),
-                # filter_mode="linear",
-                filter_mode="nearest",
-                boundary_mode="cube",
-            )[
-                0
-            ][..., 0:1]  # [H, W, 1]
+                if args.skip_walls:
+                    depth = depth_raw * (acc > 0.5).float()  # filter floaters
+                    depth = depth.squeeze(0).unsqueeze(-1)  # [1, eq_H, eq_W] → [eq_H, eq_W, 1]
+                    world_dirs = envmap_dirs * envmap_dirs.new_tensor([1.0, -1.0, -1.0])
+                    hit_pos = position + world_dirs * depth  # [eq_H, eq_W, 3]
+                    dist_to_min = hit_pos - scene_min
+                    dist_to_max = scene_max - hit_pos
+                    is_wall_faces = torch.cat([
+                        dist_to_min[..., 0:1] < wall_margins[0],
+                        dist_to_max[..., 0:1] < wall_margins[1],
+                        dist_to_min[..., 1:2] < wall_margins[2],
+                        dist_to_max[..., 1:2] < wall_margins[3],
+                        dist_to_min[..., 2:3] < wall_margins[4],
+                        dist_to_max[..., 2:3] < wall_margins[5],
+                    ], dim=-1)
+                    is_wall = (~is_bg) & is_wall_faces.any(dim=-1, keepdim=True)
+                    occlu_mask = (is_bg | is_wall).float()
+                else:
+                    occlu_mask = is_bg.float()
 
-            # print(rgb_envmap.shape)
-            # print(depth_envmap.shape)
+                weighted_color = occlu_mask * solid_angles
+                temp_coefficients = (weighted_color * components).sum(0).sum(0)
+                occlusion_coefficients[grid_id] = temp_coefficients[:, None]
 
-            # use SH to store the HDRI
-            # occlu_mask = (1 - (depth_envmap < occlusion_threshold).float()) + (depth_envmap == 0).float()  # [H, W, 1]
-            # occlu_mask = (rgb_envmap > 0.5).float()
-            is_bg = (rgb_envmap > 0.5)  # [H, W, 1] — no surface hit, fully visible
-            if args.skip_walls:
-                # Compute hit positions and check proximity to scene AABB boundary (per-face)
-                # envmap_dirs uses reflvec convention (+Y up, -Z forward, nvdiffrast cubemap).
-                # position/scene_min/scene_max are in COLMAP world space (+Y down, +Z forward).
-                # Convert direction to world space before computing hit_pos:
-                #   n_world = diag(1, -1, -1) @ n_reflvec
-                world_dirs = envmap_dirs * envmap_dirs.new_tensor([1.0, -1.0, -1.0])
-                hit_pos = position + world_dirs * depth_envmap  # [H, W, 3]
-                dist_to_min = hit_pos - scene_min  # [H, W, 3]
-                dist_to_max = scene_max - hit_pos  # [H, W, 3]
-                is_wall_faces = torch.cat([
-                    dist_to_min[..., 0:1] < wall_margins[0],  # near min_x
-                    dist_to_max[..., 0:1] < wall_margins[1],  # near max_x
-                    dist_to_min[..., 1:2] < wall_margins[2],  # near min_y
-                    dist_to_max[..., 1:2] < wall_margins[3],  # near max_y
-                    dist_to_min[..., 2:3] < wall_margins[4],  # near min_z
-                    dist_to_max[..., 2:3] < wall_margins[5],  # near max_z
-                ], dim=-1)  # [H, W, 6]
-                is_wall = (~is_bg) & is_wall_faces.any(dim=-1, keepdim=True)  # [H, W, 1]
-                occlu_mask = (is_bg | is_wall).float()
-            else:
-                occlu_mask = is_bg.float()
+        else:  # cubemap mode (original behavior)
+            for grid_id in trange(num_grid):
+                quat = coords_of_id[grid_id]  # [3] voxel coords, O(1) vs O(res³)
+                position = positions[quat[0] * args.occlu_res**2 + quat[1] * args.occlu_res + quat[2]]
+                # position = torch.tensor([0.0, 1.5, 0.0]).to(position.device)
+                rgb_cubemap = []
+                opacity_cubemap = []
+                depth_cubemap = []
+                # NOTE: crop by position
+                diff = means3D - position
+                valid = (diff.abs() < args.valid).all(dim=1)
+                valid_means3D = means3D[valid]
+                valid_means2D = means2D[valid]
+                valid_opacity = opacity[valid]
+                valid_shs = shs[valid]
+                valid_scales = scales[valid]
+                valid_rots = rots[valid]
+                for r_idx, rotation in enumerate(rotations):
+                    c2w = rotation
+                    c2w[:3, 3] = position
+                    w2c = torch.inverse(c2w)
+                    T = w2c[:3, 3]
+                    R = w2c[:3, :3].T
+                    world_view_transform = getWorld2ViewTorch(R, T).transpose(0, 1)
+                    full_proj_transform = (
+                        world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
+                    ).squeeze(0)
+                    camera_center = world_view_transform.inverse()[3, :3]
 
-            weighted_color = occlu_mask * solid_angles  # [H, W, 1]
-            temp_coefficients = (weighted_color * components).sum(0).sum(0)  # [d2]
-            occlusion_coefficients[grid_id] = temp_coefficients[:, None]
+                    input_args = (
+                        bg_color,
+                        # bg_colors[r_idx],
+                        valid_means3D,
+                        torch.zeros_like(valid_means3D),
+                        valid_opacity,
+                        valid_scales,
+                        valid_rots,
+                        torch.Tensor([]),
+                        shs,
+                        camera_center,  # campos,
+                        world_view_transform,  # viewmatrix,
+                        full_proj_transform,  # projmatrix,
+                        1.0,  # scale_modifier
+                        1.0,  # tanfovx,
+                        1.0,  # tanfovy,
+                        res,  # image_height,
+                        res,  # image_width,
+                        gaussians.active_sh_degree,
+                        False,  # prefiltered,
+                        False,  # argmax_depth,
+                    )
+                    (num_rendered, rendered_image, opacity_map, radii, depth_map) = _C.lite_rasterize_gaussians(
+                        *input_args
+                    )
+                    rgb_cubemap.append(rendered_image.permute(1, 2, 0))
+                    opacity_cubemap.append(opacity_map.permute(1, 2, 0))
+                    depth_map = depth_map * (opacity_map > 0.5).float()  # NOTE: import to filter out the floater
+                    depth_cubemap.append(depth_map.permute(1, 2, 0) * norm)
+
+                # convert cubemap to HDRI
+                depth_envmap = dr.texture(
+                    torch.stack(depth_cubemap)[None, ...],
+                    envmap_dirs[None, ...].contiguous(),
+                    # filter_mode="linear",
+                    filter_mode="nearest",
+                    boundary_mode="cube",
+                )[
+                    0
+                ]  # [H, W, 1]
+
+                rgb_envmap = dr.texture(
+                    torch.stack(rgb_cubemap)[None, ...],
+                    envmap_dirs[None, ...].contiguous(),
+                    # filter_mode="linear",
+                    filter_mode="nearest",
+                    boundary_mode="cube",
+                )[
+                    0
+                ][..., 0:1]  # [H, W, 1]
+
+                # print(rgb_envmap.shape)
+                # print(depth_envmap.shape)
+
+                # use SH to store the HDRI
+                # occlu_mask = (1 - (depth_envmap < occlusion_threshold).float()) + (depth_envmap == 0).float()  # [H, W, 1]
+                # occlu_mask = (rgb_envmap > 0.5).float()
+                is_bg = (rgb_envmap > 0.5)  # [H, W, 1] — no surface hit, fully visible
+                if args.skip_walls:
+                    # Compute hit positions and check proximity to scene AABB boundary (per-face)
+                    # envmap_dirs uses reflvec convention (+Y up, -Z forward, nvdiffrast cubemap).
+                    # position/scene_min/scene_max are in COLMAP world space (+Y down, +Z forward).
+                    # Convert direction to world space before computing hit_pos:
+                    #   n_world = diag(1, -1, -1) @ n_reflvec
+                    world_dirs = envmap_dirs * envmap_dirs.new_tensor([1.0, -1.0, -1.0])
+                    hit_pos = position + world_dirs * depth_envmap  # [H, W, 3]
+                    dist_to_min = hit_pos - scene_min  # [H, W, 3]
+                    dist_to_max = scene_max - hit_pos  # [H, W, 3]
+                    is_wall_faces = torch.cat([
+                        dist_to_min[..., 0:1] < wall_margins[0],  # near min_x
+                        dist_to_max[..., 0:1] < wall_margins[1],  # near max_x
+                        dist_to_min[..., 1:2] < wall_margins[2],  # near min_y
+                        dist_to_max[..., 1:2] < wall_margins[3],  # near max_y
+                        dist_to_min[..., 2:3] < wall_margins[4],  # near min_z
+                        dist_to_max[..., 2:3] < wall_margins[5],  # near max_z
+                    ], dim=-1)  # [H, W, 6]
+                    is_wall = (~is_bg) & is_wall_faces.any(dim=-1, keepdim=True)  # [H, W, 1]
+                    occlu_mask = (is_bg | is_wall).float()
+                else:
+                    occlu_mask = is_bg.float()
+
+                weighted_color = occlu_mask * solid_angles  # [H, W, 1]
+                temp_coefficients = (weighted_color * components).sum(0).sum(0)  # [d2]
+                occlusion_coefficients[grid_id] = temp_coefficients[:, None]
 
         # dialate coefficient ids
         while (occlusion_ids == -1).sum() > 0:
