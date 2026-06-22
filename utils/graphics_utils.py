@@ -334,8 +334,8 @@ def latlong_to_cubemap(latlong_map: torch.Tensor, res: List[int]) -> torch.Tenso
         6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device="cuda"
     )
     
-    # Ensure latlong_map is float32 for nvdiffrast texture function
-    latlong_map_float = latlong_map.float()
+    # Ensure latlong_map is float32 and contiguous for nvdiffrast texture function
+    latlong_map_float = latlong_map.float().contiguous()
     
     for s in range(6):
         gy, gx = torch.meshgrid(
@@ -410,3 +410,80 @@ def latlong_to_cubemap_nvdiffrec(latlong_map, res):
 
         cubemap[s, ...] = dr.texture(latlong_map[None, ...], texcoord[None, ...], filter_mode='linear')[0]
     return cubemap
+
+
+def latlong_to_cubemap_equirect(latlong_map: torch.Tensor, res: List[int]) -> torch.Tensor:
+    cubemap = torch.zeros(
+        6, res[0], res[1], latlong_map.shape[-1], dtype=torch.float32, device="cuda"
+    )
+    latlong_map_float = latlong_map.float().contiguous()
+    for s in range(6):
+        gy, gx = torch.meshgrid(
+            torch.linspace(-1.0 + 1.0 / res[0], 1.0 - 1.0 / res[0], res[0], device="cuda"),
+            torch.linspace(-1.0 + 1.0 / res[1], 1.0 - 1.0 / res[1], res[1], device="cuda"),
+            indexing="ij",
+        )
+        v = F.normalize(cube_to_dir(s, gx, gy), p=2, dim=-1)
+        lon = torch.atan2(v[..., 0], v[..., 2])
+        lat = torch.asin(torch.clamp(v[..., 1], -1.0, 1.0))
+        tu = lon / (2 * np.pi) + 0.5
+        tv = (np.pi / 2 - lat) / np.pi
+        texcoord = torch.stack((tu, tv), dim=-1)
+        cubemap[s, ...] = dr.texture(
+            latlong_map_float[None, ...], texcoord[None, ...], filter_mode="linear"
+        )[0]
+    return cubemap
+
+
+def cubemap_to_equirect(cubemap_faces: torch.Tensor,
+                        eq_width: int = 2048,
+                        eq_height: int = 1024) -> torch.Tensor:
+    """Convert 6 cubemap faces to equirectangular panorama via nvdiffrast.
+
+    This is the inverse of ``latlong_to_cubemap_equirect``.
+
+    Coordinate conventions:
+      - Cubemap faces follow nvdiffrast order: +X(0), -X(1), +Y(2), -Y(3),
+        +Z(4), -Z(5).
+      - Internal direction lookup uses nvdiffrast convention: **+Y=up,
+        +Z=forward** (the standard OpenGL cubemap convention).  This means
+        face +Y (index 2) should contain the **sky** (up) view and face -Y
+        (index 3) should contain the **ground** (down) view.
+      - The function itself is agnostic to COLMAP / world-space — just make
+        sure the face images and the implicit direction convention agree
+        (i.e. face +Y really shows "up" in the scene).
+      - See ``scripts/render_cubemap_equirect.render_equirect_from_position``
+        for a helper that renders cubemap faces from COLMAP world space into
+        exactly this convention.
+
+    Args:
+        cubemap_faces: [6, face_h, face_w, C] tensor in nvdiffrast order:
+            +X(0), -X(1), +Y(2), -Y(3), +Z(4), -Z(5).  C can be any
+            channel count (1, 3, etc.).
+        eq_width: output equirect width (longitude resolution).
+        eq_height: output equirect height (latitude resolution).
+
+    Returns:
+        [C, eq_height, eq_width] equirectangular image (C,H,W), ready for
+        ``torchvision.utils.save_image``.
+    """
+    # Equirectangular → direction in nvdiffrast cubemap convention (+Y up, +Z forward).
+    # The standard lon/lat→direction formula yields exactly this convention,
+    # matching what dr.texture(boundary_mode="cube") expects.
+    theta = torch.linspace(-np.pi, np.pi, eq_width, device="cuda")       # longitude
+    phi = torch.linspace(np.pi / 2, -np.pi / 2, eq_height, device="cuda")  # latitude
+
+    lon, lat = torch.meshgrid(theta, phi, indexing="xy")   # each [eq_height, eq_width]
+
+    x = torch.cos(lat) * torch.sin(lon)
+    y = torch.sin(lat)               # nvdiffrast: +Y = up (top of equirect → face +Y → sky)
+    z = torch.cos(lat) * torch.cos(lon)                  # nvdiffrast: +Z = forward
+    directions = torch.stack([x, y, z], dim=-1)             # [eq_height, eq_width, 3]
+
+    # nvdiffrast cube-map sampling: tex [B, 6, H, W, C], uv [B, H, W, 3]
+    tex = cubemap_faces[None, ...].float().contiguous()     # [1, 6, face_h, face_w, 3]
+    uv = directions[None, ...].contiguous()                 # [1, eq_height, eq_width, 3]
+
+    sampled = dr.texture(tex, uv, filter_mode="linear",
+                         boundary_mode="cube")              # [1, eq_height, eq_width, C]
+    return sampled[0].permute(-1, 0, 1)                     # [C, eq_height, eq_width]
