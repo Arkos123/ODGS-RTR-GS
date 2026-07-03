@@ -23,6 +23,11 @@ def recon_occlusion(
     # 根据 aabb 计算 grid_step
     grid_step = (aabb[3:] - aabb[:3]) / float(occlu_res - 1)  # per-axis spacing [3]
     shift_points = points + normals * (grid_step * 0.5)  # shift by half grid along normal
+
+    # # 根据 aabb 计算 per-axis grid step 并取 max 作为统一网格间距
+    # grid_step = (aabb[3:] - aabb[:3]) / float(occlu_res - 1)  # per-axis spacing [3]
+    # half_grid = max(grid_step) * 0.5  # scalar: half grid spacing (most conservative axis)
+    # shift_points = points + normals * half_grid  # shift along normal direction
     # shift_points = points
     (
         coefficients,  # [HW, d2, 1]

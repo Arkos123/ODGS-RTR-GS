@@ -270,10 +270,18 @@ def recon_occlusion(H, W, bound, points, normals, roughness,
     )
     coefficients = coefficients.permute(0, 2, 1)  # [HW, 1, d²]
 
+    # baking 的 SH 系数在 reflvec 空间（+Y上, -Z前），
+    # 但 normals 在 COLMAP 空间（+Y下, +Z前）。
+    # 必须在 SH 求值前转换到 reflvec 空间：
+    #   n_reflvec = diag(1, -1, -1) @ n_colmap
+    reflvec_normals = normals.clone()
+    reflvec_normals[:, 1] *= -1.0  # COLMAP +Y下 → reflvec +Y上
+    reflvec_normals[:, 2] *= -1.0  # COLMAP +Z前 → reflvec -Z前
+
     # 步骤 2：GGX 重要性采样 + SH 重建
     roughness = torch.ones([H * W, 1]).cuda()
     occlusion = _C.SH_reconstruction(
-        coefficients, normals, roughness, sample_rays, degree
+        coefficients, reflvec_normals, roughness, sample_rays, degree
     )  # [HW, 1]
     return occlusion
 ```

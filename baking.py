@@ -22,16 +22,76 @@ from utils.graphics_utils import getProjectionMatrix
 from utils.sh_utils import components_from_spherical_harmonics, eval_sh
 from spherical_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
+"""
+TODO:
+- 阅读 baking 源码流程。
+- 确认哪里涉及坐标系的问题
+"""
 
-def getWorld2ViewTorch(R: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    Rt = torch.zeros((4, 4), device=R.device)
-    Rt[:3, :3] = R[:3, :3].T
-    Rt[:3, 3] = t
-    Rt[3, 3] = 1.0
-    return Rt
+# =================================================================
+# 坐标系约定（baking.py 涉及三个坐标系，混用是常见 bug 来源）
+# =================================================================
+# ┌─────────────────────────┬──────────┬──────────┬──────────┬──────────────────────────────────┐
+# │ 空间                    │ +X       │ +Y       │ +Z       │ 使用场景                         │
+# ├─────────────────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤
+# │ COLMAP world space      │ 右       │ **下**  │ **前**  │ gaussians.get_xyz, scene_min/max │
+# │ reflvec / cubemap space │ 右       │ 上       │ **-前**  │ envmap_dirs, nvdiffrast sampling │
+# │ Equirect view space     │ 右       │ 上       │ 前       │ _equirect_ray_dirs（自身定义）   │
+# └─────────────────────────┴──────────┴──────────┴──────────┴──────────────────────────────────┘
+#
+# reflvec (nvdiffrast cubemap) 空间（+Y 上、-Z 前）：
+#    +y
+#    |  -z前
+#  __|/___ +x
+#   /|
+#  +z
+#
+# COLMAP 世界空间（+Y 下、+Z 前）
+#    上
+#    | +z 前
+#  __|/___ +x 右
+#   /|
+#    +y
+#
+# Equirect 空间：纬度 θ∈[-π/2,π/2]，经度 φ∈[-π,π]
+#    +Y 向上，北极 θ=+π/2，南极 θ=-π/2（与 get_envmap_dirs 的 θ 方向相反）
+#    SGS rasterizer 的 point3ToLonlatScreen 使用此约定
+#
+# 关键转换：
+#   COLMAP → reflvec:  diag(1, -1, -1)     （flip Y 和 Z）
+#   COLMAP → equirect: diag(1, -1,  1)     （flip Y）
+#   reflvec → COLMAP:  diag(1, -1, -1)     （同上，自逆）
+#
+# 在烘焙中使用场景：
+#   - envmap_dirs() 返回的方向在 reflvec 空间
+#   - 计算 hit_pos 时需转 COLMAP world space：world_dirs = envmap_dirs * diag(1,-1,-1)
+#   - 墙壁检测（skip_walls）的 scene_min/max 在 COLMAP space
+#   - 法线可视化 vis_walls 中 equi_dirs 需通过 diag(1,-1,1) 转 COLMAP view space
+# =================================================================
+
 
 # inverse the mapping from https://github.com/NVlabs/nvdiffrec/blob/dad3249af8ede96c7dd72c30328272117fabb710/render/light.py#L22
 def get_envmap_dirs(res: List[int] = [256, 512]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    计算环境贴图采样方向和立体角
+
+    reflvec (nvdiffrast cubemap) 空间（+Y 上、-Z 前）：
+    θ: 纬度，范围 [0, π]，北极(+y)→南极(-y)
+    φ: 经度，范围 [-π, π]，-π(+z)→-π/2(-x) → 0（-z前）→π/2(+x)→π(+z)
+    +y
+    | -z 前
+ ___|/___ +x
+   /|
+ +z
+
+    返回：
+      solid_angles: [H, W, 1] 每个像素对应的立体角（用于球面积分加权）
+      reflvec:      [H, W, 3] 世界空间采样方向
+    """
+
+    # 生成 [res[0], res[1]] （默认 [256, 512] ）大小的二维网格。
+    # gy[i,j] 和 gx[i,j] 是位置 (i,j) 的 (θ,φ) 坐标
+    # 其中 θ∈[0,π]，φ∈[-π,π]
     gy, gx = torch.meshgrid(
         torch.linspace(0.0, 1.0 - 1.0 / res[0], res[0], device="cuda"),
         torch.linspace(-1.0, 1.0 - 1.0 / res[1], res[1], device="cuda"),
@@ -42,30 +102,15 @@ def get_envmap_dirs(res: List[int] = [256, 512]) -> Tuple[torch.Tensor, torch.Te
     sintheta, costheta = torch.sin(gy * np.pi), torch.cos(gy * np.pi)
     sinphi, cosphi = torch.sin(gx * np.pi), torch.cos(gx * np.pi)
 
+    # reflvec = (sinθ·sinφ, cosθ, -sinθ·cosφ)  即 nvdiffrast cubemap 约定
     reflvec = torch.stack((sintheta * sinphi, costheta, -sintheta * cosphi), dim=-1)  # [H, W, 3]
 
-    # get solid angles
+    # 计算立体角权重：dΩ = (cosθ - cos(θ+dθ)) * dφ
     solid_angles = ((costheta - torch.cos(gy * np.pi + d_theta)) * d_phi)[..., None]  # [H, W, 1]
+    # 检查立体角总和是否为 4π
     print(f"solid_angles_sum error: {solid_angles.sum() - 4 * np.pi}")
 
     return solid_angles, reflvec
-
-
-def lookAt(eye: torch.Tensor, center: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
-    Z = F.normalize(eye - center, dim=0)
-    Y = up
-    X = F.normalize(torch.cross(Y, Z), dim=0)
-    Y = F.normalize(torch.cross(Z, X), dim=0)
-
-    matrix = torch.tensor(
-        [
-            [X[0], Y[0], Z[0]],
-            [X[1], Y[1], Z[1]],
-            [X[2], Y[2], Z[2]],
-        ]
-    )
-
-    return matrix
 
 
 def get_canonical_rays(H: int, W: int, tan_fovx: float, tan_fovy: float) -> torch.Tensor:
@@ -100,10 +145,16 @@ MIN_DEPTH = 1e-6
 
 
 def _equirect_ray_dirs(H: int, W: int, device: str = "cuda") -> torch.Tensor:
-    """Equirectangular pixel → world-space ray direction vectors [H, W, 3]."""
+    """等距柱面投影(ERP)像素 → 世界空间射线方向 [H, W, 3]
+
+    行序：row 0 = lat=+π/2（北极），使用 +sin(lat) 作为 Y（等距空间 +Y 向上），
+    与 SGS rasterizer 的 point3ToLonlatScreen 的行序匹配。
+    """
     ys = torch.linspace(0.5 * math.pi, -0.5 * math.pi, H, device=device)
     xs = torch.linspace(-math.pi, math.pi, W, device=device)
     lat, lon = torch.meshgrid(ys, xs, indexing="ij")
+    # dir = (sin(lon)*cos(lat), sin(lat), cos(lon)*cos(lat))
+    # 注意：这里 +Y 向上（等距空间），需通过 diag(1,-1,1) 转到 COLMAP 空间
     return torch.stack([
         torch.sin(lon) * torch.cos(lat),
         torch.sin(lat),
@@ -131,6 +182,7 @@ if __name__ == "__main__":
     # already defined by PipelineParams class
     # parser.add_argument("--equirect", action="store_true", default=False, help="Use SGS equirect rasterizer (camera_type=3) instead of 6-face cubemap. Requires the equirect GaussianModel checkpoint.")  
     parser.add_argument("--equirect_res", type=int, default=128, help="Equirect render height (width = 2 * height). Only used with --equirect.")
+    parser.add_argument("--occlusion_path", type=str, default=None, help="保存occlusion volumes的路径。默认在checkpoint目录下.")
     args = get_combined_args(parser)
 
     # Parse wall_margin: single float → 6 identical values, or "a,b,c,d,e,f"
@@ -187,6 +239,12 @@ if __name__ == "__main__":
     bg_colors[4][:2, ...] = 1
 
     # NOTE: capture 6 views with fov=90
+
+    """
+    rotations[6] = nvdiffrast cubemap 六面 (+X,-X,+Y,-Y,+Z,-Z) 的 c2w 旋转矩阵（仅旋转部分）。
+    配合 rasterizer 的 +Z forward 约定使用：R^T @ face_forward_direction → [0,0,+Z]。
+    第 4 列留空，由调用处填入 position。
+    """
     rotations: List[torch.Tensor] = [
         torch.tensor(
             [
@@ -195,7 +253,7 @@ if __name__ == "__main__":
                 [-1.0, 0.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([-1.0, 0.0, 0.0]), torch.tensor([0.0, -1.0, 0.0]))  [eye, center, up]
+        ).cuda(), 
         torch.tensor(
             [
                 [0.0, 0.0, -1.0, 0.0],
@@ -203,7 +261,15 @@ if __name__ == "__main__":
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([1.0, 0.0, 0.0]), torch.tensor([0.0, -1.0, 0.0]))  [eye, center, up]
+        ).cuda(),
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        ).cuda(), 
         torch.tensor(
             [
                 [1.0, 0.0, 0.0, 0.0],
@@ -211,23 +277,7 @@ if __name__ == "__main__":
                 [0.0, 1.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, -1.0, 0.0]), torch.tensor([0.0, 0.0, -1.0]))  [eye, center, up]
-        torch.tensor(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, -1.0, 0.0],
-                [0.0, -1.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 1.0, 0.0]), torch.tensor([0.0, 0.0, 1.0]))  [eye, center, up]
-        torch.tensor(
-            [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, -1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 0.0, -1.0]), torch.tensor([0.0, 1.0, 0.0]))  [eye, center, up]
+        ).cuda(), 
         torch.tensor(
             [
                 [-1.0, 0.0, 0.0, 0.0],
@@ -235,7 +285,15 @@ if __name__ == "__main__":
                 [0.0, 0.0, -1.0, 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ],
-        ).cuda(),  # lookAt(torch.tensor([0, 0, 0]), torch.tensor([0.0, 0.0, 1.0]), torch.tensor([0.0, -1.0, 0.0]))  [eye, center, up]
+        ).cuda(), 
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        ).cuda(), 
     ]
 
     zfar = 100.0
@@ -280,21 +338,31 @@ if __name__ == "__main__":
     grid = (aabb_max - aabb_min) / (args.occlu_res - 1)
     positions = torch.tensor(prods).cuda() * grid + aabb_min  # [bs, 3]
 
-    # init occlusion volume
+    # =================================================================
+    # SECTION 体素遮挡网格初始化
+    # =================================================================
+    # 创建均匀 3D 体素网格，每个体素存储可见性的 SH 系数。
+    # 通过从每个体素中心向场景渲染，将哪些方向被遮挡编码为 SH 系数。
+    # SH 度数为 3 → (3+1)^2 = 16 个系数（实际只用 d^2=9），支持平滑方向变化。
     occlu_sh_degree = 3
     occlusion_threshold = args.occlusion
     valid_mask = torch.zeros([args.occlu_res, args.occlu_res, args.occlu_res]).bool().cuda()
     points = gaussians.get_xyz
+    # 将高斯点分配到体素（含相邻体素标记），确定哪些体素需要烘焙。
+    # 思路：对每个高斯点，除了它所在的体素外，还把它在 +x/+y/+z 方向上的
+    # 相邻体素一并标记为有效，构成 2×2×2 的 8 个体素块。这样可避免点恰好
+    # 落在体素边界处时仅标记单一体素，导致周围体素漏烘焙、出现遮挡空洞。
+    # quat: 每个高斯点所在的体素整数索引（ floors(point - aabb_min) / grid ）
     quat = ((points - aabb_min) // grid).long()
-    qx0, qx1 = quat[..., 0].clamp(min=0, max=args.occlu_res - 1), (quat[..., 0] + 1).clamp(
-        min=0, max=args.occlu_res - 1
-    )
-    qy0, qy1 = quat[..., 1].clamp(min=0, max=args.occlu_res - 1), (quat[..., 1] + 1).clamp(
-        min=0, max=args.occlu_res - 1
-    )
-    qz0, qz1 = quat[..., 2].clamp(min=0, max=args.occlu_res - 1), (quat[..., 2] + 1).clamp(
-        min=0, max=args.occlu_res - 1
-    )
+    # 每个轴取当前体素索引(q*0)与下一个体素索引(q*1=+1)，并 clamp 到 [0, occlu_res-1]
+    # 以处理点落在网格外或最后一层体素的边界情况
+    qx0= quat[..., 0].clamp(min=0, max=args.occlu_res - 1)
+    qx1 = (quat[..., 0] + 1).clamp(min=0, max=args.occlu_res - 1)
+    qy0= quat[..., 1].clamp(min=0, max=args.occlu_res - 1)
+    qy1 = (quat[..., 1] + 1).clamp(min=0, max=args.occlu_res - 1)
+    qz0= quat[..., 2].clamp(min=0, max=args.occlu_res - 1)
+    qz1 = (quat[..., 2] + 1).clamp( min=0, max=args.occlu_res - 1)
+    # 标记高斯点周围 2×2×2 共 8 个体素为有效（需要烘焙遮挡 SH 的体素）
     valid_mask[qx0, qy0, qz0] = True
     valid_mask[qx0, qy0, qz1] = True
     valid_mask[qx0, qy1, qz0] = True
@@ -303,10 +371,11 @@ if __name__ == "__main__":
     valid_mask[qx1, qy0, qz1] = True
     valid_mask[qx1, qy1, qz0] = True
     valid_mask[qx1, qy1, qz1] = True
+    # 返回(x_indices, y_indices, z_indices) 对应 valid_mask 中所有 True 元素在三个轴上的坐标索引。
     xyz_ids = torch.where(valid_mask)
-    # Precompute grid_id → voxel coordinate lookup (avoids scanning occlusion_ids per iteration)
     coords_of_id = torch.stack(xyz_ids, dim=-1).cuda()  # [num_grid, 3]
     num_grid = valid_mask.sum()
+    # occlusion_ids: 3D 体素网格，-1=空体素
     occlusion_ids = (
         torch.ones(
             [args.occlu_res, args.occlu_res, args.occlu_res],
@@ -314,13 +383,18 @@ if __name__ == "__main__":
         )
         * -1
     ).cuda()
+    # 填入有效索引
     occlusion_ids[xyz_ids[0], xyz_ids[1], xyz_ids[2]] = torch.arange(
         num_grid, dtype=torch.int32
     ).cuda()
+    # occlusion_coefficients: [num_grid, d^2, 1] 有效体素的 SH 可见性系数
+    # 训练前初始化为零（全可见），训练中通过体素级渲染更新
     occlusion_coefficients = torch.zeros(
         [num_grid, occlu_sh_degree**2, 1], dtype=torch.float32
     ).cuda()
+    # !SECTION
 
+    # SECTION prepare 数据
     render_path = os.path.join(model_path, "temp")
 
     makedirs(render_path, exist_ok=True)
@@ -339,18 +413,16 @@ if __name__ == "__main__":
     scales = gaussians.get_scaling
     rots = gaussians.get_rotation
 
-    (
-        solid_angles,  # [H, W, 1]
-        envmap_dirs,  # [H, W, 3]
-    ) = get_envmap_dirs()
-    components = components_from_spherical_harmonics(occlu_sh_degree, envmap_dirs)  # [H, W, d2]
-
-    # Equirect mode: override envmap resolution (shorter arrays for equirect_res)
+    # Equirect mode: use equirect rasterizer resolution (shorter envmap arrays)
     if args.equirect:
         eq_H, eq_W = args.equirect_res, args.equirect_res * 2
         print(f"[equirect] Using equirect rasterizer at resolution {eq_H}×{eq_W}")
         solid_angles, envmap_dirs = get_envmap_dirs([eq_H, eq_W])
         components = components_from_spherical_harmonics(occlu_sh_degree, envmap_dirs)
+    else:
+        # [H, W, 1]、[H, W, 3]
+        solid_angles, envmap_dirs = get_envmap_dirs()
+        components = components_from_spherical_harmonics(occlu_sh_degree, envmap_dirs)  # [H, W, d2]
 
     # get canonical ray and its norm to normalize depth
     canonical_rays = get_canonical_rays(H=res, W=res, tan_fovx=1.0, tan_fovy=1.0)  # [HW, 3]
@@ -362,8 +434,13 @@ if __name__ == "__main__":
             print(f"  Using scene extent as reference for wall detection (grid covers [{aabb_min[0]:.3f}, {aabb_max[0]:.3f}] x [{aabb_min[1]:.3f}, {aabb_max[1]:.3f}] x [{aabb_min[2]:.3f}, {aabb_max[2]:.3f}])")
         else:
             print(f"  Using scene extent as reference for wall detection (bound={args.bound})")
+    # !SECTION
 
-    # --vis_walls: render equirect panorama using SGS rasterizer for wall detection verification
+    # =================================================================
+    # SECTION --vis_walls: 墙壁检测可视化
+    # 从场景中心用 SGS 等距光栅化器渲染全景图，将墙壁区域高亮为红色覆盖层，
+    # 同时输出法线朝向可视化用于调试。保存后直接退出（不执行烘焙）。
+    # =================================================================
     if args.vis_walls:
         center = ((scene_min + scene_max) / 2)
         print(f"\n[vis_walls] Rendering from scene center: {center.detach().cpu().numpy()}")
@@ -493,8 +570,17 @@ if __name__ == "__main__":
         n_surface = (~is_bg).sum().item()
         print(f"[vis_walls] Stats: wall={n_wall}, non-wall={n_surface - n_wall}, bg={is_bg.sum().item()}")
         print(f"[vis_walls] Saved to {model_path}/vis_walls_rgb.png and vis_walls_overlay.png")
+    # !SECTION
+
+
 
     with torch.no_grad():
+        # =================================================================
+        # SECTION Equirect 烘焙模式（使用 SGS 等距光栅化器，camera_type=3）
+        # =================================================================
+        # 对每个有效体素，从体素中心渲染一张等距全景图（单次渲染覆盖 4π 球面），
+        # 用背景色检测遮挡（白色背景 → 被遮挡的像素不是白色），
+        # 将遮挡掩码投影到 SH 基函数上，累加得到体素的可见性 SH 系数。
         if args.equirect:
             bg = torch.ones(3, device="cuda")  # white: unoccluded pixels remain white (>0.5) after alpha blend
             for grid_id in trange(num_grid):
@@ -509,9 +595,7 @@ if __name__ == "__main__":
                 c2w = torch.eye(4, device="cuda")
                 c2w[:3, 3] = position
                 w2c = torch.inverse(c2w)
-                T_vec = w2c[:3, 3]
-                R_mat = w2c[:3, :3].T  # identity
-                viewmatrix = getWorld2ViewTorch(R_mat, T_vec).transpose(0, 1)
+                viewmatrix = w2c.T
 
                 raster_settings = GaussianRasterizationSettings(
                     image_height=eq_H,
@@ -543,11 +627,14 @@ if __name__ == "__main__":
                 )
 
                 rendered_image = rendered_image.permute(1, 2, 0)  # [eq_H, eq_W, 3]
+                # 背景色白色 (1,1,1)，被高斯遮挡的像素 < 0.5 → masked out
                 is_bg = rendered_image[..., 0:1] > 0.5  # [eq_H, eq_W, 1]
 
                 if args.skip_walls:
                     depth = depth_raw * (acc > 0.5).float()  # filter floaters
                     depth = depth.squeeze(0).unsqueeze(-1)  # [1, eq_H, eq_W] → [eq_H, eq_W, 1]
+                    # envmap_dirs 使用 reflvec 约定 (+Y up, -Z forward)，
+                    # 转 world space：diag(1, -1, -1)
                     world_dirs = envmap_dirs * envmap_dirs.new_tensor([1.0, -1.0, -1.0])
                     hit_pos = position + world_dirs * depth  # [eq_H, eq_W, 3]
                     dist_to_min = hit_pos - scene_min
@@ -565,10 +652,17 @@ if __name__ == "__main__":
                 else:
                     occlu_mask = is_bg.float()
 
+                # 将遮挡掩码投影到 SH 基函数上：C_j = Σ_pixels (mask_p * ω_p * Y_j(dir_p))
                 weighted_color = occlu_mask * solid_angles
                 temp_coefficients = (weighted_color * components).sum(0).sum(0)
                 occlusion_coefficients[grid_id] = temp_coefficients[:, None]
-
+        # !SECTION
+        # =================================================================
+        # SECTION Cubemap 烘焙模式（原始行为，使用 diff-gaussian-rasterization）
+        # =================================================================
+        # 对每个有效体素，从体素中心渲染 6 个面（FOV=90° 的透视立方体贴图），
+        # 通过 nvdiffrast 的 boundary_mode="cube" 将 6 面贴图采样到等距方向，
+        # 用背景色检测遮挡并投影到 SH 基函数。
         else:  # cubemap mode (original behavior)
             for grid_id in trange(num_grid):
                 quat = coords_of_id[grid_id]  # [3] voxel coords, O(1) vs O(res³)
@@ -578,6 +672,7 @@ if __name__ == "__main__":
                 opacity_cubemap = []
                 depth_cubemap = []
                 # NOTE: crop by position
+                # 只保留 valid 范围内的高斯点左遮挡检测
                 diff = means3D - position
                 valid = (diff.abs() < args.valid).all(dim=1)
                 valid_means3D = means3D[valid]
@@ -586,17 +681,22 @@ if __name__ == "__main__":
                 valid_shs = shs[valid]
                 valid_scales = scales[valid]
                 valid_rots = rots[valid]
+                # 渲染 6 个面（+X, -X, +Y, -Y, +Z, -Z），每个面 FOV=90°
                 for r_idx, rotation in enumerate(rotations):
+                    # SECTION 根据 c2w 求 w2c 
                     c2w = rotation
+                    # 相机原点在世界坐标系下的坐标(体素中心)
                     c2w[:3, 3] = position
                     w2c = torch.inverse(c2w)
-                    T = w2c[:3, 3]
-                    R = w2c[:3, :3].T
-                    world_view_transform = getWorld2ViewTorch(R, T).transpose(0, 1)
+                    # w2c.T 转为列主序（供 CUDA 左乘）
+                    world_view_transform = w2c.T
                     full_proj_transform = (
                         world_view_transform.unsqueeze(0).bmm(projection_matrix.unsqueeze(0))
                     ).squeeze(0)
-                    camera_center = world_view_transform.inverse()[3, :3]
+                    # 我服了
+                    # camera_center = world_view_transform.inverse()[3, :3]
+                    camera_center = position
+                    # !SECTION
 
                     input_args = (
                         bg_color,
@@ -628,7 +728,8 @@ if __name__ == "__main__":
                     depth_map = depth_map * (opacity_map > 0.5).float()  # NOTE: import to filter out the floater
                     depth_cubemap.append(depth_map.permute(1, 2, 0) * norm)
 
-                # convert cubemap to HDRI
+                # 用 nvdiffrast 将 6 面 cubemap 采样到等距方向网格
+                # boundary_mode="cube" 根据方向 (envmap_dirs) 在 6 个面间做纹理查找
                 depth_envmap = dr.texture(
                     torch.stack(depth_cubemap)[None, ...],
                     envmap_dirs[None, ...].contiguous(),
@@ -655,6 +756,10 @@ if __name__ == "__main__":
                 # use SH to store the HDRI
                 # occlu_mask = (1 - (depth_envmap < occlusion_threshold).float()) + (depth_envmap == 0).float()  # [H, W, 1]
                 # occlu_mask = (rgb_envmap > 0.5).float()
+                
+                # 遮挡判定：白色背景 (1,1,1) → 无高斯遮挡，视为可见
+                # 使用单个通道（灰度）判断，>0.5 为可见
+
                 is_bg = (rgb_envmap > 0.5)  # [H, W, 1] — no surface hit, fully visible
                 if args.skip_walls:
                     # Compute hit positions and check proximity to scene AABB boundary (per-face)
@@ -679,24 +784,31 @@ if __name__ == "__main__":
                 else:
                     occlu_mask = is_bg.float()
 
+                # 将遮挡掩码投影到 SH 基函数：C_j = Σ 掩码 * 立体角 * Y_j
                 weighted_color = occlu_mask * solid_angles  # [H, W, 1]
                 temp_coefficients = (weighted_color * components).sum(0).sum(0)  # [d2]
                 occlusion_coefficients[grid_id] = temp_coefficients[:, None]
-
-        # dialate coefficient ids
+        # !SECTION
+        # =================================================================
+        # 体素空洞填充：将未标记（-1）的空体素用最近的邻居扩张填充
+        # 使遮挡插值（recon_occlusion）不会遇到无效体素
+        # =================================================================
         while (occlusion_ids == -1).sum() > 0:
             gs_ir_ext.dialate_occlusion_ids(occlusion_ids)
 
+    # =================================================================
+    # 保存遮挡体素数据
+    # =================================================================
     save_dict = {
-        "occlusion_ids": occlusion_ids,
-        "occlusion_coefficients": occlusion_coefficients,
-        "bound": args.bound,
-        "degree": occlu_sh_degree,
+        "occlusion_ids": occlusion_ids,           # [occlu_res³] 体素索引映射
+        "occlusion_coefficients": occlusion_coefficients,  # [num_grid, d², 1] SH 系数
+        "bound": args.bound,                      # 场景边界（对称）
+        "degree": occlu_sh_degree,                # SH 度数 (=3)
         "occlusion_threshold": occlusion_threshold,
     }
     if args.auto_bound:
-        save_dict["aabb"] = torch.cat([auto_aabb_min.cpu(), auto_aabb_max.cpu()])  # [6]
-    save_file = os.path.join(os.path.dirname(args.checkpoint), "occlusion_volumes.pth")
+        save_dict["aabb"] = torch.cat([auto_aabb_min.cpu(), auto_aabb_max.cpu()])  # [6] 非对称 AABB
+    save_file = args.occlusion_path or os.path.join(os.path.dirname(args.checkpoint), "occlusion_volumes.pth")
     torch.save(save_dict, save_file)
     print(f"save occlusion volumes as {save_file}")
 

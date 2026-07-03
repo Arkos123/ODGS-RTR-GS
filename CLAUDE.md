@@ -7,15 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 RTR-GS is a 3D Gaussian Splatting framework for inverse rendering with radiance transfer and reflection. It enables novel view synthesis, BRDF/lighting decomposition, and relighting of objects with arbitrary reflectance properties, including reflective surfaces.
 
 This repository also includes **Spherical Gaussian Splatting (SGS)** as a submodule at `submodules/spherical-gaussian-splatting/`, enabling RTR-GS to train with omnidirectional (equirectangular) 360° images. See [README.md](README.md) for unified environment setup and read `submodules/spherical-gaussian-splatting/CLAUDE.md` for SGS usage.
-- The original ODGS submodule has been replaced by the new SGS submodule. See `doc/关于融合RTRGS&ODGS的方案/implement/*.md` for historical integration details.
+- The old ODGS (Omni3DGS) submodule has been replaced by the new SGS(Spherical3DGS) submodule. See `doc/关于融合RTRGS&ODGS的方案/implement/*.md` for historical integration details.
 
 ## Documentation
 
 The [doc/](doc/) directory contains detailed documentation for this project, including:
-- **Technical deep dives**: In-depth analysis of rendering internals, occlusion baking, and key features (e.g. `ref_map`)
-- **Training pipeline overview**: Complete walkthrough of the two-stage training process
-- **Integration notes**: RTR-GS & ODGS/SGS fusion analysis and research records
-- **Historical commit explanations**: Context and rationale behind important changes
+- **Development log**: Detailed development process and key decisions in `doc/dev_log/*.md`.
+- **Technical deep dives**: In-depth analysis of rendering internals, occlusion baking, and key features (e.g. `doc/RTR-GS/ref_map介绍.md`)
 
 Check the `doc/` folder for details if you need more information.
 
@@ -65,10 +63,41 @@ Both branches run simultaneously during Stage 2 - freezing geometry or using PBR
 - **`recon_occlusion`** (`submodules/gs-ir/gs_ir/__init__.py`): During PBR rendering, interpolates per-pixel occlusion SH coefficients from the voxel grid and evaluates visibility in the surface normal direction using GGX importance sampling
 - Self-occlusion prevention: evaluation point is shifted half a grid step along the normal direction before voxel interpolation (`shift_points = points + normals * grid_step * 0.5`)
 - Cosine mask in CUDA kernel (`occlusion_kernel.cu`) excludes voxel corners below the surface
-- **Coordinate system**: Baking's SH coefficients are computed in **reflvec space** (nvdiffrast cubemap convention: +Y=up, -Z=forward), while normals from `get_min_axis` are in **COLMAP world space** (+Y=down, +Z=forward). A `diag(1, -1, -1)` conversion is applied in `recon_occlusion` before SH evaluation. See `doc/20260610-occlusion-skip-walls-and-auto-bound.md` for details.
+- **Coordinate system**: Baking's SH coefficients are computed in **reflvec space** (nvdiffrast cubemap convention: +Y=up, -Z=forward), while normals from `get_min_axis` are in **COLMAP world space** (+Y=down, +Z=forward). A `diag(1, -1, -1)` conversion is applied in `recon_occlusion` before SH evaluation. See `doc/dev_log/20260617-001-equirect-camera-centric-to-world-space-fix.md` for details.
 - `--skip_walls`: Excludes scene-boundary geometry (walls/floor/ceiling) from occlusion via distance threshold (`--wall_margin`)
 - `--auto_bound`: Automatically computes the voxel grid AABB from Gaussian positions
 - Enables indirect lighting modeling via parameter `L_ind`
+
+## Coordinate Conventions
+
+Multiple coordinate systems exist in the codebase. **Mixing them is the most common source of bugs** (normal color inversion, occlusion misalignment).
+
+| Space | +X | +Y | +Z | Used by | Typical source |
+|-------|----|----|----|---------|---------------|
+| **COLMAP world** | right | **down** | **forward** | `get_min_axis`, `rendered_normal`, `pc.get_xyz`, `scene_min/max` | COLMAP / OpenMVG convention |
+| **Equirect view** | right | **up** | forward | `_equirect_ray_dirs`, `_erp_depth_to_normal` (raw output) | Equirect lat/lon grid (lat=+π/2 = top = +Y) |
+| **reflvec / cubemap** | right | up | **-forward (-Z)** | Baking's `envmap_dirs`, nvdiffrast `boundary_mode="cube"` | nvdiffrast cubemap convention (φ=0 → -Z) |
+
+**Key conversions:**
+- `COLMAP → equirect view`: `diag(1, -1, 1)` (flip Y)
+- `COLMAP → reflvec`: `diag(1, -1, -1)` (flip Y and Z)
+- `equirect view → COLMAP`: `C2W[:3,:3] @ diag(1, -1, 1) @ n` (Y flip + C2W rotation)
+
+### 行主序 vs 列主序
+
+CUDA 光栅化器使用 **OpenGL 列主序** 约定，而 PyTorch 默认行主序。`world_view_transform` 传到 CUDA 前必须 `.T` 转成列主序。详见 [doc/RTR-GS/row-major-column-major.md](doc/RTR-GS/row-major-column-major.md)。
+
+**Files where conventions collide (be careful):**
+- `gaussian_renderer/render_equirect.py` — `_erp_depth_to_normal` output (equirect view +Y up) converted to world space (COLMAP +Y down) via Y flip + C2W
+- `submodules/gs-ir/gs_ir/__init__.py` — `recon_occlusion`: baking 的 SH 系数在 reflvec 空间，传入的 normals 是 COLMAP 空间 → 内部用 `diag(1, -1, -1)` 转换后再做 SH 重建
+- `baking.py` — `envmap_dirs` (reflvec) used with world-space `position` for `hit_pos` → requires diag(1,-1,-1) conversion
+
+**Cubemap rotation order** (nvdiffrast convention):
+`+X(0), -X(1), +Y(2), -Y(3), +Z(4), -Z(5)`
+
+RTR-GS CUDA rasterizer (`rtr_gs-rasterization`): `renderPseudoNormalCUDA` computes normals in camera space then transforms to world space using the view matrix. See `forward.cu:488-490`.
+
+
 
 ## Pipeline
 
@@ -81,7 +110,7 @@ The codebase supports **equirectangular (360° panorama)** training via the SGS 
 1. **SGS training**: Reconstruct geometry from equirectangular images using the spherical Gaussian rasterizer (camera_type=3)
 2. **PLY conversion** (`script/sgs2rtrgs.py`): Convert SGS format PLY → RTR-GS format (adds default PBR/reflection attributes)
 3. **RTR-GS Stage 1** (`train.py --t render_ref_equirect`): Geometry + reflection pre-training in equirect mode
-4. **Occlusion baking** (`baking.py`): Precompute visibility
+4. **Occlusion baking** (`baking.py`): Precompute visibility. Use `--equirect` flag for SGS equirect rasterizer (avoids perspective-rasterizer artifacts on equirect-trained Gaussians). See `doc/RTR-GS/occlusion_baking.md`.
 5. **RTR-GS Stage 2** (`train.py --t render_ref_pbr_equirect`): PBR material decomposition in equirect mode
 
 > See `script/run_sgs_rtr.sh` for details.
@@ -124,6 +153,20 @@ Others:
 
 
 ## Key Architecture
+
+### Submodules and Rasterizers
+
+The project has 6 submodule directories and 3 CUDA rasterizers:
+
+| Rasterizer | Mode | Used by |
+|---|---|---|
+| `rtr_gs-rasterization` | **Perspective** (pinhole) | `render.py`, `render_fast.py` |
+| `spherical-gaussian-rasterization` (inside SGS) | **Equirect** (360°) | `render_equirect.py` |
+| `diff-gaussian-rasterization` | Original 3DGS (lightweight) | `baking.py` (cubemap voxel render) |
+
+Others: `gs-ir` (occlusion voxel SH interpolation), `simple-knn` (initial scale via `distCUDA2`).
+
+> See `doc/submodules-and-rasterizers.md` for detailed descriptions, CUDA file structure, depth semantics, and full call graph.
 
 ### Core Modules
 
@@ -176,3 +219,5 @@ The codebase supports multiple dataset formats detected automatically:
 See `lab_output/OmniBlender/barbershop/` for equirectangular pipeline output example.
 
 See `lab_output/360Roam/base_blender/` for perspective pipeline output example.
+
+**语言要求：所有思考、计划、分析过程及回答全部使用中文！**
