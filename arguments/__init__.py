@@ -147,6 +147,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_env_smooth = 0.01
         self.lambda_reflect_strength_equal_metallic = 0.0
 
+        # Equirect geometry loss ramp: gradually activate normal/ref smoothness
+        self.geometry_loss_from_iter = 3500
+        self.geometry_loss_warmup_iters = 1500
+        self.lambda_alpha_hole = 0.0  # Self-supervised alpha hole penalty (equirect)
+
         self.use_env_scope = False
         self.env_scope_center = [0.,0.,0.]
         self.env_scope_radius = 0.0

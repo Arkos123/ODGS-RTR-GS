@@ -483,11 +483,12 @@ if __name__ == "__main__":
 
         # Render with SH
         shs = gaussians.get_shs
-        rendered_image, radii, depth_raw, acc, normal_raw = rasterizer(
+        rendered_image, _, radii, depth_raw, acc, normal_raw = rasterizer(
             means3D=means3D,
             means2D=screenspace_points,
             shs=shs,
             colors_precomp=None,
+            extra_features=None,
             opacities=opacity,
             scales=scales,
             rotations=rots,
@@ -615,11 +616,12 @@ if __name__ == "__main__":
                 )
                 rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-                rendered_image, radii, depth_raw, acc, normal_raw = rasterizer(
+                rendered_image, _, radii, depth_raw, acc, normal_raw = rasterizer(
                     means3D=means3D[valid],
                     means2D=means2D[valid],
                     shs=shs[valid],
                     colors_precomp=None,
+                    extra_features=None,
                     opacities=opacity[valid],
                     scales=scales[valid],
                     rotations=rots[valid],

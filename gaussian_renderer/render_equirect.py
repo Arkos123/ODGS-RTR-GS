@@ -7,11 +7,47 @@ from scene.gaussian_model import GaussianModel
 from scene.cameras import Camera
 from utils.prt_utils import PRTutils
 from utils.sh_utils import eval_sh
-from utils.loss_utils import ssim, tv_loss, first_order_edge_aware_loss, est_wsmap
+from utils.loss_utils import ssim, tv_loss, est_wsmap
 from utils.image_utils import psnr
 from utils.graphics_utils import linear2srgb_torch
 from spherical_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from gs_ir import recon_occlusion
+
+def _ensure_pano_losses():
+    """Lazy-load pano_losses inside function to avoid sys.path pollution at module level."""
+    if _ensure_pano_losses.cache is not None:
+        return _ensure_pano_losses.cache
+    import sys, os
+    _root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'submodules', 'spherical-gaussian-splatting'))
+    if os.path.isdir(_root):
+        if _root not in sys.path:
+            sys.path.insert(0, _root)
+        from pano_losses import (
+            pano_row_area_weight, pano_rgb_nonedge_weight,
+            geometry_iter_ramp, pano_normal_smoothness_loss, pano_alpha_hole_loss,
+        )
+        _ensure_pano_losses.cache = (pano_row_area_weight, pano_rgb_nonedge_weight, geometry_iter_ramp, pano_normal_smoothness_loss, pano_alpha_hole_loss)
+    else:
+        _ensure_pano_losses.cache = (None, None, None, None, None)
+    return _ensure_pano_losses.cache
+_ensure_pano_losses.cache = None
+
+
+def _erp_edge_aware_loss(data, img):
+    """Edge-aware smoothness with cyclic horizontal boundary for ERP.
+
+    Replaces first_order_edge_aware_loss for equirect mode.
+    Horizontal gradients use torch.roll (cyclic) to avoid left-right seam.
+    Vertical gradients use standard padding (non-cyclic, ERP vertical is finite).
+    """
+    dx = (torch.roll(data, shifts=-1, dims=-1) - data).abs()
+    wx = torch.exp(-(torch.roll(img, shifts=-1, dims=-1) - img).abs())
+    dy = torch.zeros_like(data)
+    wy = torch.zeros_like(img)
+    if data.shape[-2] > 1:
+        dy[:, :-1, :] = (data[:, 1:, :] - data[:, :-1, :]).abs()
+        wy[:, :-1, :] = torch.exp(-(img[:, 1:, :] - img[:, :-1, :]).abs())
+    return (dx * wx + dy * wy).sum(dim=0).mean()
 
 
 def _equirect_ray_dirs(H, W, device='cuda'):
@@ -43,21 +79,8 @@ def _project_lat_lon(means3D, viewmatrix):
     return psi, lat, lon
 
 
-def _run_sgs_rasterizer(means3D, means2D, colors_precomp, opacities, scales, rotations,
-                        rasterizer, shs=None, cov3D_precomp=None):
-    rendered_image, radii, depth_raw, alpha, normal_raw = rasterizer(
-        means3D=means3D,
-        means2D=means2D,
-        shs=shs,
-        colors_precomp=colors_precomp,
-        opacities=opacities,
-        scales=scales,
-        rotations=rotations,
-        cov3D_precomp=cov3D_precomp,
-    )
-    return rendered_image, depth_raw, alpha, radii, normal_raw
-
-
+# NOTE: _run_sgs_rasterizer wrapper removed in V2 multi-pass consolidation.
+#       Direct rasterizer() call is used in render_view().
 
 # ── ERP depth-to-normal helpers (from SGS gaussian_renderer) ────────────────
 
@@ -206,7 +229,8 @@ def _erp_depth_to_normal(depth: torch.Tensor, alpha: torch.Tensor,
 
 
 def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
-                scaling_modifier=1.0, override_color=None, is_training=False, dict_params=None):
+                scaling_modifier=1.0, override_color=None, is_training=False, dict_params=None,
+                fast_pbr=False):
     gamma_func = lambda x: linear2srgb_torch(x)
 
     refmap = dict_params.get("refmap")
@@ -253,7 +277,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         prefiltered=False,
         debug=pipe.debug,
         camera_type=3,
-        render_depth=False,
+        render_depth=False, # deprecated, only used by OmniGS pinhole path
     )
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
@@ -265,17 +289,15 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     ref_strength = pc.get_ref_strength
     normal = pc.get_min_axis(viewpoint_camera.camera_center)
 
-    xyz_homo = torch.cat([means3D, torch.ones_like(means3D[:, :1])], dim=-1)
-    depths = (xyz_homo @ viewpoint_camera.world_view_transform)[:, 2:3]
-
-    only_diffuse = dict_params.get("iteration", 0) < pipe.diffuse_iteration
-    if pipe.compute_with_prt and override_color is None and transfer_net is not None:
-        viewdirs = F.normalize(viewpoint_camera.camera_center - means3D, dim=-1)
-        if only_diffuse:
-            prt_color = PRTutils.cal_diffuse(pc)
-        else:
-            prt_color = PRTutils.cal_color(pc, transfer_net, viewdirs, normal, is_training)
-        override_color = prt_color
+    if not fast_pbr:
+        only_diffuse = dict_params.get("iteration", 0) < pipe.diffuse_iteration
+        if pipe.compute_with_prt and override_color is None and transfer_net is not None:
+            viewdirs = F.normalize(viewpoint_camera.camera_center - means3D, dim=-1)
+            if only_diffuse:
+                prt_color = PRTutils.cal_diffuse(pc)
+            else:
+                prt_color = PRTutils.cal_color(pc, transfer_net, viewdirs, normal, is_training)
+            override_color = prt_color
 
     scales = None
     rotations = None
@@ -300,126 +322,25 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     else:
         colors_precomp = override_color
 
-    # ---- Pass 1: Forward-shaded rendering (PRT + forward reflection) ----
+    # ---- Compute forward-shaded color (PRT + forward reflection) ----
     viewdirs_gauss = F.normalize(viewpoint_camera.camera_center - means3D, dim=-1)
 
-    if pipe.forward_shading and refmap is not None:
+    if fast_pbr:
+        colors_precomp_pass1 = None
+    elif pipe.forward_shading and refmap is not None:
         refl_color_forward = get_reflectance_color_forward(
             refmap, normal, viewdirs_gauss, ref_roughness, ref_tint, brdf_lut=brdf_lut)
         colors_precomp_pass1 = (1.0 - ref_strength) * colors_precomp + ref_strength * refl_color_forward
     else:
         colors_precomp_pass1 = colors_precomp
 
-    rendered_image, depth, acc, radii, _ = _run_sgs_rasterizer(
-        means3D, means2D, colors_precomp_pass1, opacity, scales, rotations,
-        rasterizer, shs=shs, cov3D_precomp=cov3D_precomp,
-    )
-    rendered_opacity = acc
-    visibility_filter = radii > 0
-
-    # ---- Pseudo-normal from depth (geometrically correct, like SGS normal_depth) ----
-    pseudo_normal = _erp_depth_to_normal(depth, rendered_opacity)
-
-    # Convert pseudo_normal from COLMAP view space to COLMAP world space.
-    # _erp_depth_to_normal now uses Y-down convention (COLMAP view space),
-    # so only the C2W rotation is needed.
-    if isinstance(pseudo_normal, torch.Tensor):
-        c2w_rot = c2w[:3, :3].to(device=pseudo_normal.device, dtype=pseudo_normal.dtype)
-        pseudo_normal = c2w_rot @ pseudo_normal.reshape(3, -1)              # view → world
-        pseudo_normal = F.normalize(pseudo_normal.reshape(3, H, W), dim=0)
-
-    # ---- Alpha normalization mask for multi-pass outputs ----
-    alpha_mask = (rendered_opacity > 0).float()
-    opacity_for_div = rendered_opacity.clamp_min(1e-5)
-
-    # ---- Pass 2: Normal map (encode as n*0.5+0.5 → [0,1] range) ----
-    colors_precomp_normal = normal * 0.5 + 0.5
-    rendered_normal_img, _, _, _, _ = _run_sgs_rasterizer(
-        means3D, means2D, colors_precomp_normal, opacity, scales, rotations,
-        rasterizer, cov3D_precomp=cov3D_precomp,
-    )
-    rendered_normal_img = rendered_normal_img / opacity_for_div * alpha_mask
-    rendered_normal = rendered_normal_img * 2.0 - 1.0
-    rendered_normal = F.normalize(rendered_normal, dim=0)
-
-    # ---- Normal-facing visualization (red=back-facing, blue=front-facing) ----
-    out_feature_dict = {}
-    # rendered_normal is [3, H, W] world-space normal
-    # Camera-to-point direction in world space.
-    ray_dirs_vis = _equirect_ray_dirs(H, W)  # [H, W, 3] COLMAP view space (+Y down)
-    cam_to_point = F.normalize(
-        (ray_dirs_vis.reshape(-1, 3) @ c2w[:3, :3].T).reshape(H, W, 3), dim=-1)
-    normal_hw = rendered_normal.permute(1, 2, 0)  # [H, W, 3]
-    cos_angle_nml = (normal_hw * cam_to_point).sum(dim=-1)  # [H, W], >0 back-facing
-    facing_vis = torch.where(
-        cos_angle_nml.unsqueeze(-1) > 0,
-        torch.tensor([1.0, 0.1, 0.1], device="cuda"),  # red: back-facing
-        torch.tensor([0.1, 0.3, 1.0], device="cuda"),  # blue: front-facing
-    )
-    facing_vis = torch.where(
-        (rendered_opacity > 0.5).permute(1, 2, 0).expand(-1, -1, 3),
-        facing_vis,
-        torch.tensor([0.5, 0.5, 0.5], device="cuda"),  # gray: background
-    )
-    out_feature_dict["normal_facing"] = facing_vis.permute(2, 0, 1)
-
-    # ---- Pass 3: Ref_strength + ref_roughness + ref_tint (for visualization) ----
-    colors_precomp_refs = torch.cat([ref_strength, ref_roughness, torch.zeros_like(ref_strength)], dim=-1)
-    rendered_refs, _, _, _, _ = _run_sgs_rasterizer(
-        means3D, means2D, colors_precomp_refs, opacity, scales, rotations,
-        rasterizer, cov3D_precomp=cov3D_precomp,
-    )
-    rendered_refs = rendered_refs / opacity_for_div * alpha_mask
-    rendered_ref_strength_map = rendered_refs[0:1]
-    rendered_ref_roughness_map = rendered_refs[1:2]
-
-    # ---- Pass 3b: Ref_tint map (RGB) ----
-    rendered_ref_tint, _, _, _, _ = _run_sgs_rasterizer(
-        means3D, means2D, ref_tint, opacity, scales, rotations,
-        rasterizer, cov3D_precomp=cov3D_precomp,
-    )
-    rendered_ref_tint = rendered_ref_tint / opacity_for_div * alpha_mask
-
-    # ---- Pass 4,5: PBR attributes (PBR mode only) ----
+    # ---- Compute PBR per-Gaussian attributes for extra_features ----
     if pc.use_pbr:
         base_color = pc.get_base_color
         roughness = pc.get_roughness
         metallic = pc.get_metallic
-
-        # Pass 4: Base color (3 channels)
-        colors_precomp_base = base_color
-        rendered_base_color_img, _, _, _, _ = _run_sgs_rasterizer(
-            means3D, means2D, colors_precomp_base, opacity, scales, rotations,
-            rasterizer, cov3D_precomp=cov3D_precomp,
-        )
-        rendered_base_color_img = rendered_base_color_img / opacity_for_div * alpha_mask
-
-        # Pass 5: Packed (R=roughness, G=metallic, B=depth_normalized)
-        depth_attr = depths / depths.max().clamp_min(1e-6)
-        colors_precomp_packed = torch.cat([
-            roughness.clamp(0.04, 1.0),
-            metallic,
-            depth_attr,
-        ], dim=-1)
-        rendered_packed, _, _, _, _ = _run_sgs_rasterizer(
-            means3D, means2D, colors_precomp_packed, opacity, scales, rotations,
-            rasterizer, cov3D_precomp=cov3D_precomp,
-        )
-        rendered_packed = rendered_packed / opacity_for_div * alpha_mask
-
-        # ---- Pass 6: Incident light (3 channels) ----
         if not getattr(pipe, 'relight', False):
             incidents = pc.get_incidents
-            incidents_rgb = torch.clamp(eval_sh(
-                pc.active_sh_degree,
-                incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2),
-                normal,
-            ), 0.0, 1.0)
-        elif getattr(pipe, 'transfer_light', False) and cubemap is not None:
-            transfer_shs = pc.get_incidents.permute(0, 2, 1)
-            light_shs = cubemap.shs
-            incidents = light_shs * transfer_shs
-            incidents = incidents.permute(0, 2, 1)
             incidents_rgb = torch.clamp(eval_sh(
                 pc.active_sh_degree,
                 incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2),
@@ -428,11 +349,89 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         else:
             incidents_rgb = torch.zeros_like(base_color)
 
-        rendered_incident_img, _, _, _, _ = _run_sgs_rasterizer(
-            means3D, means2D, incidents_rgb, opacity, scales, rotations,
-            rasterizer, cov3D_precomp=cov3D_precomp,
+    # ---- Build extra_features (V2 multi-channel: all non-color attrs in one pass) ----
+    extra_list = [normal * 0.5 + 0.5]  # [P, 3], normal encoded for [0,1] range
+    if not fast_pbr:
+        extra_list.extend([ref_strength, ref_roughness, ref_tint])  # [P, 1+1+3]
+    if pc.use_pbr:
+        extra_list.extend([base_color, roughness.clamp(0.04, 1.0), metallic, incidents_rgb])
+    extra_features_tensor = torch.cat(extra_list, dim=-1)  # [P, N]
+
+    # ---- Single V2 rasterizer call (color + extra + geometry) ----
+    rendered_image, rendered_extra, radii, depth_raw, alpha, normal_raw = rasterizer(
+        means3D=means3D, means2D=means2D, opacities=opacity,
+        shs=shs, colors_precomp=colors_precomp_pass1,
+        extra_features=extra_features_tensor,
+        scales=scales, rotations=rotations, cov3D_precomp=cov3D_precomp,
+    )
+    rendered_opacity = alpha
+    visibility_filter = radii > 0
+    depth = depth_raw
+
+    # ---- Pseudo-normal from depth (loss supervision for Gaussian normals) ----
+    pseudo_normal = None
+    if not fast_pbr:
+        with torch.no_grad():
+            pseudo_normal = _erp_depth_to_normal(depth, rendered_opacity)
+        c2w_rot = c2w[:3, :3].to(device=pseudo_normal.device, dtype=pseudo_normal.dtype)
+        pseudo_normal = c2w_rot @ pseudo_normal.reshape(3, -1)              # view → world
+        pseudo_normal = F.normalize(pseudo_normal.reshape(3, H, W), dim=0)
+
+    # ---- Alpha-normalize extra features ----
+    alpha_mask = (rendered_opacity > 0).float()
+    opacity_for_div = rendered_opacity.clamp_min(1e-5)
+    rendered_extra = rendered_extra / opacity_for_div * alpha_mask  # [N, H, W]
+
+    # ---- Slice extra into individual attribute maps ----
+    offset = 0
+    rendered_normal = rendered_extra[0:3] * 2.0 - 1.0
+    rendered_normal = F.normalize(rendered_normal, dim=0)
+    offset += 3
+
+    rendered_ref_strength_map = None
+    rendered_ref_roughness_map = None
+    rendered_ref_tint = None
+    if not fast_pbr:
+        rendered_ref_strength_map = rendered_extra[offset+0:offset+1]
+        rendered_ref_roughness_map = rendered_extra[offset+1:offset+2]
+        rendered_ref_tint = rendered_extra[offset+2:offset+5]
+        offset += 5
+
+    rendered_base_color_img = None
+    rendered_incident_img = None
+    rendered_packed = None
+    if pc.use_pbr:
+        rendered_base_color_img = rendered_extra[offset+0:offset+3]
+        roughness_single = rendered_extra[offset+3:offset+4]
+        metallic_single = rendered_extra[offset+4:offset+5]
+        rendered_incident_img = rendered_extra[offset+5:offset+8]
+        # PBR packed tensor for backward compat with downstream code
+        rendered_packed = torch.cat([
+            roughness_single, metallic_single,
+            torch.zeros_like(roughness_single),
+        ], dim=0)
+        offset += 8
+
+    # ---- Normal-facing visualization (red=back-facing, blue=front-facing) ----
+    out_feature_dict = {}
+    facing_vis = None
+    if not fast_pbr:
+        ray_dirs_vis = _equirect_ray_dirs(H, W)
+        cam_to_point = F.normalize(
+            (ray_dirs_vis.reshape(-1, 3) @ c2w[:3, :3].T).reshape(H, W, 3), dim=-1)
+        normal_hw = rendered_normal.permute(1, 2, 0)
+        cos_angle_nml = (normal_hw * cam_to_point).sum(dim=-1)
+        facing_vis = torch.where(
+            cos_angle_nml.unsqueeze(-1) > 0,
+            torch.tensor([1.0, 0.1, 0.1], device="cuda"),
+            torch.tensor([0.1, 0.3, 1.0], device="cuda"),
         )
-        rendered_incident_img = rendered_incident_img / opacity_for_div * alpha_mask
+        facing_vis = torch.where(
+            (rendered_opacity > 0.5).permute(1, 2, 0).expand(-1, -1, 3),
+            facing_vis,
+            torch.tensor([0.5, 0.5, 0.5], device="cuda"),
+        )
+        out_feature_dict["normal_facing"] = facing_vis.permute(2, 0, 1)
 
     # ---- Background blending for main render ----
     opacity_map = rendered_opacity.permute(1, 2, 0)
@@ -506,7 +505,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
 
         # PBR output is NOT pre-multiplied; blend with background via opacity.
         # Detach opacity from PBR gradient — PBR should not optimize opacity.
-        rendered_pbr = rendered_pbr * opacity_map.detach() + (1.0 - opacity_map.detach()) * bg_color
+        rendered_pbr = rendered_pbr * opacity_map + (1.0 - opacity_map) * bg_color
 
         if pipe.tone_mapping:
             rendered_pbr = torch.clamp(rendered_pbr, 0.0, 1.0)
@@ -517,22 +516,25 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             "metallic": metallic_map.permute(2, 0, 1),
             "visibility": occlusion_map.permute(2, 0, 1) if occlusion_map is not None
                           else torch.zeros_like(roughness_map).permute(2, 0, 1),
-            "incidents_light": pbr_result.get("incidents_light", torch.zeros_like(roughness_map)).permute(2, 0, 1),
-            "incident_light_raw": incident_light_map.permute(2, 0, 1),
             "diffuse_pbr": diffuse_pbr.permute(2, 0, 1),
             "specular_pbr": specular_pbr.permute(2, 0, 1),
             "image_pbr": rendered_pbr.permute(2, 0, 1),
         })
+        if not fast_pbr:
+            out_feature_dict.update({
+                "incidents_light": pbr_result.get("incidents_light", torch.zeros_like(roughness_map)).permute(2, 0, 1),
+                "incident_light_raw": incident_light_map.permute(2, 0, 1),
+            })
+            if cubemap is not None:
+                out_feature_dict["env_export_base"] = cubemap.export_envmap(return_img=True).permute(2, 0, 1)
+                out_feature_dict["env_export_diffuse"] = cubemap.export_envmap(return_img=True, base=False).permute(2, 0, 1)
 
-        if cubemap is not None:
-            out_feature_dict["env_export_base"] = cubemap.export_envmap(return_img=True).permute(2, 0, 1)
-            out_feature_dict["env_export_diffuse"] = cubemap.export_envmap(return_img=True, base=False).permute(2, 0, 1)
-
-    out_feature_dict.update({
-        "ref_roughness": rendered_ref_roughness_map,
-        "ref_strength": rendered_ref_strength_map,
-        "ref_tint": rendered_ref_tint,
-    })
+    if not fast_pbr:
+        out_feature_dict.update({
+            "ref_roughness": rendered_ref_roughness_map,
+            "ref_strength": rendered_ref_strength_map,
+            "ref_tint": rendered_ref_tint,
+        })
 
     # ---- psi, lat, lon for densification ----
     psi, lat, lon = _project_lat_lon(means3D, viewpoint_camera.world_view_transform)
@@ -544,8 +546,6 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         "normal": rendered_normal,
         "opacity": rendered_opacity,
         "pseudo_normal": pseudo_normal,
-        "ref_roughness": rendered_ref_roughness_map,
-        "ref_strength": rendered_ref_strength_map,
         "viewspace_points": screenspace_points,
         "visibility_filter": visibility_filter,
         "radii": radii,
@@ -555,12 +555,17 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         "lat": lat,
         "lon": lon,
     }
+    if not fast_pbr:
+        results.update({
+            "ref_roughness": rendered_ref_roughness_map,
+            "ref_strength": rendered_ref_strength_map,
+        })
     results.update(out_feature_dict)
 
     if pc.use_pbr:
         results["pbr"] = gamma_func(rendered_pbr.permute(2, 0, 1))
 
-    if not is_training:
+    if not is_training and not fast_pbr:
         depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
         vis_dict = {
             "depth": depth_norm,
@@ -597,13 +602,14 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     return results
 
 
-def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim=False):
+def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim=False, iteration=0):
     tb_dict = {"num_points": pc.get_xyz.shape[0]}
     rendered_image = results["render"]
     rendered_opacity = results["opacity"]
     gt_image = viewpoint_camera.original_image.cuda()
 
     loss = 0
+    torch.cuda.empty_cache()
     Ll1 = F.l1_loss(rendered_image, gt_image)
     if use_ws_ssim:
         ws_map = est_wsmap(rendered_image)
@@ -621,6 +627,18 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
     tb_dict["psnr"] = psnr(rendered_image, gt_image).mean().item()
     loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
 
+    # ── ERP-aware weighting for equirect mode ─────────────────────
+    _pano = _ensure_pano_losses()
+    _pano_row, _pano_rgb, _geom_ramp_fn, _pano_normal_smooth, _pano_alpha = _pano
+
+    _, H, W = rendered_image.shape
+    row_weight = _pano_row(H, rendered_image.device, rendered_image.dtype) if _pano_row is not None else None
+    rgb_nonedge = _pano_rgb(gt_image) if _pano_rgb is not None else None
+
+    # Geometry loss ramp: gradual activation
+    geom_ramp = _geom_ramp_fn(opt, iteration, "geometry_loss_from_iter") if _geom_ramp_fn is not None else 1.0
+    tb_dict["geom_ramp"] = float(geom_ramp)
+
     if opt.lambda_mask_entropy > 0:
         o = rendered_opacity.clamp(1e-6, 1 - 1e-6)
         image_mask = viewpoint_camera.image_mask.cuda()
@@ -628,36 +646,63 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
         tb_dict["loss_mask_entropy"] = loss_mask_entropy.item()
         loss = loss + opt.lambda_mask_entropy * loss_mask_entropy
 
+    if opt.lambda_alpha_hole > 0 and _pano_alpha is not None:
+        loss_alpha_hole = _pano_alpha(
+            rendered_opacity, rendered_image, gt_image,
+            target=0.985, residual_weight=0.5)
+        tb_dict["loss_alpha_hole"] = loss_alpha_hole.item()
+        loss = loss + geom_ramp * opt.lambda_alpha_hole * loss_alpha_hole
+
     if opt.lambda_ref_roughness_smooth > 0:
         image_mask = viewpoint_camera.image_mask.cuda()
         rendered_ref_roughness = results.get("ref_roughness")
         if rendered_ref_roughness is not None:
-            loss_ref_roughness_smooth = first_order_edge_aware_loss(
-                rendered_ref_roughness * image_mask, gt_image)
+            w = image_mask
+            if rgb_nonedge is not None:
+                w = w * rgb_nonedge
+            loss_ref_roughness_smooth = _erp_edge_aware_loss(
+                rendered_ref_roughness * w, gt_image)
             tb_dict["loss_ref_roughness_smooth"] = loss_ref_roughness_smooth.item()
-            loss = loss + opt.lambda_ref_roughness_smooth * loss_ref_roughness_smooth
+            loss = loss + geom_ramp * opt.lambda_ref_roughness_smooth * loss_ref_roughness_smooth
 
     if opt.lambda_ref_strength_smooth > 0:
         image_mask = viewpoint_camera.image_mask.cuda()
         rendered_ref_strength = results.get("ref_strength")
         if rendered_ref_strength is not None:
-            loss_ref_strength_smooth = first_order_edge_aware_loss(
-                rendered_ref_strength * image_mask, gt_image)
+            w = image_mask
+            if rgb_nonedge is not None:
+                w = w * rgb_nonedge
+            loss_ref_strength_smooth = _erp_edge_aware_loss(
+                rendered_ref_strength * w, gt_image)
             tb_dict["loss_ref_strength_smooth"] = loss_ref_strength_smooth.item()
-            loss = loss + opt.lambda_ref_strength_smooth * loss_ref_strength_smooth
+            loss = loss + geom_ramp * opt.lambda_ref_strength_smooth * loss_ref_strength_smooth
 
     if opt.lambda_normal_render_depth > 0:
         rendered_normal = results["normal"]
         pseudo_normal = results["pseudo_normal"]
         loss_normal_render_depth = F.mse_loss(rendered_normal, pseudo_normal.detach())
         tb_dict["loss_normal_render_depth"] = loss_normal_render_depth.item()
-        loss = loss + opt.lambda_normal_render_depth * loss_normal_render_depth
+        loss = loss + geom_ramp * opt.lambda_normal_render_depth * loss_normal_render_depth
 
     if opt.lambda_normal_smooth > 0:
         rendered_normal = results["normal"]
-        loss_normal_smooth = tv_loss(rendered_normal)
+        if _pano_normal_smooth is not None:
+            # ERP-aware normal smoothness: cyclic horizontal, edge-gated, lat-weighted
+            valid_alpha = (rendered_opacity > 0.05).float()
+            if row_weight is not None:
+                valid_alpha = valid_alpha * row_weight
+            # Low-texture weight: high in smooth regions, low near edges
+            lowtex_weight = (1.0 - rgb_nonedge).pow(0.85) if rgb_nonedge is not None else torch.ones_like(rendered_opacity)
+            loss_normal_smooth = _pano_normal_smooth(
+                rendered_normal, lowtex_weight, valid_alpha)
+        else:
+            # Fallback: simple TV with latitude weighting
+            nw = rendered_normal
+            if row_weight is not None:
+                nw = nw * row_weight
+            loss_normal_smooth = tv_loss(nw)
         tb_dict["loss_normal_smooth"] = loss_normal_smooth.item()
-        loss = loss + opt.lambda_normal_smooth * loss_normal_smooth
+        loss = loss + geom_ramp * opt.lambda_normal_smooth * loss_normal_smooth
 
     if pc.use_pbr:
         rendered_pbr = results["pbr"]
@@ -673,7 +718,10 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
             image_mask = viewpoint_camera.image_mask.cuda()
             rendered_roughness = results.get("roughness")
             if rendered_roughness is not None:
-                loss_roughness_smooth = first_order_edge_aware_loss(rendered_roughness * image_mask, gt_image)
+                w = image_mask
+                if rgb_nonedge is not None:
+                    w = w * rgb_nonedge
+                loss_roughness_smooth = _erp_edge_aware_loss(rendered_roughness * w, gt_image)
                 tb_dict["loss_roughness_smooth"] = loss_roughness_smooth.item()
                 loss = loss + opt.lambda_roughness_smooth * loss_roughness_smooth
 
@@ -681,7 +729,10 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
             image_mask = viewpoint_camera.image_mask.cuda()
             rendered_base_color = results.get("base_color")
             if rendered_base_color is not None:
-                loss_base_color_smooth = first_order_edge_aware_loss(rendered_base_color * image_mask, gt_image)
+                w = image_mask
+                if rgb_nonedge is not None:
+                    w = w * rgb_nonedge
+                loss_base_color_smooth = _erp_edge_aware_loss(rendered_base_color * w, gt_image)
                 tb_dict["loss_base_color_smooth"] = loss_base_color_smooth.item()
                 loss = loss + opt.lambda_base_color_smooth * loss_base_color_smooth
 
@@ -689,7 +740,10 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
             image_mask = viewpoint_camera.image_mask.cuda()
             rendered_metallic = results.get("metallic")
             if rendered_metallic is not None:
-                loss_metallic_smooth = first_order_edge_aware_loss(rendered_metallic * image_mask, gt_image)
+                w = image_mask
+                if rgb_nonedge is not None:
+                    w = w * rgb_nonedge
+                loss_metallic_smooth = _erp_edge_aware_loss(rendered_metallic * w, gt_image)
                 tb_dict["loss_metallic_smooth"] = loss_metallic_smooth.item()
                 loss = loss + opt.lambda_metallic_smooth * loss_metallic_smooth
 
@@ -713,13 +767,16 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
 def render(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
            scaling_modifier=1.0, override_color=None, opt: OptimizationParams = False,
            is_training=False, dict_params=None):
+    fast_pbr = dict_params.get("fast_pbr", False) if dict_params else False
     results = render_view(viewpoint_camera, pc, pipe, bg_color,
-                          scaling_modifier, override_color, is_training, dict_params)
+                          scaling_modifier, override_color, is_training, dict_params,
+                          fast_pbr=fast_pbr)
     if is_training:
-        use_ws_ssim = getattr(pipe, 'equirect', False)
+        use_ws_ssim = False  # Disabled for memory: weighted SSIM adds ~100+ MB of conv2d intermediates at 4K ERP
+        iteration = dict_params.get("iteration", 0) if dict_params else 0
         loss, tb_dict = calculate_loss(viewpoint_camera, pc, results, opt,
                                        env_map=dict_params.get('cubemap') if pc.use_pbr else None,
-                                       use_ws_ssim=use_ws_ssim)
+                                       use_ws_ssim=use_ws_ssim, iteration=iteration)
         results["tb_dict"] = tb_dict
         results["loss"] = loss
     return results
