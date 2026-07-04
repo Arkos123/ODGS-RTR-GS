@@ -124,6 +124,10 @@ class Scene:
     
 
     def get_canonical_rays(self, scale: float = 1.0):
+        """
+        Get canonical rays for the scene.
+        相机自身坐标系中，从原点出发、穿过每个像素的归一化射线方向。
+        """
         # NOTE: some datasets do not share the same intrinsic (e.g. DTU)
         # get reference camera
         ref_camera = self.train_cameras[scale][0]

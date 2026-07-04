@@ -113,6 +113,11 @@ def srgb_to_rgb(f: torch.Tensor) -> torch.Tensor:
 
 
 def get_brdf_lut() -> torch.Tensor:
+    """
+    Get BRDF lookup table. (256, 256, 2)
+    在 PBR（基于物理的渲染）中， 镜面反射（specular） 的计算涉及一个复杂的积分，实时计算非常慢。
+    解决方案是 预先计算好结果，存成一张 2D 纹理 ，运行时直接查表。
+    """
     brdf_lut_path = os.path.join(os.path.dirname(__file__), "brdf_256_256.bin")
     brdf_lut = torch.from_numpy(
         np.fromfile(brdf_lut_path, dtype=np.float32).reshape(1, 256, 256, 2)
@@ -160,29 +165,51 @@ def GGX_specular(
 
 def get_reflectance_color_forward(
         light: CubemapLight,
-        normals: torch.Tensor,  # [..., 3]
-        view_dirs: torch.Tensor,  # [..., 3]
-        roughness: torch.Tensor,  # [..., 1]
-        specular_color: torch.Tensor,  # ..., 3]
-        brdf_lut: Optional[torch.Tensor] = None,
+        normals: torch.Tensor,  # [..., 3] 表面法线（世界空间）
+        view_dirs: torch.Tensor,  # [..., 3] 视图方向（从表面点到相机）
+        roughness: torch.Tensor,  # [..., 1] 粗糙度
+        specular_color: torch.Tensor,  # [..., 3] 镜面反射颜色（specular tint）
+        brdf_lut: Optional[torch.Tensor] = None,  # BRDF 查找表 [1, 256, 256, 2]
 ):
+    """
+    使用前向着色计算反射颜色（基于 split-sum 近似）。
+    
+    该函数实现了基于反射贴图（reflection map）的延迟高光渲染：
+    1. 计算反射方向，用于采样环境贴图
+    2. 使用 BRDF LUT 获取 Fresnel 和几何项的预积分值
+    3. 根据粗糙度选择环境贴图的 mip level 进行采样
+    4. 组合得到最终的镜面反射颜色
+    
+    公式: C_ref = R_t · F_ref(E_r, R_r, n, v)
+    其中 R_t 是 specular_color，F_ref 是反射函数
+    
+    Returns:
+        torch.Tensor: 镜面反射颜色 [N, 3]
+    """
     H = 1
     W = normals.shape[0]
+    # 重塑为 [1, H, W, C] 格式以适配 nvdiffrast 的 texture 采样
     normals = normals.reshape(1, H, W, 3)
     view_dirs = view_dirs.reshape(1, H, W, 3)
     spec_col = specular_color.reshape(1, H, W, 3)
     roughness = roughness.reshape(1, H, W, 1)
 
-
+    # 计算反射方向: R = 2(N·V)N - V
+    # 使用 clamp(min=0.0) 确保只在法线朝向视图的一侧计算反射
     ref_dirs = (
         2.0 * (normals * view_dirs).sum(-1, keepdims=True).clamp(min=0.0) * normals - view_dirs
     )  # [1, H, W, 3]
 
+    # 如果环境贴图有旋转矩阵，需要对反射方向进行相应旋转
     if light.mtx is not None:
         ref_dirs = light.rotate_dirs(ref_dirs)
 
+    # 计算 N·V（法线与视图方向的点积），用于 BRDF LUT 采样
     NoV = saturate_dot(normals, view_dirs)  # [1, H, W, 1]
+    # 构建 LUT 采样坐标: (N·V, roughness)
     fg_uv = torch.cat((NoV, roughness), dim=-1)  # [1, H, W, 2]
+    # 采样 BRDF LUT，得到 [scale, bias] 用于 Fresnel 近似
+    # scale 对应 F0 的系数，bias 对应 Fresnel 的偏移项
     fg_lookup = dr.texture(
         brdf_lut,  # [1, 256, 256, 2]
         fg_uv.contiguous(),  # [1, H, W, 2]
@@ -190,16 +217,23 @@ def get_reflectance_color_forward(
         boundary_mode="clamp",
     )  # [1, H, W, 2]
 
+    # 根据粗糙度计算环境贴图的 mip level（粗糙度越大，采样越模糊的 mip）
     miplevel = light.get_mip(roughness)  # [1, H, W, 1]
+    # 采样环境贴图的镜面反射部分（使用预过滤的 mipmaps）
+    # linear-mipmap-linear 实现三线性过滤，cube 边界模式处理立方体贴图
     spec = dr.texture(
-        light.specular[0][None, ...],  # [1, 6, env_res, env_res, 3]
-        ref_dirs.contiguous(),  # [1, H, W, 3]
-        mip=list(m[None, ...] for m in light.specular[1:]),
-        mip_level_bias=miplevel[..., 0],  # [1, H, W]
+        light.specular[0][None, ...],  # [1, 6, env_res, env_res, 3] 基础 mip
+        ref_dirs.contiguous(),  # [1, H, W, 3] 反射方向
+        mip=list(m[None, ...] for m in light.specular[1:]),  # 更高层级的 mip
+        mip_level_bias=miplevel[..., 0],  # [1, H, W] 每像素的 mip 偏移
         filter_mode="linear-mipmap-linear",
         boundary_mode="cube",
     )  # [1, H, W, 3]
+    
+    # 计算反射率: reflectance = spec_col * scale + bias
+    # 这是 Schlick Fresnel 近似的拆分形式: F = F0 * scale + bias
     reflectance = spec_col * fg_lookup[..., 0:1] + fg_lookup[..., 1:2]  # [1, H, W, 3]
+    # 最终镜面反射 = 环境光采样 * 反射率
     specular_rgb = spec * reflectance  # [1, H, W, 3]
 
     return specular_rgb.squeeze().reshape(-1, 3)
@@ -213,6 +247,10 @@ def get_reflectance_color(
         specular_color: torch.Tensor,  # [H, W, 3]
         brdf_lut: Optional[torch.Tensor] = None,
 ):
+    """
+    和 get_reflectance_color_forward 一样，但前者逐高斯（[N,3]），后者逐像素（[H*W,3]）
+    用于延迟渲染
+    """
     H, W, _ = normals.shape
     normals = normals.reshape(1, H, W, 3)
     view_dirs = view_dirs.reshape(1, H, W, 3)
@@ -253,7 +291,7 @@ def get_reflectance_color(
     
 
 def pbr_shading(
-    light: CubemapLight,
+    light: CubemapLight, # 环境贴图，负责所有方向的光照采样
     normals: torch.Tensor,  # [H, W, 3]
     view_dirs: torch.Tensor,  # [H, W, 3]
     albedo: torch.Tensor,  # [H, W, 3]
@@ -264,6 +302,26 @@ def pbr_shading(
     brdf_lut: Optional[torch.Tensor] = None,
     background: Optional[torch.Tensor] = None,
 ) -> Dict:
+    """
+    PBR 着色函数
+    Args:
+        light: 环境贴图，负责所有方向的光照采样
+            - light.diffuse 是预滤波后的漫反射cubemap，沿法线查询
+            - light.specular 沿反射方向查询，根据粗糙度决定采样哪个 mip
+        normals: 法线图，[H, W, 3]
+        view_dirs: 视图方向，[H, W, 3]
+        albedo: 颜色，[H, W, 3]
+        roughness: 粗糙度，[H, W, 1]
+        occlusion: 阮挡，[H, W, 1]
+        irradiance: 间接光照，[H, W, 3]
+            - 只参与漫反射部分，作用是补偿遮挡区域的间接光照。
+        metallic: 金属度，[H, W, 1]
+        brdf_lut: BRDF LUT，[256, 256, 2]
+        background: 背景颜色，[3]
+    Returns:
+        results: dict
+        results["incidents_light"]: 乘以可见性后的间接光照，[H, W, 3]
+    """
     H, W, _ = normals.shape
     if background is None:
         background = torch.zeros_like(normals)  # [H, W, 3]
@@ -305,6 +363,7 @@ def pbr_shading(
 
     diffuse_light = diffuse_light * occlusion
     diffuse_light = diffuse_light + (1.0 - occlusion) * irradiance
+    # 实际间接光照（乘以遮挡）
     results["incidents_light"] = ((1.0 - occlusion) * irradiance).squeeze(0)
 
     # Compute aggregate lighting

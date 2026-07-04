@@ -27,6 +27,9 @@ class TransferMLP:
         return x
 
     def training_setup(self, training_args: OptimizationParams):
+        """
+        初始化优化器
+        """
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=training_args.mlp_lr, weight_decay=1e-6, eps=1e-15)
 
     def step(self):

@@ -216,17 +216,32 @@ def eval_sh_coef(deg, dirs):
     return results
 
 def components_from_spherical_harmonics(degree: int, directions: torch.Tensor) -> torch.Tensor:
-    """
-    Returns value for each component of spherical harmonics.
+    """计算球谐（SH）基函数在给定方向向量上的取值。
+
+    将单位方向向量 directions 展开为 degree^2 个 SH 基函数在该方向上的值，
+    用于后续与存储的 SH 系数做点积，重建该方向上的标量场
+    （如可见性、辐照度、环境光等）。
+
+    度数与分量数（实球谐，l=0..degree-1）：
+        degree=1 ->  1 个分量（仅 l=0 常量基）
+        degree=2 ->  4 个分量（l=0,1）
+        degree=3 ->  9 个分量（l=0,1,2）
+        degree=4 -> 16 个分量（l=0,1,2,3）
+        degree=5 -> 25 个分量（l=0,1,2,3,4）
 
     Args:
-        degree: Number of spherical harmonic degrees to compute.
-        directions: Spherical hamonic coefficients
+        degree: 球谐度数（取值范围 [1, 5]，等于最高阶 l 加 1）。
+        directions: 单位方向向量，形状 [..., 3]（如法线 / 入射光方向）。
+            注意：这里是方向向量，并非 SH 系数。
+
+    Returns:
+        形状 [..., degree^2] 的张量，最后一维是各 SH 基函数在
+        对应方向上的取值。
     """
     num_components = degree**2
     components = torch.zeros((*directions.shape[:-1], num_components), device=directions.device)
 
-    assert 1 <= degree <= 5, f"SH degrees must be in [1,4], got {degree}"
+    assert 1 <= degree <= 5, f"SH degrees must be in [1,5], got {degree}"
     assert (
         directions.shape[-1] == 3
     ), f"Direction input should have three dimensions. Got {directions.shape[-1]}"

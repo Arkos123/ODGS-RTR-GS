@@ -82,6 +82,14 @@ def strip_symmetric(sym):
 
 
 def build_rotation(r):
+    """
+    四元数 → 旋转矩阵 的批量转换函数，
+    在 3DGS 中用来把每个高斯的旋转属性（用四元数表示）转成 3×3 旋转矩阵。
+    Args:
+        r: (N, 4) 四元数，每个四元数表示一个旋转。
+    Returns:
+        (N, 3, 3) 旋转矩阵，每个矩阵表示一个旋转。
+    """
     norm = torch.sqrt(r[:, 0] * r[:, 0] + r[:, 1] * r[:, 1] + r[:, 2] * r[:, 2] + r[:, 3] * r[:, 3])
 
     q = r / norm[:, None]

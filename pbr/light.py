@@ -176,39 +176,59 @@ class CubemapLight(nn.Module):
         return_img: bool = False,
         base: bool = True,
     ) -> Optional[torch.Tensor]:
+        """将 cubemap 环境贴图导出为等距柱状投影图（equirectangular panorama），便于可视化。
+
+        cubemap（6 张方形图）存储在 self.base 或 self.diffuse 中，人眼不便直接查看。
+        此函数在经纬度网格上采样 cubemap，生成一张可以直观看的 ERP 图像。
+
+        Args:
+            filename: 保存路径（路径需存在）。None 且 return_img=False 时不保存也不返回。
+            res: ERP 分辨率 [H, W]，默认 [512, 1024]。
+            return_img: True 则返回 tensor，False 则保存到文件。
+            base: True 时采样 self.base（完整环境贴图，含高光细节），
+                  False 时采样 self.diffuse（预滤波漫反射，仅低频）。
+        Returns:
+            return_img=True 时返回 color tensor [H, W, 3]，否则 None。
+        """
+        # 构建等距柱状投影的经纬度网格
+        # lat（纬度）范围 [+π/2, -π/2]（从上到下），lng（经度）范围 [+π, -π]（从左到右）
         lat_step_size = np.pi / res[0]
         lng_step_size = 2 * np.pi / res[1]
-        phi, theta = torch.meshgrid([torch.linspace(np.pi / 2 - 0.5 * lat_step_size, -np.pi / 2 + 0.5 * lat_step_size, res[0],device="cuda"), 
-                                    torch.linspace(np.pi - 0.5 * lng_step_size, -np.pi + 0.5 * lng_step_size, res[1],device="cuda"  )], indexing='ij')
+        phi, theta = torch.meshgrid([torch.linspace(np.pi / 2 - 0.5 * lat_step_size, -np.pi / 2 + 0.5 * lat_step_size, res[0], device="cuda"),
+                                    torch.linspace(np.pi - 0.5 * lng_step_size, -np.pi + 0.5 * lng_step_size, res[1], device="cuda")], indexing='ij')
 
+        # 将经纬度转换为世界空间中的方向向量（reflvec 坐标系：+X 右, +Y 上, +Z 后）
+        # 对于 nvdiffrast cubemap 采样，boundary_mode="cube" 会将方向向量映射到 6 个面
+        reflvec = torch.stack([
+            torch.cos(theta) * torch.cos(phi),   # X: 右
+            torch.sin(theta) * torch.cos(phi),   # Y: 上
+            torch.sin(phi)                       # Z: 后
+        ], dim=-1).view(res[0], res[1], 3)        # [envH, envW, 3]
 
-        reflvec = torch.stack([  torch.cos(theta) * torch.cos(phi), 
-                                torch.sin(theta) * torch.cos(phi), 
-                                torch.sin(phi)], dim=-1).view(res[0], res[1], 3)    # [envH, envW, 3]
-        
+        # 如果设置了环境旋转矩阵（self.mtx），先将方向旋转后再采样
         sample_dirs = self.rotate_dirs(reflvec) if self.mtx is not None else reflvec
 
+        # 用 nvdiffrast 从 cubemap 采样：传入 [1, 6, H, W, 3] cubemap 和 [1, H, W, 3] 方向，
+        # boundary_mode="cube" 负责将方向向量路由到对应面进行插值
         if base:
             color = dr.texture(
-                self.base[None, ...],
-                sample_dirs[None, ...].contiguous(),
+                self.base[None, ...],            # [1, 6, face_h, face_w, 3]
+                sample_dirs[None, ...].contiguous(),  # [1, H, W, 3]
                 filter_mode="linear",
                 boundary_mode="cube",
-            )[
-                0
-            ]  # [H, W, 3]
+            )[0]  # [H, W, 3]
         else:
             color = dr.texture(
-                self.diffuse[None, ...],
-                sample_dirs[None, ...].contiguous(),
+                self.diffuse[None, ...],         # [1, 6, face_h, face_w, 3]
+                sample_dirs[None, ...].contiguous(),  # [1, H, W, 3]
                 filter_mode="linear",
                 boundary_mode="cube",
-            )[
-                0
-            ]  # [H, W, 3]
+            )[0]  # [H, W, 3]
+
         if return_img:
             return color
         else:
+            # 保存为图像文件，cv2 需要 BGR 顺序，所以 RGB→BGR 翻转
             cv2.imwrite(filename, color.clamp(min=0.0).detach().cpu().numpy()[..., ::-1])
 
     def regularizer(self):
