@@ -95,6 +95,10 @@ CUDA 光栅化器使用 **OpenGL 列主序** 约定，而 PyTorch 默认行主�
 **Cubemap rotation order** (nvdiffrast convention):
 `+X(0), -X(1), +Y(2), -Y(3), +Z(4), -Z(5)`
 
+### Python vs CUDA 旋转矩阵约定
+
+`build_rotation` (Python) 与 `computeCov3D` (CUDA) 的四元数→旋转矩阵约定**互为转置**：`R_cuda = R_py^T`。因此 `get_min_axis` 取 R_py 的列 = R_cuda 的行，匹配 CUDA 的 `computeShortAxisNormalView`。详见 [doc/RTR-GS/rotation-convention.md](doc/RTR-GS/rotation-convention.md)。
+
 RTR-GS CUDA rasterizer (`rtr_gs-rasterization`): `renderPseudoNormalCUDA` computes normals in camera space then transforms to world space using the view matrix. See `forward.cu:488-490`.
 
 
