@@ -1,6 +1,6 @@
 import copy
 import os
-import cv2
+# import cv2
 import torch
 import numpy as np
 import pygame
@@ -9,10 +9,11 @@ from pbr import CubemapLight, get_brdf_lut
 from scene import GaussianModel, Scene
 from scene.transfer_mlp import TransferMLP
 from scene.cameras import Camera
-from utils.graphics_utils import focal2fov, fov2focal
-from utils.general_utils import load_json_config
-from utils.sh_utils import eval_sh
+# from utils.graphics_utils import focal2fov, fov2focal
+# from utils.general_utils import load_json_config
+# from utils.sh_utils import eval_sh
 import torch.nn.functional as F
+import nvdiffrast.torch as dr
 import math
 
 # mipnerf/counter
@@ -30,8 +31,8 @@ import math
 source E:/Anaconda/etc/profile.d/conda.sh
 conda activate odgs-rtr
 python viewer_pygame.py \
-    -c lab_output/360Roam/base/stage2/checkpoint/chkpnt40000.pth \
-    --occlusion_path lab_output/360Roam/base/stage1/checkpoint/occlusion_volumes.pth \
+    -c lab_output/OmniBlender/barbershop/stage2/checkpoint/chkpnt36000.pth \
+    --occlusion_path lab_output/OmniBlender/barbershop/stage1/checkpoint/occlusion_volumes.pth \
     --envmap_path "./data/env_maps/directional_front_top.hdr" \
     --image_width 512 \
     --image_height 512
@@ -46,7 +47,7 @@ python viewer_pygame.py \
     -s ./data/mipnerf/360_v2/counter \
     -c lab_output/mipnerf/360_v2/counter/stage2/checkpoint/chkpnt40000.pth \
     --occlusion_path lab_output/mipnerf/360_v2/counter/stage1/checkpoint/occlusion_volumes.pth \
-    --envmap_path "d:/localSpace/relighting/env_maps/big-studio-01_4K.exr" \
+    --envmap_path "home/huangpengyue/projects/env_maps/big-studio-01_4K.exr" \
     --image_width 512 \
     --image_height 512
 """
@@ -347,9 +348,9 @@ def load_scene_data(checkpoint_path, occlusion_path, envmap_path, resolution=2):
                 f"No envmap path specified and trained cubemap not found at {cubemap_checkpoint_path}. "
                 "Please provide --envmap_path."
             )
-    if True: #pipe.transfer_light:  # 不需要，因为我们用纯 PBR 模式
-        cubemap.build_sh(3)
-        gaussians.incident_to_transfer(cubemap.shs)
+    # if True: #pipe.transfer_light:  # 不需要，因为我们用纯 PBR 模式
+        # cubemap.build_sh(3)
+        # gaussians.incident_to_transfer(cubemap.shs)
     
     # 加载 BRDF LUT
     brdf_lut = get_brdf_lut().cuda()
@@ -402,6 +403,64 @@ def get_canonical_rays(image_width: int, image_height: int, FoVx: float, FoVy: f
     return camera_dirs
 
 
+# Equirect → 透视裁切的 GPU 缓存（避免每帧重建 linspace/meshgrid/normalize）
+_extraction_grid_cache = {
+    "key": None,          # (fovx_rad, W, H) → 确定一套 dirs_cam
+    "dirs_cam": None,     # [H*W, 3] 相机空间射线方向（归一化）
+}
+
+
+def render_env_skybox(cubemap, forward, up, fovx_rad, width, height):
+    """直接采样 cubemap 渲染天空盒（不渲染场景）
+
+    用 nvdiffrast 做 cubemap 纹理查找，比跑完整渲染管线快得多。
+    """
+    device = cubemap.base.device
+    H, W = height, width
+
+    aspect = W / H
+    fovy_rad = 2 * math.atan(math.tan(fovx_rad * 0.5) / aspect)
+    tan_hfovx = math.tan(fovx_rad * 0.5)
+    tan_hfovy = math.tan(fovy_rad * 0.5)
+
+    xs = torch.linspace(-tan_hfovx, tan_hfovx, W, device=device)
+    ys = torch.linspace(tan_hfovy, -tan_hfovy, H, device=device)
+    gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+
+    dirs_cam = F.normalize(torch.stack([gx, gy, torch.ones_like(gx)], dim=-1), dim=-1)
+
+    # 相机 → 世界旋转（与 equirect_to_perspective 一致）
+    forward_n = forward / np.linalg.norm(forward)
+    right = np.cross(forward_n, up)
+    rn = np.linalg.norm(right)
+    if rn < 1e-6:
+        right = np.array([1.0, 0.0, 0.0])
+    else:
+        right = right / rn
+    cam_up = np.cross(right, forward_n)
+    cam_up = cam_up / np.linalg.norm(cam_up)
+    R_world = np.float32([right, cam_up, forward_n])
+    R_world_t = torch.from_numpy(R_world).to(device=device)
+
+    # 世界空间方向
+    dirs_world = (dirs_cam.reshape(-1, 3) @ R_world_t.T).reshape(1, H, W, 3)
+
+    # cubemap 采样（处理 mtx 旋转）
+    if cubemap.mtx is not None:
+        dirs = cubemap.rotate_dirs(dirs_world)
+    else:
+        dirs = dirs_world
+
+    sky = dr.texture(
+        cubemap.base[None, ...],  # [1, 6, faceH, faceW, 3]
+        dirs.contiguous(),
+        filter_mode="linear",
+        boundary_mode="cube",
+    )[0]  # [H, W, 3]
+
+    return sky.permute(2, 0, 1)  # [3, H, W]
+
+
 def equirect_to_perspective(equirect_img, forward, up, fovx_rad, target_width, target_height):
     """从等距柱状投影图中提取透视视口
 
@@ -415,47 +474,59 @@ def equirect_to_perspective(equirect_img, forward, up, fovx_rad, target_width, t
     Returns:
         [3, target_height, target_width] 透视图像
     """
+    global _extraction_grid_cache
     device = equirect_img.device
     H, W = target_height, target_width
 
-    # 构造正交相机基
-    forward = forward / np.linalg.norm(forward)
-    right = np.cross(forward, up)
-    if np.linalg.norm(right) < 1e-6:
-        right = np.array([1.0, 0.0, 0.0])
-    else:
-        right = right / np.linalg.norm(right)
-    cam_up = np.cross(right, forward)  # 真正的相机上方（垂直forward和right）
-    cam_up = cam_up / np.linalg.norm(cam_up)
-
+    # 计算正确 fovy
     aspect = W / H
     fovy_rad = 2 * math.atan(math.tan(fovx_rad * 0.5) / aspect)
 
-    tan_hfovx = math.tan(fovx_rad * 0.5)
-    tan_hfovy = math.tan(fovy_rad * 0.5)
+    # 缓存 key = (fovx_rad 取整, fovy_rad 取整, W, H)
+    cache_key = (round(fovx_rad, 4), round(fovy_rad, 4), W, H)
 
-    # 像素网格（NDC坐标）
-    xs = torch.linspace(-tan_hfovx, tan_hfovx, W, device=device)
-    ys = torch.linspace(tan_hfovy, -tan_hfovy, H, device=device)  # +Y向上 → 图像上方
-    gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+    # 缓存未命中 → 重建相机空间射线方向网格
+    if _extraction_grid_cache["key"] != cache_key or _extraction_grid_cache["dirs_cam"] is None:
+        tan_hfovx = math.tan(fovx_rad * 0.5)
+        tan_hfovy = math.tan(fovy_rad * 0.5)
 
-    # 相机空间光线方向（+Z向前）
-    dirs_cam = F.normalize(torch.stack([gx, gy, torch.ones_like(gx)], dim=-1), dim=-1)
+        xs = torch.linspace(-tan_hfovx, tan_hfovx, W, device=device)
+        ys = torch.linspace(tan_hfovy, -tan_hfovy, H, device=device)  # +Y向上 → 图像上方
+        gy, gx = torch.meshgrid(ys, xs, indexing='ij')
 
-    # 转到世界空间: dir_world = dirs_cam_x * right + dirs_cam_y * cam_up + dirs_cam_z * forward
-    R_world = np.column_stack([right, cam_up, forward])  # [3, 3]
-    R_world_t = torch.tensor(R_world, dtype=torch.float32, device=device)
+        dirs_cam = F.normalize(torch.stack([gx, gy, torch.ones_like(gx)], dim=-1), dim=-1)
+        _extraction_grid_cache = {
+            "key": cache_key,
+            "dirs_cam": dirs_cam,  # [H, W, 3]
+        }
+
+    dirs_cam = _extraction_grid_cache["dirs_cam"]
+
+    # 构造世界空间旋转矩阵（每帧更新，因为视角方向会变）
+    forward_n = forward / np.linalg.norm(forward)
+    right = np.cross(forward_n, up)
+    rn = np.linalg.norm(right)
+    if rn < 1e-6:
+        right = np.array([1.0, 0.0, 0.0])
+    else:
+        right = right / rn
+    cam_up = np.cross(right, forward_n)
+    cam_up = cam_up / np.linalg.norm(cam_up)
+
+    # 相机→世界旋转（3x3），直接传到 GPU
+    R_world = np.float32([right, cam_up, forward_n])  # [3, 3] row-major, 等同于 column_stack(...).T
+    R_world_t = torch.from_numpy(R_world).to(device=device)  # [3, 3]
+
+    # dirs_world = dirs_cam @ R_world_t^T → 等价于 dirs_cam 的每一行左乘旋转矩阵
+    # 用 einsum 或 matmul，不 reshape
     dirs_world = (dirs_cam.reshape(-1, 3) @ R_world_t.T).reshape(H, W, 3)
 
-    # 转lon/lat（equirect坐标）
+    # 转 equirect grid 坐标
     lon = torch.atan2(dirs_world[..., 0], dirs_world[..., 2])
     lat = torch.asin(torch.clamp(dirs_world[..., 1], -1.0, 1.0))
 
-    # 映射到equirect grid [-1, 1]
-    # equirect中: lon∈[-π,π]→x∈[-1,1], lat∈[-π/2,π/2]→y∈[-1,1]（上→下）
     grid_x = lon / math.pi
     grid_y = -2 * lat / math.pi
-
     grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0)  # [1, H, W, 2]
 
     perspective = F.grid_sample(
@@ -466,15 +537,25 @@ def equirect_to_perspective(equirect_img, forward, up, fovx_rad, target_width, t
     return perspective[0]  # [3, H, W]
 
 
-def render_frame_equirect(fps_cam, scene_data, equirect_width=1024):
+# Equirect 缓存：位置不变时复用全景图，只重新裁切透视视口
+_equirect_cache = {
+    "cam_center": None,        # 上次渲染时的相机位置 (np.array)
+    "equirect_w": None,        # 全景图宽度
+    "equirect_img": None,      # 全景图张量 [3, H, W]
+    "white_background": None,  # 背景色
+}
+
+
+def render_frame_equirect(fps_cam, scene_data, equirect_width=1024, white_background=False,
+                          env_rotation_y=0.0, env_rotation_x=0.0):
     """使用equirect渲染器，从全景图中提取透视视口
 
     流程:
       1. 计算所需全景分辨率（根据FOV，保证透视视口至少1:1像素映射）
-      2. 旋转equirect相机使视角朝向落在全景图中心，减少边缘畸变
-      3. 在fps_cam位置创建equirect相机，渲染全景图
-      4. 从全景图中提取透视视口
+      2. 在fps_cam位置创建equirect相机，渲染全景图（若位置未变则复用缓存）
+      3. 从全景图中提取透视视口
     """
+    global _equirect_cache
     gaussians = scene_data['gaussians']
     transfer_net = scene_data['transfer_net']
     occlusion_volumes = scene_data['occlusion_volumes']
@@ -484,97 +565,133 @@ def render_frame_equirect(fps_cam, scene_data, equirect_width=1024):
     enable_occlusion = scene_data.get('enable_occlusion', True)
     render_mode = scene_data.get('render_mode', 'pbr')
 
-    # 自适应全景分辨率：保证透视视口有充足像素
+    # 直接使用 fps_cam.position 判断位置变化（避免 -R@T 的浮点噪声）
+    cam_pos = fps_cam.get_camera_center().astype(np.float64)
+    if fps_cam.trans is not None:
+        cam_pos += fps_cam.trans
+
+    # 全景图分辨率：由 --equirect_width 控制，上限 4096
     out_w = fps_cam.image_width
-    fov_fraction = fps_cam.FoVx / (2 * math.pi)  # FOV占360°的比例
-    # 如果用户给的equirect_width太小，自动适配到输出分辨率
-    min_eq_w = max(int(out_w / fov_fraction), equirect_width)
-    # 上限4096防爆显存，下限保证至少和输出一样大
-    equirect_w = min(min_eq_w, 4096)
+    equirect_w = min(equirect_width, 4096)
     equirect_h = equirect_w // 2
 
-    # equirect相机位置 = 标准渲染器的 camera_center = (-R @ T + trans)
-    # 用标准渲染器的位置计算方式保证与 mode 0/1 视角一致
-    cam_center = (-fps_cam.R @ fps_cam.T).astype(np.float64)
-    if fps_cam.trans is not None:
-        cam_center += fps_cam.trans
-    R_eq = np.eye(3, dtype=np.float32)
-    T_eq = -cam_center.astype(np.float32)
-
-    equirect_cam = Camera(
-        colmap_id=0,
-        R=R_eq, T=T_eq,
-        FoVx=2*math.pi, FoVy=math.pi,
-        trans=np.array([0.0, 0.0, 0.0]),
-        fx=None, fy=None, cx=None, cy=None,
-        image=None,
-        width=equirect_w, height=equirect_h,
-        image_name="equirect",
-        render_only=True, uid=0
+    # 判断是否需要重新渲染全景图：位置/环境光/分辨率/背景/渲染模式变化
+    pos_changed = (
+        _equirect_cache["cam_center"] is None
+        or np.linalg.norm(cam_pos - _equirect_cache["cam_center"]) > 0.01
+        or _equirect_cache["equirect_w"] != equirect_w
+        or _equirect_cache["white_background"] != white_background
+        or _equirect_cache.get("render_mode") != render_mode
+        or _equirect_cache.get("env_rotation_y") != env_rotation_y
+        or _equirect_cache.get("env_rotation_x") != env_rotation_x
     )
 
-    # 渲染参数（匹配训练配置：equirect模式 forward_shading=True, metallic=False）
-    pipe = type('Pipe', (), {
-        'debug': False,
-        'compute_with_prt': True,
-        'diffuse_iteration': 3000,
-        'compute_cov3D_python': False,
-        'compute_SHs_python': False,
-        'metallic': False,
-        'ref_map': True,
-        'compute_pseudo_normal': False,
-        'relight': False,
-        'tone_mapping': True,
-        'transfer_light': True,
-        'white_background': False,
-        'forward_shading': True,
-    })()
+    if pos_changed:
+        # ---- 重新渲染全景图 ----
+        R_eq = np.eye(3, dtype=np.float32)
+        T_eq = -cam_pos.astype(np.float32)
 
-    bg_color = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
-    aabb = occ_aabb
+        equirect_cam = Camera(
+            colmap_id=0,
+            R=R_eq, T=T_eq,
+            FoVx=2*math.pi, FoVy=math.pi,
+            trans=np.array([0.0, 0.0, 0.0]),
+            fx=None, fy=None, cx=None, cy=None,
+            image=None,
+            width=equirect_w, height=equirect_h,
+            image_name="equirect",
+            render_only=True, uid=0
+        )
 
-    render_kwargs = {
-        "pc": gaussians,
-        "pipe": pipe,
-        "bg_color": bg_color,
-        "is_training": False,
-        "dict_params": {
-            "transfer_net": transfer_net,
-            "occlusion_volumes": occlusion_volumes,
-            "aabb": aabb,
-            "cubemap": cubemap,
-            "refmap": cubemap,
-            "brdf_lut": brdf_lut,
-            "canonical_rays": None,
-            "iteration": 999999999,
-            "enable_occlusion": enable_occlusion,
-        },
-    }
+        is_fast_pbr = render_mode in ('pbr', 'render')
+        pipe = type('Pipe', (), {
+            'debug': False,
+            'compute_with_prt': True,
+            'diffuse_iteration': 3000,
+            'compute_cov3D_python': False,
+            'compute_SHs_python': not is_fast_pbr,  # 调试模式需要Python端计算SH以填充colors_precomp
+            'metallic': False,
+            'ref_map': True,
+            'compute_pseudo_normal': False,
+            'relight': True,
+            'tone_mapping': True,
+            'transfer_light': False,
+            'white_background': white_background,
+            'forward_shading': True,
+        })()
 
-    # Equirect全景渲染
-    render_fn = render_fn_dict['render_ref_pbr_equirect']
+        bg = 1.0 if white_background else 0.0
+        bg_color = torch.tensor([bg, bg, bg], dtype=torch.float32, device="cuda")
+        aabb = scene_data.get('occ_aabb', torch.tensor([-bound, -bound, -bound, bound, bound, bound])).cuda()
+
+        render_kwargs = {
+            "pc": gaussians,
+            "pipe": pipe,
+            "bg_color": bg_color,
+            "is_training": False,
+            "dict_params": {
+                "transfer_net": transfer_net,
+                "occlusion_volumes": occlusion_volumes,
+                "aabb": aabb,
+                "cubemap": cubemap,
+                "refmap": cubemap,
+                "brdf_lut": brdf_lut,
+                "canonical_rays": None,
+                "iteration": 999999999,
+                "enable_occlusion": enable_occlusion,
+                "fast_pbr": is_fast_pbr,
+            },
+        }
+
+        render_fn = render_fn_dict['render_ref_pbr_equirect']
+        with torch.no_grad():
+            render_pkg = render_fn(viewpoint_camera=equirect_cam, **render_kwargs)
+
+        # 获取渲染结果（V键切换可视化模式）
+        if render_mode == 'pbr':
+            equirect_img = render_pkg['pbr']
+        elif render_mode == 'render':
+            equirect_img = render_pkg['render']
+        elif 'vis_dict' in render_pkg and render_mode in render_pkg['vis_dict']:
+            equirect_img = render_pkg['vis_dict'][render_mode]
+        else:
+            equirect_img = render_pkg.get(render_mode, render_pkg["pbr"])
+
+        # 确保3通道（单通道属性如roughness/metallic/depth需扩展）
+        if equirect_img.shape[0] == 1:
+            equirect_img = equirect_img.repeat(3, 1, 1)
+
+        # 更新缓存
+        _equirect_cache = {
+            "cam_center": cam_pos.copy(),
+            "equirect_w": equirect_w,
+            "equirect_img": equirect_img,
+            "white_background": white_background,
+            "render_mode": render_mode,
+            "env_rotation_y": env_rotation_y,
+            "env_rotation_x": env_rotation_x,
+        }
+    else:
+        equirect_img = _equirect_cache["equirect_img"]
+
+    # 从全景图中提取透视视口（无论是否重新渲染，这一步都执行）
     with torch.no_grad():
-        render_pkg = render_fn(viewpoint_camera=equirect_cam, **render_kwargs)
-
-    equirect_img = render_pkg.get(render_mode, render_pkg["pbr"])
-
-    # 从全景图中提取透视视口
-    perspective_img = equirect_to_perspective(
-        equirect_img,
-        fps_cam.forward, fps_cam.up,
-        fps_cam.FoVx,
-        fps_cam.image_width, fps_cam.image_height
-    )
+        perspective_img = equirect_to_perspective(
+            equirect_img,
+            fps_cam.forward, fps_cam.up,
+            fps_cam.FoVx,
+            fps_cam.image_width, fps_cam.image_height
+        )
 
     # 转numpy
-    img_np = perspective_img.detach().permute(1, 2, 0).cpu().numpy()
+    img_np = perspective_img.permute(1, 2, 0).cpu().numpy()
     img_np = np.clip(img_np, 0.0, 1.0)
     img_np = (img_np * 255).astype(np.uint8)
 
     return img_np, None, None
 
 
-def render_frame(fps_cam: FPSCamera, scene_data, canonical_rays: torch.Tensor):
+def render_frame(fps_cam: FPSCamera, scene_data, canonical_rays: torch.Tensor, white_background=False):
     """渲染单帧画面"""
 
 
@@ -621,12 +738,13 @@ def render_frame(fps_cam: FPSCamera, scene_data, canonical_rays: torch.Tensor):
         'compute_pseudo_normal': False,
         'relight': True,       # 启用重光照
         'tone_mapping': True,  # 启用色调映射
-        'transfer_light': True,  # 是否使用传输光照
-        'white_background': False,  # 背景颜色，根据数据集调整
+        'transfer_light': False,  # 是否使用传输光照
+        'white_background': white_background,  # 背景颜色，根据数据集调整
         'forward_shading': False
     })()
-    
-    bg_color = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
+
+    bg = 1.0 if white_background else 0.0
+    bg_color = torch.tensor([bg, bg, bg], dtype=torch.float32, device="cuda")
     
     # 准备 aabb
     aabb = scene_data.get('occ_aabb', torch.tensor([-bound, -bound, -bound, bound, bound, bound])).cuda()
@@ -657,9 +775,20 @@ def render_frame(fps_cam: FPSCamera, scene_data, canonical_rays: torch.Tensor):
     render_fn = render_fn_dict['neilf_ref']
     render_pkg = render_fn(viewpoint_camera=viewpoint_camera, **render_kwargs)
     
-    # 获取渲染结果（P键切换 pbr / render 模式）
-    image = render_pkg.get(render_mode, render_pkg["pbr"])
-    
+    # 获取渲染结果（V键切换可视化模式）
+    if render_mode == 'pbr':
+        image = render_pkg['vis_dict'].get('pbr', render_pkg["pbr"])
+    elif render_mode == 'render':
+        image = render_pkg['render']
+    elif 'vis_dict' in render_pkg and render_mode in render_pkg['vis_dict']:
+        image = render_pkg['vis_dict'][render_mode]
+    else:
+        image = render_pkg.get(render_mode, render_pkg["pbr"])
+
+    # 确保3通道（单通道属性如roughness/metallic/depth需扩展）
+    if image.shape[0] == 1:
+        image = image.repeat(3, 1, 1)
+
     # 转换为 numpy 格式
     image_np = image.detach().permute(1, 2, 0).cpu().numpy()
     image_np = np.clip(image_np, 0.0, 1.0)
@@ -682,7 +811,7 @@ def render_frame(fps_cam: FPSCamera, scene_data, canonical_rays: torch.Tensor):
     return image_np, env_bg_np, opacity_np
 
 
-def save_snapshot(fps_cam, scene_data, output_dir="snapshots"):
+def save_snapshot(fps_cam, scene_data, output_dir="snapshots", white_background=False):
     """保存当前视角的快照：渲染高分辨率equirect + 转6面cubemap + 当前透视视图"""
     import datetime
     from utils.graphics_utils import latlong_to_cubemap_equirect
@@ -726,11 +855,12 @@ def save_snapshot(fps_cam, scene_data, output_dir="snapshots"):
         'compute_cov3D_python': False, 'compute_SHs_python': False,
         'metallic': False, 'ref_map': True, 'compute_pseudo_normal': False,
         'relight': False, 'tone_mapping': True, 'transfer_light': True,
-        'white_background': False, 'forward_shading': True,
+        'white_background': white_background, 'forward_shading': True,
     })()
 
+    bg = 1.0 if white_background else 0.0
     aabb = scene_data.get('occ_aabb', torch.tensor([-bound, -bound, -bound, bound, bound, bound])).cuda()
-    bg_color = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
+    bg_color = torch.tensor([bg, bg, bg], dtype=torch.float32, device="cuda")
 
     render_kwargs = {
         "pc": gaussians, "pipe": pipe, "bg_color": bg_color, "is_training": False,
@@ -798,6 +928,8 @@ def main():
                         help="Prefer equirect model (defaults to ISO scale mode)")
     parser.add_argument("--equirect_width", type=int, default=2048,
                         help="Equirect base width for mode 2 (auto-scales by 360/FOV; capped at 4096)")
+    parser.add_argument("--white_background", action='store_true', default=None,
+                        help="Use white background (auto-detected from transforms if possible)")
     args = parser.parse_args()
 
     # 从 args.source_path 加载场景(只加载相机)
@@ -827,6 +959,29 @@ def main():
             
             test_cams = cycle_cameras
     
+    # 检测 white_background
+    if args.white_background is None:
+        # 自动检测：检查 transforms_train.json 中的 white_bg 字段
+        # Blender 格式数据集通常在 json 中有此字段，若无则默认 False
+        white_bg = False
+        if args.source_path is not None:
+            for tf_file in ["transforms_train.json", "transforms_test.json"]:
+                tf_path = os.path.join(args.source_path, tf_file)
+                if os.path.exists(tf_path):
+                    try:
+                        import json
+                        with open(tf_path) as f:
+                            tf_data = json.load(f)
+                        if "white_bg" in tf_data:
+                            white_bg = bool(tf_data["white_bg"])
+                            break
+                    except:
+                        pass
+        args.white_background = white_bg
+        print(f"Auto-detected white_background={args.white_background}")
+    else:
+        print(f"Using white_background={args.white_background} from --white_background flag")
+
     print("Loading scene data...")
     scene_data = load_scene_data(
         args.checkpoint,
@@ -841,13 +996,40 @@ def main():
     # 0=ANISO(标准), 1=ISO(scale各向同性化), 2=EQUIRECT(全图→crop)
     scene_data['render_type'] = 1 if args.equirect else 0
     scene_center = gaussians.get_xyz.detach().mean(dim=0).cpu().numpy()
-    
+
     # 计算场景边界
     scene_min = gaussians.get_xyz.detach().min(dim=0).values.cpu().numpy()
     scene_max = gaussians.get_xyz.detach().max(dim=0).values.cpu().numpy()
     scene_size = np.maximum(scene_max - scene_min, 0.1)
     scene_radius = np.linalg.norm(scene_size) / 2.0
-    
+
+    # 从场景相机读取 FOV（优先使用第一个相机的真实 FOV）
+    # 注意：OpenMVG/equirect 数据集的 FoVx ≈ π（180°）是全景图 FOV，不适合透视渲染
+    is_equirect_dataset = args.source_path is not None and os.path.exists(
+        os.path.join(args.source_path, "data_extrinsics.json"))
+
+    scene_fovx = 0.5
+    scene_fovy = 0.5
+    if test_cams is not None and len(test_cams) > 0 and not is_equirect_dataset:
+        scene_fovx = test_cams[0].FoVx
+        scene_fovy = test_cams[0].FoVy
+        print(f"Using scene camera FOV: FoVx={scene_fovx:.4f}, FoVy={scene_fovy:.4f}")
+    elif is_equirect_dataset:
+        # OpenMVG equirect 数据集：使用舒适的透视 FOV（~35°），不读取相机上的 180°
+        scene_fovx = 0.6
+        scene_fovy = 0.6
+        print(f"Equirect dataset detected, using perspective FOV: FoVx={scene_fovx:.4f}, FoVy={scene_fovy:.4f}")
+    else:
+        print(f"Using default FOV: FoVx={scene_fovx:.4f}, FoVy={scene_fovy:.4f}")
+
+    # FOV 安全上限：超过 2.0 rad (~115°) 不适合透视渲染（一般是全景图数据）
+    MAX_PERSPECTIVE_FOV = 2.0
+    if scene_fovx > MAX_PERSPECTIVE_FOV or scene_fovy > MAX_PERSPECTIVE_FOV:
+        print(f"WARNING: Camera FOV ({scene_fovx:.2f}, {scene_fovy:.2f}) exceeds perspective limit, "
+              f"clamping to {scene_fovx:.2f}")
+        scene_fovx = min(scene_fovx, MAX_PERSPECTIVE_FOV)
+        scene_fovy = min(scene_fovy, MAX_PERSPECTIVE_FOV)
+
     # 如果有相机数据，初始位置和朝向设为第一个相机
     if test_cams is not None and len(test_cams) > 0 and not is_colmap:
         first_cam = test_cams[0]
@@ -865,20 +1047,20 @@ def main():
         initial_forward /= np.linalg.norm(initial_forward)
         initial_target = scene_center
         initial_up = np.array([0, 1, 0], dtype=np.float64)
-    
+
     print(f"Scene center: {scene_center}")
     print(f"Scene radius: {scene_radius:.2f}")
-    
+
     fps_cam = FPSCamera(
         position=initial_position,
         target=initial_target,
         up=initial_up,
-        FoVy=0.5,
-        FoVx=0.5,
+        FoVy=scene_fovy,
+        FoVx=scene_fovx,
         image_height=args.image_height,
         image_width=args.image_width
     )
-    
+
     # canonical_rays = scene.get_canonical_rays()
     canonical_rays = get_canonical_rays(args.image_width, args.image_height, fps_cam.FoVx, fps_cam.FoVy)
     
@@ -901,6 +1083,7 @@ def main():
     print("    B: Toggle envmap background")
     print("    V: Toggle render/pbr view")
     print("    O: Toggle occlusion (AO)")
+    print("    L: Toggle env only (no scene)")
     print("    N: Cycle render mode ANISO → ISO → EQUIRECT")
     print("    K: Save snapshot (equirect+cubemap 6 faces+perspective)")
     print("    ESC: Exit")
@@ -922,8 +1105,25 @@ def main():
     playing_transforms = False
     play_index = 0
     show_env_bg = False  # 是否在背景绘制环境光贴图
+    show_env_only = False  # 是否只看环境光贴图（不渲染场景）
     running = True
     scene_data['render_mode'] = 'pbr'  # 'pbr' 或 'render'
+
+    # 可视化模式列表：(render_pkg中的key, 显示名称)
+    # 通过V键循环切换，支持perspective和equirect两种模式
+    RENDER_MODES = [
+        ('pbr',             'PBR'),
+        ('render',          'Render'),
+        ('base_color',      'Base Color'),
+        ('normal',          'Normal'),
+        ('roughness',       'Roughness'),
+        ('metallic',        'Metallic'),
+        ('depth',           'Depth'),
+        ('visibility',      'Occlusion'),
+        ('diffuse_pbr',     'Diffuse'),
+        ('specular_pbr',    'Specular'),
+        ('incidents_light', 'Incident Light'),
+    ]
     with torch.no_grad():
         while running:
             # 处理事件
@@ -960,13 +1160,19 @@ def main():
                         show_env_bg = not show_env_bg
                         print(f"Env background: {'ON' if show_env_bg else 'OFF'}")
                     elif event.key == pygame.K_v:
+                        modes_list = [m[0] for m in RENDER_MODES]
                         current = scene_data.get('render_mode', 'pbr')
-                        new_mode = 'render' if current == 'pbr' else 'pbr'
+                        idx = modes_list.index(current) if current in modes_list else 0
+                        new_mode = modes_list[(idx + 1) % len(modes_list)]
                         scene_data['render_mode'] = new_mode
-                        print(f"Render mode: {new_mode.upper()}")
+                        label = dict(RENDER_MODES).get(new_mode, new_mode.upper())
+                        print(f"View: {label}")
                     elif event.key == pygame.K_o:
                         scene_data['enable_occlusion'] = not scene_data['enable_occlusion']
                         print(f"Occlusion: {'ON' if scene_data['enable_occlusion'] else 'OFF'}")
+                    elif event.key == pygame.K_l:
+                        show_env_only = not show_env_only
+                        print(f"Env only (no scene): {'ON' if show_env_only else 'OFF'}")
                     elif event.key == pygame.K_n:
                         rt = (scene_data.get('render_type', 0) + 1) % 3
                         scene_data['render_type'] = rt
@@ -974,7 +1180,7 @@ def main():
                         print(f"Render mode: {labels[rt]}")
                     elif event.key == pygame.K_k:
                         print("Saving snapshot (equirect + cubemap + perspective)...")
-                        save_snapshot(fps_cam, scene_data)
+                        save_snapshot(fps_cam, scene_data, white_background=args.white_background)
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 3:  # 右键按下
                         right_mouse_pressed = True
@@ -1051,25 +1257,39 @@ def main():
                 # 根据forward、position更新相机 RT
                 fps_cam.update_RT()
             
-            # 渲染当前帧（0=ANISO, 1=ISO, 2=EQUIRECT）
-            rt = scene_data.get('render_type', 0)
-            if rt == 2:
-                image_np, env_bg_np, opacity_np = render_frame_equirect(
-                    fps_cam, scene_data, equirect_width=args.equirect_width)
+            # ---- 环境光纯背景模式（跳过场景渲染） ----
+            if show_env_only and scene_data.get('cubemap') is not None:
+                cubemap = scene_data['cubemap']
+                with torch.no_grad():
+                    sky = render_env_skybox(
+                        cubemap, fps_cam.forward, fps_cam.up,
+                        fps_cam.FoVx, fps_cam.image_width, fps_cam.image_height)
+                sky_np = sky.permute(1, 2, 0).cpu().numpy()
+                sky_np = np.clip(sky_np, 0.0, 1.0)
+                display_np = (sky_np * 255).astype(np.uint8)
+                env_bg_np = None
+                opacity_np = None
             else:
-                image_np, env_bg_np, opacity_np = render_frame(fps_cam, scene_data, canonical_rays)
-            
-            # 背景环境光: 替换白色背景为env_only
-            # renderer中 pbr = pbr_raw*α + white*(1-α), 所以:
-            #   display = pbr_raw*α + env*(1-α) = pbr + (env - 1.0)*(1-α)
-            if show_env_bg and env_bg_np is not None and opacity_np is not None:
-                pbr_f = image_np.astype(np.float32) / 255.0
-                env_f = env_bg_np.astype(np.float32) / 255.0
-                display_f = pbr_f + (env_f - 1.0) * (1.0 - opacity_np)
-                display_np = (np.clip(display_f, 0.0, 1.0) * 255).astype(np.uint8)
-            else:
-                display_np = image_np
-            
+                # 渲染当前帧（0=ANISO, 1=ISO, 2=EQUIRECT）
+                rt = scene_data.get('render_type', 0)
+                if rt == 2:
+                    image_np, env_bg_np, opacity_np = render_frame_equirect(
+                        fps_cam, scene_data, equirect_width=args.equirect_width, white_background=args.white_background,
+                        env_rotation_y=env_rotation_y, env_rotation_x=env_rotation_x)
+                else:
+                    image_np, env_bg_np, opacity_np = render_frame(fps_cam, scene_data, canonical_rays, white_background=args.white_background)
+
+                # 背景环境光: 替换白色背景为env_only
+                # renderer中 pbr = pbr_raw*α + white*(1-α), 所以:
+                #   display = pbr_raw*α + env*(1-α) = pbr + (env - 1.0)*(1-α)
+                if show_env_bg and env_bg_np is not None and opacity_np is not None:
+                    pbr_f = image_np.astype(np.float32) / 255.0
+                    env_f = env_bg_np.astype(np.float32) / 255.0
+                    display_f = pbr_f + (env_f - 1.0) * (1.0 - opacity_np)
+                    display_np = (np.clip(display_f, 0.0, 1.0) * 255).astype(np.uint8)
+                else:
+                    display_np = image_np
+
             # 转换为 Pygame 表面
             image_surface = pygame.surfarray.make_surface(np.transpose(display_np, (1, 0, 2)))
             
@@ -1082,7 +1302,10 @@ def main():
             pitch_text = font.render(f"Pitch: {fps_cam.pitch * 180 / np.pi:.2f}", True, (0, 255, 0))
             env_rot_text = font.render(f"Env Rot: {env_rotation_y * 180 / math.pi:.1f}° [←→]", True, (0, 255, 0))
             env_bg_text = font.render(f"Env BG: {'ON' if show_env_bg else 'OFF'} [B]", True, (0, 255, 0))
-            render_mode_text = font.render(f"View: {scene_data.get('render_mode', 'pbr').upper()} [V]", True, (0, 255, 0))
+            env_only_text = font.render(f"Env Only: {'ON' if show_env_only else 'OFF'} [L]", True, (255, 255, 0))
+            current_vmode = scene_data.get('render_mode', 'pbr')
+            vmode_label = dict(RENDER_MODES).get(current_vmode, current_vmode.upper())
+            render_mode_text = font.render(f"View: {vmode_label} [V]", True, (0, 255, 0))
             rt_labels = ['ANISO', 'ISO', 'EQUIRECT']
             rt = scene_data.get('render_type', 0)
             eq_text = font.render(f"Mode: {rt_labels[rt]} [N]", True, (0, 255, 255))
@@ -1095,14 +1318,15 @@ def main():
             screen.blit(pitch_text, (10, 100))
             screen.blit(env_rot_text, (10, 130))
             screen.blit(env_bg_text, (10, 160))
-            screen.blit(render_mode_text, (10, 190))
-            screen.blit(eq_text, (10, 220))
+            screen.blit(env_only_text, (10, 190))
+            screen.blit(render_mode_text, (10, 220))
+            screen.blit(eq_text, (10, 250))
             if fps_cam.mode == 'orbit':
                 radius_text = font.render(f"Radius: {fps_cam.orbit_radius:.2f}", True, (0, 255, 0))
-                screen.blit(radius_text, (10, 250))
-                screen.blit(pos_text, (10, 280))
+                screen.blit(radius_text, (10, 280))
+                screen.blit(pos_text, (10, 310))
             else:
-                screen.blit(pos_text, (10, 250))
+                screen.blit(pos_text, (10, 280))
             
             # 更新显示
             pygame.display.flip()
