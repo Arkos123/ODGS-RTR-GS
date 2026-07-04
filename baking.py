@@ -2,6 +2,7 @@ import os
 import json
 import itertools
 import math
+import time
 from argparse import ArgumentParser
 from os import makedirs
 from typing import List, Tuple
@@ -29,15 +30,19 @@ TODO:
 """
 
 # =================================================================
-# 坐标系约定（baking.py 涉及三个坐标系，混用是常见 bug 来源）
+# 坐标系约定（baking.py 涉及两个坐标系，混用是常见 bug 来源）
 # =================================================================
-# ┌─────────────────────────┬──────────┬──────────┬──────────┬──────────────────────────────────┐
-# │ 空间                    │ +X       │ +Y       │ +Z       │ 使用场景                         │
-# ├─────────────────────────┼──────────┼──────────┼──────────┼──────────────────────────────────┤
-# │ COLMAP world space      │ 右       │ **下**  │ **前**  │ gaussians.get_xyz, scene_min/max │
-# │ reflvec / cubemap space │ 右       │ 上       │ **-前**  │ envmap_dirs, nvdiffrast sampling │
-# │ Equirect view space     │ 右       │ 上       │ 前       │ _equirect_ray_dirs（自身定义）   │
-# └─────────────────────────┴──────────┴──────────┴──────────┴──────────────────────────────────┘
+# ┌─────────────────────────┬──────────┬──────────┬────────────┬─────────────────────────────────┐
+# │ 空间                    │ +X       │ +Y       │ +Z         │ 使用场景                        │
+# ├─────────────────────────┼──────────┼──────────┼────────────┼─────────────────────────────────┤
+# │ COLMAP world space      │ 右       │ **下**  │ **前**     │ gaussians.get_xyz, scene_min/max│
+# │ reflvec / cubemap space │ 右       │ 上       │ **-前**    │ envmap_dirs, nvdiffrast sampling│
+# └─────────────────────────┴──────────┴──────────┴────────────┴─────────────────────────────────┘
+#
+# 注：SGS equirect rasterizer 的 view-space 约定：+Z forward（atan2(x,z)），
+#   +Y 为正纬度方向（asin(y/r) 中 y>0 → lat>0 → 图像下方）。
+#   当传入 COLMAP viewmatrix（+Y down）时 +Y 指向下方，恰好匹配正纬度→图像下方。
+#   vis_walls 中已改用 get_envmap_dirs + [1,-1,-1] 计算 hit_pos。
 #
 # reflvec (nvdiffrast cubemap) 空间（+Y 上、-Z 前）：
 #    +y
@@ -53,20 +58,23 @@ TODO:
 #   /|
 #    +y
 #
-# Equirect 空间：纬度 θ∈[-π/2,π/2]，经度 φ∈[-π,π]
-#    +Y 向上，北极 θ=+π/2，南极 θ=-π/2（与 get_envmap_dirs 的 θ 方向相反）
-#    SGS rasterizer 的 point3ToLonlatScreen 使用此约定
-#
 # 关键转换：
 #   COLMAP → reflvec:  diag(1, -1, -1)     （flip Y 和 Z）
-#   COLMAP → equirect: diag(1, -1,  1)     （flip Y）
-#   reflvec → COLMAP:  diag(1, -1, -1)     （同上，自逆）
+#   reflvec → COLMAP:  diag(1, -1, -1)     （自逆）
 #
 # 在烘焙中使用场景：
 #   - envmap_dirs() 返回的方向在 reflvec 空间
 #   - 计算 hit_pos 时需转 COLMAP world space：world_dirs = envmap_dirs * diag(1,-1,-1)
 #   - 墙壁检测（skip_walls）的 scene_min/max 在 COLMAP space
-#   - 法线可视化 vis_walls 中 equi_dirs 需通过 diag(1,-1,1) 转 COLMAP view space
+#   - vis_walls 中改用了 get_envmap_dirs+[1,-1,-1] 计算 hit_pos（不再用 Equirect view）
+#
+# ⚠️ Equirect 模式方向一致性：
+#   SGS rasterizer 的 d_sgs(i,j)（COLMAP space）和 get_envmap_dirs 的
+#   d_rf(i,j)（reflvec space），经 diag(1,-1,-1) 转换后表示同一物理方向。
+#   无需任何 remapping。之前 doc/equirect-baking-z-flip.md 的分析将不同坐标系
+#   的向量分量直接比较（d_sgs.z vs d_rf.z），忽略了 +Z 在 COLMAP 是"前方"而
+#   -Z 在 reflvec 也是"前方"这一事实，得出了需要列重映射的错误结论。
+#   验证脚本：scripts/test_equirect_baking_dirs.py
 # =================================================================
 
 
@@ -144,22 +152,8 @@ def get_canonical_rays(H: int, W: int, tan_fovx: float, tan_fovy: float) -> torc
 MIN_DEPTH = 1e-6
 
 
-def _equirect_ray_dirs(H: int, W: int, device: str = "cuda") -> torch.Tensor:
-    """等距柱面投影(ERP)像素 → 世界空间射线方向 [H, W, 3]
-
-    行序：row 0 = lat=+π/2（北极），使用 +sin(lat) 作为 Y（等距空间 +Y 向上），
-    与 SGS rasterizer 的 point3ToLonlatScreen 的行序匹配。
-    """
-    ys = torch.linspace(0.5 * math.pi, -0.5 * math.pi, H, device=device)
-    xs = torch.linspace(-math.pi, math.pi, W, device=device)
-    lat, lon = torch.meshgrid(ys, xs, indexing="ij")
-    # dir = (sin(lon)*cos(lat), sin(lat), cos(lon)*cos(lat))
-    # 注意：这里 +Y 向上（等距空间），需通过 diag(1,-1,1) 转到 COLMAP 空间
-    return torch.stack([
-        torch.sin(lon) * torch.cos(lat),
-        torch.sin(lat),
-        torch.cos(lon) * torch.cos(lat),
-    ], dim=-1)
+# _equirect_ray_dirs 已移除，统一使用 get_envmap_dirs (reflvec 空间) 计算方向。
+# 需要 COLMAP 空间方向时：world_dirs = envmap_dirs * [1, -1, -1]
 
 
 if __name__ == "__main__":
@@ -449,6 +443,7 @@ if __name__ == "__main__":
 
         # Build a dummy Camera at scene center for the SGS equirect rasterizer
         H, W = 256, 512  # equirect resolution
+        # H, W = args.equirect_res, args.equirect_res * 2
         R = np.eye(3, dtype=np.float32)
         T = -center.detach().cpu().numpy().astype(np.float32)
         dummy_cam = Camera(colmap_id=0, R=R, T=T, FoVx=1.0, FoVy=1.0,
@@ -483,29 +478,33 @@ if __name__ == "__main__":
 
         # Render with SH
         shs = gaussians.get_shs
-        rendered_image, _, radii, depth_raw, acc, normal_raw = rasterizer(
+
+        # Python-side shortest-axis normal (matching render_equirect.py)
+        # Compare with SGS built-in normal_raw (CUDA computeShortAxisNormalView)
+        normal_py = gaussians.get_min_axis(dummy_cam.camera_center)  # [P, 3] world-space
+        extra_features_py = normal_py * 0.5 + 0.5  # encode to [0, 1] range
+
+        rendered_image, rendered_extra, radii, depth_raw, acc, normal_raw = rasterizer(
             means3D=means3D,
             means2D=screenspace_points,
             shs=shs,
             colors_precomp=None,
-            extra_features=None,
+            extra_features=extra_features_py,
             opacities=opacity,
             scales=scales,
             rotations=rots,
             cov3D_precomp=None,
-        )  # rendered_image: [3, H, W], depth_raw: [1, H, W], acc: [1, H, W]
+        )  # rendered_image: [3, H, W], rendered_extra: [3, H, W], normal_raw: [3, H, W]
 
         rendered_image = rendered_image.permute(1, 2, 0)  # [H, W, 3]
-        depth = depth_raw.squeeze(0).unsqueeze(-1)  # [1, H, W] → [H, W, 1]; already alpha-normalized radial distance
+        depth = depth_raw * (acc > 0.5).float()  # filter floaters (match equirect baking)
+        depth = depth.squeeze(0).unsqueeze(-1)  # [1, H, W] → [H, W, 1]
         alpha = acc.unsqueeze(-1)  # [H, W, 1]
 
-        # Equirect ray directions for hit position computation.
-        # _equirect_ray_dirs returns rays in equirect space (+Y up) but the rasterizer's
-        # view space uses COLMAP convention (+Y down).  Flip Y to match before computing
-        # world-space hit positions and normal-facing dot products.
-        equi_dirs = _equirect_ray_dirs(H, W).cuda()  # [H, W, 3] equirect space (+Y up)
-        equi_dirs = equi_dirs * equi_dirs.new_tensor([1.0, -1.0, 1.0])  # → COLMAP view space
-        hit_pos = dummy_cam.camera_center.view(1, 1, 3) + equi_dirs * depth  # [H, W, 3]
+        # Use get_envmap_dirs (reflvec space) → COLMAP world space via [1,-1,-1].
+        _, envmap_dirs_vis = get_envmap_dirs([H, W])  # [H, W, 3] reflvec space
+        world_dirs = envmap_dirs_vis * envmap_dirs_vis.new_tensor([1.0, -1.0, -1.0])  # → COLMAP world space
+        hit_pos = dummy_cam.camera_center.view(1, 1, 3) + world_dirs * depth  # [H, W, 3]
 
         # ---- Normal-facing debug: check if normals point toward or away from camera ----
         def save_img(tensor, path):
@@ -516,11 +515,11 @@ if __name__ == "__main__":
         normal_len = normal_img.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         normal_unit = normal_img / normal_len  # [H, W, 3] unit-length world-space normals
 
-        # view_dir = hit_pos - camera (direction from camera → hit point), equi_dirs is already unit.
+        # view_dir = hit_pos - camera (direction from camera → hit point), world_dirs is already unit.
         # cos_angle = dot(normal, view_dir):
         #   > 0 → same direction → normal points AWAY from camera (back-facing, "背向视野")
         #   < 0 → opposite → normal points TOWARD camera (front-facing, "朝向视野")
-        cos_angle = (normal_unit * equi_dirs).sum(dim=-1)  # [H, W], range ≈ [-1, 1]
+        cos_angle = (normal_unit * world_dirs).sum(dim=-1)  # [H, W], range ≈ [-1, 1]
 
         # 1) Binary facing map: red = back-facing (normal away from camera), blue = front-facing
         facing_vis = torch.where(
@@ -535,14 +534,29 @@ if __name__ == "__main__":
         cos_heat_rgb = cos_heat.unsqueeze(-1).expand(-1, -1, 3)
         cos_heat_rgb = torch.where(alpha > 0.5, cos_heat_rgb, rendered_image * 0.3 + 0.5)
 
-        # 3) Raw normal map for reference (world-space normal encoded as RGB)
+        # 3) SGS built-in normal (CUDA computeShortAxisNormalView, view-space)
         normal_map = normal_unit * 0.5 + 0.5  # [-1,1] → [0,1]
+
+        # 4) Python get_min_axis normal (rendered via extra_features, world-space)
+        # Alpha-normalize: matching render_equirect.py L383
+        alpha_mask_3d = (acc > 0.5).float()  # [1, H, W]
+        opacity_for_div = acc.clamp_min(1e-6)  # [1, H, W]
+        normal_py_rendered = rendered_extra / opacity_for_div * alpha_mask_3d  # [3, H, W]
+        normal_py_img = normal_py_rendered.permute(1, 2, 0)  # [H, W, 3]
+        # Decode from [0,1] back to [-1,1], then re-encode for RGB visualization
+        normal_py_decoded = normal_py_img * 2.0 - 1.0  # [H, W, 3]
+        normal_py_len = normal_py_decoded.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        normal_py_unit = normal_py_decoded / normal_py_len
+        normal_py_map = normal_py_unit * 0.5 + 0.5  # RGB visualization
+        # Apply alpha mask: show gray background where no surface
+        normal_py_map = torch.where(alpha_mask_3d.squeeze(0).unsqueeze(-1) > 0.5, normal_py_map, torch.tensor(0.5, device="cuda"))
 
         save_img(facing_vis.squeeze(), os.path.join(model_path, "vis_walls_normal_facing.png"))
         save_img(cos_heat_rgb.squeeze(), os.path.join(model_path, "vis_walls_normal_cos.png"))
         save_img(normal_map.squeeze(), os.path.join(model_path, "vis_walls_normal_map.png"))
+        save_img(normal_py_map.squeeze(), os.path.join(model_path, "vis_walls_normal_py.png"))
         print(f"[vis_walls] Saved normal-facing debug: vis_walls_normal_facing.png (red=back, blue=front)")
-        print(f"[vis_walls]   Also saved: vis_walls_normal_cos.png (heatmap), vis_walls_normal_map.png")
+        print(f"[vis_walls]   Also saved: vis_walls_normal_cos.png (heatmap), vis_walls_normal_map.png (SGS built-in), vis_walls_normal_py.png (Python get_min_axis)")
 
         # Wall detection with per-face margins
         is_bg = (alpha < 0.5)
@@ -584,6 +598,7 @@ if __name__ == "__main__":
         # 将遮挡掩码投影到 SH 基函数上，累加得到体素的可见性 SH 系数。
         if args.equirect:
             bg = torch.ones(3, device="cuda")  # white: unoccluded pixels remain white (>0.5) after alpha blend
+            _t_render, _t_sh = 0.0, 0.0
             for grid_id in trange(num_grid):
                 quat = coords_of_id[grid_id]
                 position = positions[quat[0] * args.occlu_res**2 + quat[1] * args.occlu_res + quat[2]]
@@ -616,6 +631,8 @@ if __name__ == "__main__":
                 )
                 rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
                 rendered_image, _, radii, depth_raw, acc, normal_raw = rasterizer(
                     means3D=means3D[valid],
                     means2D=means2D[valid],
@@ -627,10 +644,13 @@ if __name__ == "__main__":
                     rotations=rots[valid],
                     cov3D_precomp=None,
                 )
+                torch.cuda.synchronize()
+                _t_render += time.perf_counter() - _t0
 
                 rendered_image = rendered_image.permute(1, 2, 0)  # [eq_H, eq_W, 3]
-                # 背景色白色 (1,1,1)，被高斯遮挡的像素 < 0.5 → masked out
-                is_bg = rendered_image[..., 0:1] > 0.5  # [eq_H, eq_W, 1]
+                # 用累积 alpha 判断背景：acc < 0.5 表示无高斯覆盖，即为无遮挡方向。
+                # 比用 rendered>0.5 更准确（避免白色高斯被误判为背景）。
+                is_bg = acc.squeeze(0).unsqueeze(-1) < 0.5  # [eq_H, eq_W, 1]
 
                 if args.skip_walls:
                     depth = depth_raw * (acc > 0.5).float()  # filter floaters
@@ -654,10 +674,18 @@ if __name__ == "__main__":
                 else:
                     occlu_mask = is_bg.float()
 
-                # 将遮挡掩码投影到 SH 基函数上：C_j = Σ_pixels (mask_p * ω_p * Y_j(dir_p))
+                # 遮挡掩码投影到 SH 基函数：C_j = Σ_pixels (mask_p * ω_p * Y_j(dir_p))
+                # mask 来自 SGS rasterizer（COLMAP space 方向），components 来自
+                # get_envmap_dirs（reflvec space 方向）。同一像素 (i,j) 在两者中对应
+                # 同一物理方向（diag(1,-1,-1) 转换后一致），无需 remapping。
+                # 详见 scripts/test_equirect_baking_dirs.py
+                _t0 = time.perf_counter()
                 weighted_color = occlu_mask * solid_angles
                 temp_coefficients = (weighted_color * components).sum(0).sum(0)
                 occlusion_coefficients[grid_id] = temp_coefficients[:, None]
+                torch.cuda.synchronize()
+                _t_sh += time.perf_counter() - _t0
+            print(f"[equirect] render: {_t_render:.1f}s, SH proj: {_t_sh:.1f}s, total: {_t_render+_t_sh:.1f}s")
         # !SECTION
         # =================================================================
         # SECTION Cubemap 烘焙模式（原始行为，使用 diff-gaussian-rasterization）
@@ -666,6 +694,7 @@ if __name__ == "__main__":
         # 通过 nvdiffrast 的 boundary_mode="cube" 将 6 面贴图采样到等距方向，
         # 用背景色检测遮挡并投影到 SH 基函数。
         else:  # cubemap mode (original behavior)
+            _t_render, _t_tex, _t_sh = 0.0, 0.0, 0.0
             for grid_id in trange(num_grid):
                 quat = coords_of_id[grid_id]  # [3] voxel coords, O(1) vs O(res³)
                 position = positions[quat[0] * args.occlu_res**2 + quat[1] * args.occlu_res + quat[2]]
@@ -684,8 +713,10 @@ if __name__ == "__main__":
                 valid_scales = scales[valid]
                 valid_rots = rots[valid]
                 # 渲染 6 个面（+X, -X, +Y, -Y, +Z, -Z），每个面 FOV=90°
+                torch.cuda.synchronize()
+                _t0 = time.perf_counter()
                 for r_idx, rotation in enumerate(rotations):
-                    # SECTION 根据 c2w 求 w2c 
+                    # SECTION 根据 c2w 求 w2c
                     c2w = rotation
                     # 相机原点在世界坐标系下的坐标(体素中心)
                     c2w[:3, 3] = position
@@ -729,8 +760,11 @@ if __name__ == "__main__":
                     opacity_cubemap.append(opacity_map.permute(1, 2, 0))
                     depth_map = depth_map * (opacity_map > 0.5).float()  # NOTE: import to filter out the floater
                     depth_cubemap.append(depth_map.permute(1, 2, 0) * norm)
+                torch.cuda.synchronize()
+                _t_render += time.perf_counter() - _t0
 
                 # 用 nvdiffrast 将 6 面 cubemap 采样到等距方向网格
+                _t0 = time.perf_counter()
                 # boundary_mode="cube" 根据方向 (envmap_dirs) 在 6 个面间做纹理查找
                 depth_envmap = dr.texture(
                     torch.stack(depth_cubemap)[None, ...],
@@ -751,6 +785,8 @@ if __name__ == "__main__":
                 )[
                     0
                 ][..., 0:1]  # [H, W, 1]
+                torch.cuda.synchronize()
+                _t_tex += time.perf_counter() - _t0
 
                 # print(rgb_envmap.shape)
                 # print(depth_envmap.shape)
@@ -787,9 +823,13 @@ if __name__ == "__main__":
                     occlu_mask = is_bg.float()
 
                 # 将遮挡掩码投影到 SH 基函数：C_j = Σ 掩码 * 立体角 * Y_j
+                _t0 = time.perf_counter()
                 weighted_color = occlu_mask * solid_angles  # [H, W, 1]
                 temp_coefficients = (weighted_color * components).sum(0).sum(0)  # [d2]
                 occlusion_coefficients[grid_id] = temp_coefficients[:, None]
+                torch.cuda.synchronize()
+                _t_sh += time.perf_counter() - _t0
+            print(f"[cubemap] render: {_t_render:.1f}s, texture: {_t_tex:.1f}s, SH proj: {_t_sh:.1f}s, total: {_t_render+_t_tex+_t_sh:.1f}s")
         # !SECTION
         # =================================================================
         # 体素空洞填充：将未标记（-1）的空体素用最近的邻居扩张填充
@@ -810,7 +850,7 @@ if __name__ == "__main__":
     }
     if args.auto_bound:
         save_dict["aabb"] = torch.cat([auto_aabb_min.cpu(), auto_aabb_max.cpu()])  # [6] 非对称 AABB
-    save_file = args.occlusion_path or os.path.join(os.path.dirname(args.checkpoint), "occlusion_volumes.pth")
+    save_file = getattr(args, 'occlusion_path', None) or os.path.join(os.path.dirname(args.checkpoint), "occlusion_volumes.pth")
     torch.save(save_dict, save_file)
     print(f"save occlusion volumes as {save_file}")
 

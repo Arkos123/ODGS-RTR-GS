@@ -72,25 +72,30 @@ Both branches run simultaneously during Stage 2 - freezing geometry or using PBR
 
 Multiple coordinate systems exist in the codebase. **Mixing them is the most common source of bugs** (normal color inversion, occlusion misalignment).
 
-| Space | +X | +Y | +Z | Used by | Typical source |
-|-------|----|----|----|---------|---------------|
-| **COLMAP world** | right | **down** | **forward** | `get_min_axis`, `rendered_normal`, `pc.get_xyz`, `scene_min/max` | COLMAP / OpenMVG convention |
-| **Equirect view** | right | **up** | forward | `_equirect_ray_dirs`, `_erp_depth_to_normal` (raw output) | Equirect lat/lon grid (lat=+π/2 = top = +Y) |
-| **reflvec / cubemap** | right | up | **-forward (-Z)** | Baking's `envmap_dirs`, nvdiffrast `boundary_mode="cube"` | nvdiffrast cubemap convention (φ=0 → -Z) |
+| Space | +X | +Y | +Z | Where it appears |
+|-------|----|----|----|-----------------|
+| **COLMAP world** | right | **down** | **forward** | Gaussian xyz/normals, `scene_min/max`, SGS rasterizer (when fed COLMAP viewmatrix) |
+| **reflvec / cubemap** | right | up | **-forward (-Z)** | `get_envmap_dirs`, nvdiffrast `boundary_mode="cube"`, baking's SH coefficients storage |
+| **Equirect view (SGS internal)** | right | up | forward | SGS `_erp_ray_grid`, `_erp_depth_to_normal` raw output (SGS submodule only). Uses `+sin(lat)` → +Y up |
+
+> `render_equirect.py` (RTR-GS project) has its own `_equirect_ray_dirs` and `_erp_depth_to_normal` that use **COLMAP** (+Y down) directly — they are not in Equirect view space.
 
 **Key conversions:**
-- `COLMAP → equirect view`: `diag(1, -1, 1)` (flip Y)
 - `COLMAP → reflvec`: `diag(1, -1, -1)` (flip Y and Z)
-- `equirect view → COLMAP`: `C2W[:3,:3] @ diag(1, -1, 1) @ n` (Y flip + C2W rotation)
+- `COLMAP → equirect view (SGS)`: `diag(1, -1, 1)` (flip Y only)
+
+**Equirect baking direction consistency:**
+The SGS equirect rasterizer (fed a COLMAP viewmatrix) and `get_envmap_dirs` use different coordinate systems but the **same pixel `(i,j)` corresponds to the same physical direction** after `diag(1,-1,-1)` conversion. No mask remapping is needed. The column-remap "fix" previously suggested in [doc/RTR-GS/equirect-baking-z-flip.md](doc/RTR-GS/equirect-baking-z-flip.md) was based on comparing vector components across coordinate systems (COLMAP +Z=forward vs reflvec -Z=forward) and has been removed. Verify with `scripts/test_equirect_baking_dirs.py`.
 
 ### 行主序 vs 列主序
 
 CUDA 光栅化器使用 **OpenGL 列主序** 约定，而 PyTorch 默认行主序。`world_view_transform` 传到 CUDA 前必须 `.T` 转成列主序。详见 [doc/RTR-GS/row-major-column-major.md](doc/RTR-GS/row-major-column-major.md)。
 
 **Files where conventions collide (be careful):**
-- `gaussian_renderer/render_equirect.py` — `_erp_depth_to_normal` output (equirect view +Y up) converted to world space (COLMAP +Y down) via Y flip + C2W
+- `gaussian_renderer/render_equirect.py` — RTR-GS 版本的 `_equirect_ray_dirs` / `_erp_depth_to_normal` 直接在 COLMAP space 中工作（`-sin(lat)`），输出的是 COLMAP 空间法线 → 只需 C2W 旋转即可到 world space。而 SGS 子模块的对应函数使用 Equirect view（`+sin(lat)`），需要额外 Y flip。
 - `submodules/gs-ir/gs_ir/__init__.py` — `recon_occlusion`: baking 的 SH 系数在 reflvec 空间，传入的 normals 是 COLMAP 空间 → 内部用 `diag(1, -1, -1)` 转换后再做 SH 重建
 - `baking.py` — `envmap_dirs` (reflvec) used with world-space `position` for `hit_pos` → requires diag(1,-1,-1) conversion
+- `baking.py --equirect` — occlusion mask (COLMAP space) and SH components (reflvec space) correspond to the same physical direction per pixel; no remapping needed
 
 **Cubemap rotation order** (nvdiffrast convention):
 `+X(0), -X(1), +Y(2), -Y(3), +Z(4), -Z(5)`
@@ -123,7 +128,7 @@ The codebase supports **equirectangular (360° panorama)** training via the SGS 
 - Uses `spherical_gaussian_rasterization` instead of `diff_gaussian_rasterization`
 - Camera type 3 (equirectangular) in the rasterizer settings
 - Depth-derived pseudo-normals (`_erp_depth_to_normal` in `render_equirect.py`) for normal supervision
-- Multi-pass alpha-normalized rendering for normal, reflection attributes, and PBR attributes
+- V2 single-pass extra_features: all non-color attributes (normal, reflection, PBR) rasterized via one extra_features tensor
 - Geometry is frozen when loading from SGS pre-training (xyz/scaling/rotation/opacity locked)
 
 ### Perspective Training Pipeline (traditional)
@@ -187,7 +192,7 @@ Others: `gs-ir` (occlusion voxel SH interpolation), `simple-knn` (initial scale 
     - Cubernap-based relighting support (`transfer_light` mode)
   - **`render_fast.py`** (perspective lightweight variant): Simplified rendering with deferred PBR-only shading
   - **`render_equirect.py`** (equirectangular 360° mode): Full equirect rendering using the **SGS spherical CUDA rasterizer** (`spherical_gaussian_rasterization`). Key characteristics:
-    - **Multi-pass alpha-normalized rendering**: Because the SGS rasterizer handles one color attribute per rasterization call, the equirect path splits rendering into 3–6 separate GPU rasterization passes: (1) forward-shaded PRT color, (2) normal map, (3) ref_strength + ref_roughness, (4) ref_tint, (5) PBR base color, (6) PBR packed (roughness+metallic+depth), (7) incident light. Each pass is alpha-normalized (`rendered / opacity_for_div * alpha_mask`) post-rasterization.
+    - **V2 single-pass extra_features**: The SGS V2 rasterizer supports multi-channel `extra_features` in a single call. All non-color attributes (normal, ref_strength/roughness/tint, base_color, roughness, metallic, incident light) are concatenated into a per-Gaussian `extra_features: [P, N]` tensor and rasterized in one pass alongside the main color. The result is alpha-normalized (`rendered_extra / opacity_for_div * alpha_mask`) post-rasterization, then sliced into individual attribute maps. This replaces the previous multi-pass (3-6 separate rasterizer calls) approach.
     - **Depth-derived pseudo-normals** (`_erp_depth_to_normal`): Multi-scale, edge-safe normal estimation from depth via tangent cross-products, only across same-surface neighbors. Provides high-quality geometric normal supervision when CUDA rasterizer's analytical normal (shortest-axis) is unreliable in ERP space.
     - **Equirect ray geometry**: Uses `_equirect_ray_dirs()` for world-space ray directions and `_project_lat_lon()` for densification in ERP coordinates.
     - **Normal-facing visualization**: Red=back-facing, blue=front-facing, gray=background debug overlay.
