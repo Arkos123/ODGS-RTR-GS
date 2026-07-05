@@ -573,6 +573,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             "radiance_color": rendered_image,
             "normal_facing": facing_vis.permute(2, 0, 1),
         }
+        vis_dict["pseudo_normal"] = pseudo_normal * 0.5 + 0.5
         vis_dict["ref_strength"] = rendered_ref_strength_map
         vis_dict["ref_roughness"] = rendered_ref_roughness_map
         vis_dict["ref_tint"] = rendered_ref_tint
@@ -603,6 +604,34 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
 
 
 def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim=False, iteration=0):
+    """计算 equirect 全景模式下的所有损失项。
+
+    损失体系分三层，从通用到专用逐步叠加：
+
+    ── 层1: 图像重建（通用） ──────────────────────────────────
+      L1 + SSIM：渲染与 GT 之间的光度一致性。
+
+    ── 层2: 全景图几何优化（equirect 特有） ───────────────────
+      纬度面积加权:     ERP 极地像素实际球面面积小，用 row_weight
+                       让极地 smoothness 自动降权，避免过度平滑天花板。
+      RGB 边缘门控:     用 gt_image 梯度检测物体边界，smoothness
+                       跨边界时自动降权，保护边缘锐度。
+      几何 loss 渐变:   geometry_loss_from_iter 前不生效，之后逐步
+                       warmup，防止训练早期几何不稳定时 loss 干扰。
+      Alpha 空洞:       (可选) 惩罚 opacity 低于 target 的区域。
+      Attribute smooth: ref_roughness/ref_strength 的 edge-aware
+                       平滑（cyclic 水平边界防止左右接缝）。
+      Normal MSE:       将光栅化最短轴法线拉向深度法线（pseudo_normal），
+                       辅助法线学习但不反向传播到深度。
+      Normal TV:        最短轴法线的 L1 全变分（cyclic 水平边界），
+                       防止 MSE 把法线往噪声方向拉。
+
+    ── 层3: PBR 材质分解（Stage 2 特有） ────────────────────
+      PBR recon:        PBR 渲染结果的 L1 + SSIM。
+      Attribute smooth: roughness / base_color / metallic 的 edge-aware
+                       平滑，驱动物理属性在空间上连续变化。
+      环境贴图:         TV 平滑 + 各通道趋于灰色的先验。
+    """
     tb_dict = {"num_points": pc.get_xyz.shape[0]}
     rendered_image = results["render"]
     rendered_opacity = results["opacity"]
@@ -610,6 +639,10 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
 
     loss = 0
     torch.cuda.empty_cache()
+
+    # ════════════════════════════════════════════════════════════
+    # 层1: 图像重建损失（L1 + SSIM）
+    # ════════════════════════════════════════════════════════════
     Ll1 = F.l1_loss(rendered_image, gt_image)
     if use_ws_ssim:
         ws_map = est_wsmap(rendered_image)
@@ -627,18 +660,39 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
     tb_dict["psnr"] = psnr(rendered_image, gt_image).mean().item()
     loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss
 
-    # ── ERP-aware weighting for equirect mode ─────────────────────
+    # ════════════════════════════════════════════════════════════
+    # 层2: 全景图几何优化（equirect 特有）
+    # ════════════════════════════════════════════════════════════
+
+    # ── 预计算纬度权重、RGB 边缘门控、几何 loss 渐变系数 ────
     _pano = _ensure_pano_losses()
     _pano_row, _pano_rgb, _geom_ramp_fn, _pano_normal_smooth, _pano_alpha = _pano
 
     _, H, W = rendered_image.shape
+
+    # row_weight[1,H,1] = cos(lat) 纬度面积加权。
+    # ERP 投影中极地像素对应很小的球面面积，赤道像素对应大球面面积。
+    # 在 smoothness loss 中乘以该权重，使得极地约束自动减弱，
+    # 避免天花板/地板被过度平滑。
     row_weight = _pano_row(H, rendered_image.device, rendered_image.dtype) if _pano_row is not None else None
-    rgb_nonedge = _pano_rgb(gt_image) if _pano_rgb is not None else None
 
-    # Geometry loss ramp: gradual activation
-    geom_ramp = _geom_ramp_fn(opt, iteration, "geometry_loss_from_iter") if _geom_ramp_fn is not None else 1.0
-    tb_dict["geom_ramp"] = float(geom_ramp)
+    # rgb_nonedge[1,H,W] ∈ [0,1]: RGB 边缘门控。
+    # 从 gt_image 梯度检测物体边界，在边界处 weight≈0（抑制
+    # smoothness 跨过边界），在平滑区域 weight≈1（正常 smooth）。
+    # 注意：该 weight 不参与 normal smooth（避免极地和纹理丰富区域
+    # 的 normal 约束被过度削弱导致正反馈漂移）。
+    # rgb_nonedge = _pano_rgb(gt_image) if _pano_rgb is not None else None
+    rgb_nonedge = None
 
+    # geom_ramp[0,1]: 几何 loss 渐变激活系数。
+    #   iter < geometry_loss_from_iter        → ramp = 0
+    #   iter >> geometry_loss_from_iter+warmup → ramp = 1
+    # 防止训练早期几何不稳定时 normal/ref 平滑过多干扰。
+    # geom_ramp = _geom_ramp_fn(opt, iteration, "geometry_loss_from_iter") if _geom_ramp_fn is not None else 1.0
+    # tb_dict["geom_ramp"] = float(geom_ramp)
+    geom_ramp = 1.0
+
+    # ── Mask 熵（透明度 vs 已知前景 mask） ────────────────────
     if opt.lambda_mask_entropy > 0:
         o = rendered_opacity.clamp(1e-6, 1 - 1e-6)
         image_mask = viewpoint_camera.image_mask.cuda()
@@ -646,6 +700,9 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
         tb_dict["loss_mask_entropy"] = loss_mask_entropy.item()
         loss = loss + opt.lambda_mask_entropy * loss_mask_entropy
 
+    # ── Alpha 空洞损失（自监督，默认关闭 lambda_alpha_hole=0） ─
+    # 惩罚 rendered_opacity 低于 target（0.985）的区域。
+    # residual_weight 让残差大的像素获得更高权重，推动填补空洞。
     if opt.lambda_alpha_hole > 0 and _pano_alpha is not None:
         loss_alpha_hole = _pano_alpha(
             rendered_opacity, rendered_image, gt_image,
@@ -653,6 +710,10 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
         tb_dict["loss_alpha_hole"] = loss_alpha_hole.item()
         loss = loss + geom_ramp * opt.lambda_alpha_hole * loss_alpha_hole
 
+    # ── 反射粗糙度平滑（ref_roughness） ───────────────────────
+    # 目标: 让反射粗糙度在空间上连续，避免椒盐噪声。
+    # 使用 _erp_edge_aware_loss = cyclic 水平方向 + 边缘保护。
+    # image_mask * rgb_nonedge 确保 smoothness 只在有效区域且不跨边界。
     if opt.lambda_ref_roughness_smooth > 0:
         image_mask = viewpoint_camera.image_mask.cuda()
         rendered_ref_roughness = results.get("ref_roughness")
@@ -665,6 +726,8 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
             tb_dict["loss_ref_roughness_smooth"] = loss_ref_roughness_smooth.item()
             loss = loss + geom_ramp * opt.lambda_ref_roughness_smooth * loss_ref_roughness_smooth
 
+    # ── 反射强度平滑（ref_strength） ───────────────────────────
+    # 同上：让反射强度贴图在空间上连续变化。
     if opt.lambda_ref_strength_smooth > 0:
         image_mask = viewpoint_camera.image_mask.cuda()
         rendered_ref_strength = results.get("ref_strength")
@@ -677,6 +740,12 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
             tb_dict["loss_ref_strength_smooth"] = loss_ref_strength_smooth.item()
             loss = loss + geom_ramp * opt.lambda_ref_strength_smooth * loss_ref_strength_smooth
 
+    # ── Normal 一致性（MSE 拉向深度法线） ──────────────────────
+    # 把光栅化器输出的最短轴法线（rendered_normal）向深度推导
+    # 法线（pseudo_normal）拉近。pseudo_normal 使用 detach()
+    # 切断梯度，避免此 loss 反向传播到深度和 position。
+    # 注意：rotation 参数仍通过其他路径（PBR 渲染梯度）更新，
+    # 因此需要下方的 TV smooth 来防止法线无约束漂移。
     if opt.lambda_normal_render_depth > 0:
         rendered_normal = results["normal"]
         pseudo_normal = results["pseudo_normal"]
@@ -684,27 +753,32 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
         tb_dict["loss_normal_render_depth"] = loss_normal_render_depth.item()
         loss = loss + geom_ramp * opt.lambda_normal_render_depth * loss_normal_render_depth
 
+    # ── Normal TV 平滑（替代 SGS 的二次型 smoothness） ────────
+    # 使用 L1 TV（不是 SGS 的 1-cos(θ) 二次型），因为 L1 对小角度
+    # 变化产生线性梯度，约束更强，在所有纬度上均匀生效。
+    # 水平方向用 torch.roll（cyclic 边界消除左右接缝），
+    # 垂直方向标准 padding（ERP 垂直方向有限）。
+    # 不在此处使用 row_weight / rgb_nonedge：确保极地也有足够的
+    # normal smoothness 来抑制 MSE loss 导致的旋转正反馈漂移。
     if opt.lambda_normal_smooth > 0:
         rendered_normal = results["normal"]
-        if _pano_normal_smooth is not None:
-            # ERP-aware normal smoothness: cyclic horizontal, edge-gated, lat-weighted
-            valid_alpha = (rendered_opacity > 0.05).float()
-            if row_weight is not None:
-                valid_alpha = valid_alpha * row_weight
-            # Low-texture weight: high in smooth regions, low near edges
-            lowtex_weight = (1.0 - rgb_nonedge).pow(0.85) if rgb_nonedge is not None else torch.ones_like(rendered_opacity)
-            loss_normal_smooth = _pano_normal_smooth(
-                rendered_normal, lowtex_weight, valid_alpha)
-        else:
-            # Fallback: simple TV with latitude weighting
-            nw = rendered_normal
-            if row_weight is not None:
-                nw = nw * row_weight
-            loss_normal_smooth = tv_loss(nw)
+        # L2 TV with cyclic horizontal boundary: L2 penalizes small bumps
+        # quadratically (gradient ∝ Δn), giving stronger suppression than L1
+        # (gradient ∝ sign(Δn)) for the same lambda.
+        dx = (torch.roll(rendered_normal, shifts=-1, dims=-1) - rendered_normal).pow(2)
+        dy = torch.zeros_like(rendered_normal)
+        if rendered_normal.shape[-2] > 1:
+            dy[:, :-1, :] = (rendered_normal[:, 1:, :] - rendered_normal[:, :-1, :]).pow(2)
+        loss_normal_smooth = dx.mean() + dy.mean()
         tb_dict["loss_normal_smooth"] = loss_normal_smooth.item()
         loss = loss + geom_ramp * opt.lambda_normal_smooth * loss_normal_smooth
 
+    # ════════════════════════════════════════════════════════════
+    # 层3: PBR 材质分解损失（Stage 2 特有）
+    # ════════════════════════════════════════════════════════════
     if pc.use_pbr:
+        # ── PBR 图像重建（L1 + SSIM） ──────────────────────────
+        # rendered_pbr 已经过 gamma_correction
         rendered_pbr = results["pbr"]
         Ll1_pbr = F.l1_loss(rendered_pbr, gt_image)
         ssim_val_pbr = ssim(rendered_pbr, gt_image)
@@ -714,6 +788,9 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
         loss_pbr = (1.0 - opt.lambda_dssim) * Ll1_pbr + opt.lambda_dssim * (1.0 - ssim_val_pbr)
         loss = loss + opt.lambda_pbr * loss_pbr
 
+        # ── PBR 粗糙度平滑 ─────────────────────────────────────
+        # 使用 _erp_edge_aware_loss（cyclic 水平 + 边缘保护），
+        # image_mask * rgb_nonedge 限制在有效区域且不跨 RGB 边界。
         if opt.lambda_roughness_smooth > 0:
             image_mask = viewpoint_camera.image_mask.cuda()
             rendered_roughness = results.get("roughness")
@@ -725,6 +802,7 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
                 tb_dict["loss_roughness_smooth"] = loss_roughness_smooth.item()
                 loss = loss + opt.lambda_roughness_smooth * loss_roughness_smooth
 
+        # ── PBR 基本色平滑 ─────────────────────────────────────
         if opt.lambda_base_color_smooth > 0:
             image_mask = viewpoint_camera.image_mask.cuda()
             rendered_base_color = results.get("base_color")
@@ -736,6 +814,7 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
                 tb_dict["loss_base_color_smooth"] = loss_base_color_smooth.item()
                 loss = loss + opt.lambda_base_color_smooth * loss_base_color_smooth
 
+        # ── PBR 金属度平滑 ─────────────────────────────────────
         if opt.lambda_metallic_smooth > 0:
             image_mask = viewpoint_camera.image_mask.cuda()
             rendered_metallic = results.get("metallic")
@@ -747,12 +826,15 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
                 tb_dict["loss_metallic_smooth"] = loss_metallic_smooth.item()
                 loss = loss + opt.lambda_metallic_smooth * loss_metallic_smooth
 
+        # ── 环境贴图 TV 平滑 ──────────────────────────────────
         if opt.lambda_env_smooth > 0 and env_map is not None:
             env = env_map.get_env_map()
             loss_env_smooth = tv_loss(env.permute(2, 0, 1))
             tb_dict["loss_env_smooth"] = loss_env_smooth
             loss = loss + opt.lambda_env_smooth * loss_env_smooth
 
+        # ── 环境光照白化（各通道趋于中性灰） ──────────────────
+        # 先验：环境光照应在各颜色通道上接近灰色，防止偏色。
         if opt.lambda_white_light > 0 and env_map is not None:
             env_base = env_map.base
             white = (env_base[..., 0:1] + env_base[..., 1:2] + env_base[..., 2:3]) / 3.0
