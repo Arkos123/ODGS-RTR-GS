@@ -126,6 +126,18 @@ class OptimizationParams(ParamGroup):
 
         self.densify_grad_threshold = 0.0002
 
+        # Equirect-specific densification parameters (ported from SGS)
+        self.equirect_grad_threshold_min = 0.0002
+        self.equirect_grad_threshold_max = 0.002
+        self.equirect_prune_start_iter = 7000
+        self.equirect_min_prune_obs = 6
+        self.equirect_max_prune_ratio = 0.03
+        self.equirect_densify_update_ratio = 0.08
+        self.equirect_max_clone_ratio = 0.18
+        self.equirect_max_split_ratio = 0.12
+        self.equirect_split_shrink = 1.15
+        self.equirect_min_new_scale_ratio = 0.0
+
         self.lambda_depth = 0.0
         self.lambda_mask_entropy = 0.0
                 
@@ -148,8 +160,8 @@ class OptimizationParams(ParamGroup):
         self.lambda_reflect_strength_equal_metallic = 0.0
 
         # Equirect geometry loss ramp: gradually activate normal/ref smoothness
-        self.geometry_loss_from_iter = 3500
-        self.geometry_loss_warmup_iters = 1500
+        self.geometry_loss_from_iter = 3500 # deprecated
+        self.geometry_loss_warmup_iters = 1500 # deprecated
         self.lambda_alpha_hole = 0.0  # Self-supervised alpha hole penalty (equirect)
 
         self.use_env_scope = False

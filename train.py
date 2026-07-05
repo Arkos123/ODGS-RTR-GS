@@ -104,20 +104,9 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
     gaussians.training_setup(opt)
 
-    # 几何冻结：
-    # 从PLY导入（例如SGS/ODGS预训练结果）时，或从checkpoint恢复且为equirect模式时，
-    # 锁定位置/缩放/旋转/不透明度，并禁用densification
-    # 解释：equirect模式下SGS光栅化器已经产生了很好的几何，
-    # 再对其做densification反而会破坏质量
-    freeze_geometry = args.ply_checkpoint is not None or (args.checkpoint is not None and pipe.equirect)
-    # if freeze_geometry:
-    #     # for param_group in gaussians.optimizer.param_groups:
-    #     #     if param_group["name"] in ("xyz", "scaling", "rotation", "opacity"):
-    #     #         param_group['lr'] = 0
-    #     gaussians.xyz_scheduler_args = lambda iteration: 0
-    #     opt.densify_from_iter = opt.iterations + 1
-    #     opt.densify_until_iter = 0
-    #     print("Geometry frozen: xyz/scaling/rotation/opacity locked, densification disabled")
+    # 注意：不再冻结几何（freeze_geometry 已被移除）。
+    # Equirect 模式使用 SGS 风格的保守 densification（见下方训练循环），
+    # 避免过度生长 floater，同时允许 RTR-GS 继续优化几何。
 
 
     """
@@ -334,21 +323,36 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                                 iteration, pbr_kwargs, is_pbr)
 
             # ── Densification（高斯密化/修剪） ────────────────────
-            # 3DGS自适应控制策略：
-            #   - 收集位置梯度统计 → 判断哪些高斯需要克隆或分裂
-            #   - 修剪不透明度 < 0.005 的高斯
-            #   - 定期重置不透明度来恢复被过度修剪的高斯
-            # 注意：几何冻结（freeze_geometry）时跳过densification
             if iteration < opt.densify_until_iter:
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter, 
-                                                    render_pkg['weights'])
-                # 记录屏幕空间最大半径，用于修剪判断
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
-                                                                        radii[visibility_filter])
+                if pipe.equirect:
+                    # Equirect 模式：使用 SGS 风格的保守 densification
+                    # (lat-aware 阈值、capped 修剪、initial point 保护)
+                    gaussians.add_densification_stats(
+                        viewspace_point_tensor, visibility_filter,
+                        weights=None, lat=render_pkg.get('lat'))
+                    gaussians.max_radii2D[visibility_filter] = torch.max(
+                        gaussians.max_radii2D[visibility_filter],
+                        radii[visibility_filter])
 
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    if (iteration > opt.densify_from_iter
+                            and iteration % opt.densification_interval == 0):
+                        gaussians.equirect_densify_and_prune(
+                            opt, scene.cameras_extent,
+                            lat=render_pkg.get('lat'), iteration=iteration)
+                else:
+                    # 透视模式：标准 3DGS densification
+                    gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter,
+                                                        render_pkg['weights'])
+                    gaussians.max_radii2D[visibility_filter] = torch.max(
+                        gaussians.max_radii2D[visibility_filter],
+                        radii[visibility_filter])
+
+                    if (iteration > opt.densify_from_iter
+                            and iteration % opt.densification_interval == 0):
+                        size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                        gaussians.densify_and_prune(
+                            opt.densify_grad_threshold, 0.005,
+                            scene.cameras_extent, size_threshold)
 
                 # ── 不透明度和反射属性重置 ────────────────────────
                 HAS_RESET0 = False
@@ -358,13 +362,10 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                     outside_msk = get_outside_msk()
                     gaussians.reset_opacity()
                     if not opt.without_normal_propagation:
-                        # 重置反射属性（normal propagation），保持法线更新
                         gaussians.reset_refl(exclusive_msk=outside_msk)
 
-                # 法线传播（normal propagation）：
-                # 定期将深度图推导的法线传播到高斯上，增强法线一致性
-                # 仅在 init_iter < iteration ≤ propagation_until_iter 时生效
-                if  (opt.init_iter < iteration <= opt.propagation_until_iter) and iteration % 1000 == 0 and pipe.ref_map:
+                # 法线传播（normal propagation）
+                if (opt.init_iter < iteration <= opt.propagation_until_iter) and iteration % 1000 == 0 and pipe.ref_map:
                     if not HAS_RESET0 and not opt.without_normal_propagation:
                         outside_msk = get_outside_msk()
                         gaussians.reset_opacity1(exclusive_msk=outside_msk)
@@ -372,29 +373,25 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
 
             # ── Equirect 模式的独立修剪（densification结束后） ────
-            # 透视模式的densification结束后，SGS全景模式还需要额外的修剪
-            # 原因：SGS光栅化器在前向PRT渲染中对不透明度的处理不同，
-            # 需要继续修剪低不透明度的高斯以保持几何质量
-            # 注意：几何冻结（freeze_geometry = True）时跳过
-            # if pipe.equirect and not freeze_geometry and iteration >= opt.densify_until_iter:
-            #     if iteration > 500 and iteration % opt.densification_interval == 0:
-            #         if gaussians.max_radii2D.numel() != gaussians.get_xyz.shape[0]:
-            #             gaussians.max_radii2D = torch.zeros(
-            #                 (gaussians.get_xyz.shape[0]), device="cuda")
-            #         gaussians.prune(min_opacity=0.005, extent=scene.cameras_extent,
-            #                         max_screen_size=None, weights_threshold=0)
+            # 透视模式的 densification 结束后，全景模式仍需继续修剪
+            # 低不透明度高斯，防止 floater 积累。
+            # 使用 SGS 风格的保守修剪（capped、保护初始点）。
+            if pipe.equirect and iteration >= opt.densify_until_iter:
+                if iteration > 500 and iteration % opt.densification_interval == 0:
+                    gaussians.equirect_prune(
+                        opt, scene.cameras_extent, iteration=iteration)
 
-            #     if iteration % opt.opacity_reset_interval == 0:
-            #         outside_msk = get_outside_msk()
-            #         gaussians.reset_opacity()
-            #         if not opt.without_normal_propagation:
-            #             gaussians.reset_refl(exclusive_msk=outside_msk)
+                if iteration % opt.opacity_reset_interval == 0:
+                    outside_msk = get_outside_msk()
+                    gaussians.reset_opacity()
+                    if not opt.without_normal_propagation:
+                        gaussians.reset_refl(exclusive_msk=outside_msk)
 
-            #     if (opt.init_iter < iteration <= opt.propagation_until_iter) and iteration % 1000 == 0 and pipe.ref_map:
-            #         if not opt.without_normal_propagation:
-            #             outside_msk = get_outside_msk()
-            #             gaussians.reset_opacity1(exclusive_msk=outside_msk)
-            #             gaussians.reset_scale(exclusive_msk=outside_msk)
+                if (opt.init_iter < iteration <= opt.propagation_until_iter) and iteration % 1000 == 0 and pipe.ref_map:
+                    if not opt.without_normal_propagation:
+                        outside_msk = get_outside_msk()
+                        gaussians.reset_opacity1(exclusive_msk=outside_msk)
+                        gaussians.reset_scale(exclusive_msk=outside_msk)
 
             # ── 优化器步进 ────────────────────────────────────────
             # 更新所有可训练参数：
@@ -452,7 +449,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     
 
 
-def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, is_pbr, num_views=10):
+def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, is_pbr, num_views=4):
     """
     轻量级可视化保存函数
 

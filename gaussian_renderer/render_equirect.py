@@ -346,6 +346,16 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
                 incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2),
                 normal,
             ), 0.0, 1.0)
+        elif getattr(pipe, 'transfer_light', False) and cubemap is not None:
+            transfer_shs = pc.get_incidents.permute(0, 2, 1)
+            light_shs = cubemap.shs
+            incidents = light_shs * transfer_shs
+            incidents = incidents.permute(0, 2, 1)
+            incidents_rgb = torch.clamp(eval_sh(
+                pc.active_sh_degree,
+                incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2),
+                normal,
+            ), 0.0, 1.0)
         else:
             incidents_rgb = torch.zeros_like(base_color)
 
@@ -550,7 +560,8 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         "visibility_filter": visibility_filter,
         "radii": radii,
         "num_rendered": 0,
-        "weights": opacity,
+        # Note: no "weights" key — equirect mode uses _equirect_prune_mask
+        # which does not rely on weights_accum.  See scene/gaussian_model.py.
         "psi": psi,
         "lat": lat,
         "lon": lon,

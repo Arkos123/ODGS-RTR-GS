@@ -886,6 +886,13 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+        # Sync _is_initial_point mask (equirect mode) on prune.
+        # Use valid_points_mask.numel() (pre-prune size) since _xyz has
+        # already been updated to post-prune size at this point.
+        if hasattr(self, "_is_initial_point") and self._is_initial_point.numel() == valid_points_mask.numel():
+            self._is_initial_point = self._is_initial_point[valid_points_mask]
+            self._initial_point_count = int(self._is_initial_point.sum().item())
+
         if self.use_pbr:
             self._base_color = optimizable_tensors["base_color"]
             self._roughness = optimizable_tensors["roughness"]
@@ -972,6 +979,13 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        # Sync _is_initial_point mask (equirect mode): new Gaussians are NOT initial
+        if hasattr(self, "_is_initial_point") and self._is_initial_point.numel() == (self.get_xyz.shape[0] - new_xyz.shape[0]):
+            old_n = self._is_initial_point.numel()
+            old_mask = self._is_initial_point
+            self._is_initial_point = torch.cat(
+                [old_mask, torch.zeros((self.get_xyz.shape[0] - old_n,), dtype=torch.bool, device="cuda")], dim=0)
 
         if self.use_pbr:
             self._base_color = optimizable_tensors["base_color"]
@@ -1091,6 +1105,271 @@ class GaussianModel:
 
 
 
+    # ── Equirect-specific densification helpers (ported from SGS) ────────────
+
+    def _dynamic_grad_threshold(self, scores, grad_threshold_min, grad_threshold_max, lat=None, update_ratio=0.0):
+        """Latitude-aware gradient threshold for equirect mode.
+
+        Polar regions (|lat|≈90°) get a HIGHER threshold to suppress unnecessary
+        densification caused by ERP oversampling.  Equator (lat≈0°) gets the
+        lower threshold for normal growth.
+
+        When update_ratio>0, the threshold has a quantile floor: at least
+        top-(1-update_ratio) of observed gradients will exceed it.
+        """
+        n = scores.shape[0]
+        if lat is None or lat.numel() == 0:
+            lat = torch.zeros((n,), device="cuda", dtype=scores.dtype)
+        else:
+            lat = lat.to(device="cuda", dtype=scores.dtype).reshape(-1)
+            if lat.numel() < n:
+                lat = torch.cat([lat, torch.zeros(n - lat.numel(), device="cuda", dtype=scores.dtype)], dim=0)
+            lat = lat[:n]
+        cos_lat = torch.cos(lat).abs().clamp(0.0, 1.0)
+        base = (1.0 - cos_lat) * (float(grad_threshold_max) - float(grad_threshold_min)) + float(grad_threshold_min)
+        if float(update_ratio) > 0.0:
+            observed = torch.isfinite(scores) & (scores > 0.0)
+            if observed.sum() > 16:
+                q = max(0.0, min(1.0, 1.0 - float(update_ratio)))
+                qv = torch.quantile(scores[observed].detach(), q).to(scores.dtype)
+                base = torch.maximum(base, qv.expand_as(base))
+        return base
+
+    def _limit_mask_by_score(self, mask, score, max_ratio):
+        """Cap selected candidates to at most max_ratio * total_count."""
+        if max_ratio is None or float(max_ratio) <= 0.0:
+            return mask
+        num = int(mask.sum().item())
+        if num <= 0:
+            return mask
+        max_count = max(1, int(float(max_ratio) * max(1, mask.numel())))
+        if num <= max_count:
+            return mask
+        cand = torch.nonzero(mask, as_tuple=False).squeeze(1)
+        vals = score[cand].detach()
+        _, order = torch.topk(vals, k=max_count, largest=True, sorted=False)
+        keep = cand[order]
+        limited = torch.zeros_like(mask)
+        limited[keep] = True
+        return limited
+
+    def _ensure_initial_mask(self):
+        """Return boolean mask of initial (SfM backbone) Gaussians.
+
+        On first call or after size mismatch (from clone/split/prune where
+        _is_initial_point was already updated), marks the first
+        _initial_point_count Gaussians as protected.
+        """
+        n = self.get_xyz.shape[0]
+        if not hasattr(self, "_is_initial_point") or self._is_initial_point.numel() != n:
+            if not hasattr(self, "_initial_point_count"):
+                self._initial_point_count = int(n)
+            init_n = min(self._initial_point_count, n)
+            self._is_initial_point = torch.zeros((n,), dtype=torch.bool, device="cuda")
+            self._is_initial_point[:init_n] = True
+        return self._is_initial_point
+
+    def _equirect_prune_mask(self, min_opacity, extent, max_screen_size, iteration=0,
+                             prune_start_iter=7000, min_prune_obs=0,
+                             max_prune_ratio=0.03, protect_initial_points=True,
+                             enable_screen_size_prune=False,
+                             enable_world_size_prune=False,
+                             world_size_prune_ratio=0.12):
+        """Conservative pruning for equirect mode (from SGS _direct_prune_mask).
+
+        Key differences from standard prune:
+        - Requires minimum observations (denom >= min_prune_obs) before pruning
+        - Caps total pruning to max_prune_ratio per call
+        - Protects initial SfM backbone points
+        - Delays start until prune_start_iter
+        - Screen-size and world-size pruning off by default
+        - Does NOT use weights_accum
+        """
+        n = self.get_xyz.shape[0]
+        prune_mask = torch.zeros((n,), dtype=torch.bool, device="cuda")
+        if n == 0 or int(iteration) < int(prune_start_iter):
+            return prune_mask
+        opacity_bad = (self.get_opacity < float(min_opacity)).squeeze()
+        if min_prune_obs and self.denom.numel() == n:
+            observed = self.denom.squeeze() >= float(min_prune_obs)
+            opacity_bad = torch.logical_and(opacity_bad, observed)
+        prune_mask = torch.logical_or(prune_mask, opacity_bad)
+        if max_screen_size and bool(enable_screen_size_prune):
+            prune_mask = torch.logical_or(prune_mask, self.max_radii2D > max_screen_size)
+        if bool(enable_world_size_prune):
+            prune_mask = torch.logical_or(prune_mask, self.get_scaling.max(dim=1).values > float(world_size_prune_ratio) * float(extent))
+        if bool(protect_initial_points):
+            init_mask = self._ensure_initial_mask()
+            prune_mask = torch.logical_and(prune_mask, ~init_mask)
+        # Cap destructive pruning
+        prune_mask = self._limit_mask_by_score(prune_mask, -self.get_opacity.detach().squeeze(), float(max_prune_ratio))
+        return prune_mask
+
+    def _equirect_densify_and_clone(self, grads, grad_threshold_min, grad_threshold_max, extent, lat,
+                                    update_ratio=0.0, max_clone_ratio=0.0):
+        """Latitude-aware clone for equirect mode (from SGS)."""
+        if grads is None or grads.numel() == 0 or self.get_xyz.shape[0] == 0:
+            return
+        n = min(grads.shape[0], self.get_xyz.shape[0])
+        score = torch.norm(grads[:n], dim=-1)
+        threshold = self._dynamic_grad_threshold(
+            score, grad_threshold_min, grad_threshold_max,
+            lat[:n] if lat is not None and lat.numel() >= n else lat,
+            update_ratio)
+        selected_pts_mask = torch.zeros((self.get_xyz.shape[0],), dtype=torch.bool, device="cuda")
+        selected_n = torch.logical_and(
+            score >= threshold,
+            torch.max(self.get_scaling[:n], dim=1).values <= self.percent_dense * extent)
+        selected_n = self._limit_mask_by_score(selected_n, score, float(max_clone_ratio))
+        selected_pts_mask[:n] = selected_n
+        if selected_pts_mask.sum() == 0:
+            return
+
+        new_xyz = self._xyz[selected_pts_mask]
+        new_shs_dc = self._shs_dc[selected_pts_mask]
+        new_shs_rest = self._shs_rest[selected_pts_mask]
+        new_diffuse_tint = self._diffuse_tint[selected_pts_mask]
+        new_specular_tint = self._specular_tint[selected_pts_mask]
+        new_ref_tint = self._ref_tint[selected_pts_mask]
+        new_ref_strength = self._ref_strength[selected_pts_mask]
+        new_ref_roughness = self._ref_roughness[selected_pts_mask]
+        new_specular_feature = self._specular_feature[selected_pts_mask]
+        new_diffuse_transfer_dc = self._diffuse_transfer_dc[selected_pts_mask]
+        new_diffuse_transfer_rest = self._diffuse_transfer_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+
+        args = [new_xyz, new_shs_dc, new_shs_rest,
+                new_diffuse_tint, new_specular_tint, new_ref_tint, new_ref_strength, new_ref_roughness,
+                new_specular_feature, new_diffuse_transfer_dc, new_diffuse_transfer_rest,
+                new_opacities, new_scaling, new_rotation]
+        if self.use_pbr:
+            args.extend([
+                self._base_color[selected_pts_mask],
+                self._roughness[selected_pts_mask],
+                self._metallic[selected_pts_mask],
+                self._incidents_dc[selected_pts_mask],
+                self._incidents_rest[selected_pts_mask],
+            ])
+        self.densification_postfix(*args)
+
+    def _equirect_densify_and_split(self, grads, grad_threshold_min, grad_threshold_max, extent, lat,
+                                    N=2, update_ratio=0.0, max_split_ratio=0.0,
+                                    split_shrink=1.15, min_new_scale_ratio=0.0):
+        """Latitude-aware split for equirect mode (from SGS)."""
+        n_init_points = self.get_xyz.shape[0]
+        if n_init_points == 0 or grads.numel() == 0:
+            return
+        scores = torch.zeros((n_init_points,), device="cuda")
+        g = grads.squeeze()
+        scores[:min(g.numel(), n_init_points)] = g[:min(g.numel(), n_init_points)]
+        threshold = self._dynamic_grad_threshold(scores, grad_threshold_min, grad_threshold_max, lat, update_ratio)
+        selected_pts_mask = torch.logical_and(
+            scores >= threshold,
+            torch.max(self.get_scaling, dim=1).values > self.percent_dense * extent)
+        selected_pts_mask = self._limit_mask_by_score(selected_pts_mask, scores, float(max_split_ratio))
+        if selected_pts_mask.sum() == 0:
+            return
+
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3), device="cuda")
+        samples = torch.normal(mean=means, std=stds)
+        rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
+        new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
+        shrink = max(float(split_shrink), 0.8)
+        new_scale = self.get_scaling[selected_pts_mask].repeat(N, 1) / (shrink * float(N))
+        if min_new_scale_ratio and float(min_new_scale_ratio) > 0.0:
+            new_scale = torch.clamp(new_scale, min=float(min_new_scale_ratio) * float(extent))
+        new_scaling = self.scaling_inverse_activation(new_scale)
+        new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
+        new_shs_dc = self._shs_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_shs_rest = self._shs_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_diffuse_tint = self._diffuse_tint[selected_pts_mask].repeat(N, 1)
+        new_specular_tint = self._specular_tint[selected_pts_mask].repeat(N, 1)
+        new_ref_tint = self._ref_tint[selected_pts_mask].repeat(N, 1)
+        new_ref_strength = self._ref_strength[selected_pts_mask].repeat(N, 1)
+        new_ref_roughness = self._ref_roughness[selected_pts_mask].repeat(N, 1)
+        new_specular_feature = self._specular_feature[selected_pts_mask].repeat(N, 1)
+        new_diffuse_transfer_dc = self._diffuse_transfer_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_diffuse_transfer_rest = self._diffuse_transfer_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
+
+        args = [new_xyz, new_shs_dc, new_shs_rest,
+                new_diffuse_tint, new_specular_tint, new_ref_tint, new_ref_strength, new_ref_roughness,
+                new_specular_feature, new_diffuse_transfer_dc, new_diffuse_transfer_rest,
+                new_opacity, new_scaling, new_rotation]
+        if self.use_pbr:
+            args.extend([
+                self._base_color[selected_pts_mask].repeat(N, 1),
+                self._roughness[selected_pts_mask].repeat(N, 1),
+                self._metallic[selected_pts_mask].repeat(N, 1),
+                self._incidents_dc[selected_pts_mask].repeat(N, 1, 1),
+                self._incidents_rest[selected_pts_mask].repeat(N, 1, 1),
+            ])
+        self.densification_postfix(*args)
+
+        prune_filter = torch.cat(
+            (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
+        self.prune_points(prune_filter)
+
+    def equirect_densify_and_prune(self, opt, extent, lat, iteration=0):
+        """Equirect-mode densification (from SGS): prune before growth, lat-aware thresholds, capped."""
+        if self.get_xyz.shape[0] == 0:
+            return
+        grads = self.xyz_gradient_accum / self.denom.clamp_min(1.0)
+        grads[grads.isnan()] = 0.0
+
+        # Prune conservatively before growth (so observation stats are still valid)
+        prune_mask = self._equirect_prune_mask(
+            0.005, extent, None,
+            iteration=iteration,
+            prune_start_iter=opt.equirect_prune_start_iter,
+            min_prune_obs=opt.equirect_min_prune_obs,
+            max_prune_ratio=opt.equirect_max_prune_ratio,
+            protect_initial_points=True,
+        )
+        if prune_mask.any() and prune_mask.sum() < self.get_xyz.shape[0]:
+            keep = ~prune_mask
+            self.prune_points(prune_mask)
+            grads = grads[keep[:grads.shape[0]]]
+            if lat is not None and lat.numel() >= keep.numel():
+                lat = lat[keep]
+
+        self._equirect_densify_and_clone(
+            grads, opt.equirect_grad_threshold_min, opt.equirect_grad_threshold_max,
+            extent, lat,
+            update_ratio=opt.equirect_densify_update_ratio,
+            max_clone_ratio=opt.equirect_max_clone_ratio,
+        )
+        self._equirect_densify_and_split(
+            grads, opt.equirect_grad_threshold_min, opt.equirect_grad_threshold_max,
+            extent, lat,
+            update_ratio=opt.equirect_densify_update_ratio,
+            max_split_ratio=opt.equirect_max_split_ratio,
+            split_shrink=opt.equirect_split_shrink,
+            min_new_scale_ratio=opt.equirect_min_new_scale_ratio,
+        )
+        self.weights_accum.data[:] = 0.0
+        torch.cuda.empty_cache()
+
+    def equirect_prune(self, opt, extent, iteration=0):
+        """Equirect-only prune (no clone/split), for post-densification cleanup."""
+        if self.get_xyz.shape[0] == 0:
+            return
+        prune_mask = self._equirect_prune_mask(
+            0.005, extent, None,
+            iteration=iteration,
+            prune_start_iter=opt.equirect_prune_start_iter,
+            min_prune_obs=opt.equirect_min_prune_obs,
+            max_prune_ratio=opt.equirect_max_prune_ratio,
+            protect_initial_points=True,
+        )
+        if prune_mask.any():
+            self.prune_points(prune_mask)
+        self.weights_accum.data[:] = 0.0
+        torch.cuda.empty_cache()
+
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, weights_threshold=1e-4):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
@@ -1126,11 +1405,14 @@ class GaussianModel:
 
         torch.cuda.empty_cache()
 
-    def add_densification_stats(self, viewspace_point_tensor, update_filter, weights):
-        self.weights_accum += weights
+    def add_densification_stats(self, viewspace_point_tensor, update_filter, weights, lat=None):
+        # In equirect mode weights may be None (equirect uses _equirect_prune_mask, not weight-based pruning)
+        if weights is not None:
+            self.weights_accum += weights
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
                                                              keepdim=True)
         self.denom[update_filter] += 1
+        # lat is accepted for API consistency with equirect mode but not used in stats
 
 
     def incident_to_transfer(self, light_shs):

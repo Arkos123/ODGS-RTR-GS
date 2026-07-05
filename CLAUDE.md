@@ -128,8 +128,8 @@ The codebase supports **equirectangular (360° panorama)** training via the SGS 
 - Uses `spherical_gaussian_rasterization` instead of `diff_gaussian_rasterization`
 - Camera type 3 (equirectangular) in the rasterizer settings
 - Depth-derived pseudo-normals (`_erp_depth_to_normal` in `render_equirect.py`) for normal supervision
+- Uses SGS-style equirect densification (latitude-aware thresholds, conservative capped pruning, initial-point protection) — see `doc/dev_log/20260705-002-equirect-densification-sgs-port.md`
 - V2 single-pass extra_features: all non-color attributes (normal, reflection, PBR) rasterized via one extra_features tensor
-- Geometry is frozen when loading from SGS pre-training (xyz/scaling/rotation/opacity locked)
 
 ### Perspective Training Pipeline (traditional)
 
