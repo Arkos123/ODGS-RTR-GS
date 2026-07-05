@@ -765,21 +765,23 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
         loss = loss + geom_ramp * opt.lambda_normal_render_depth * loss_normal_render_depth
 
     # ── Normal TV 平滑（替代 SGS 的二次型 smoothness） ────────
-    # 使用 L1 TV（不是 SGS 的 1-cos(θ) 二次型），因为 L1 对小角度
-    # 变化产生线性梯度，约束更强，在所有纬度上均匀生效。
-    # 水平方向用 torch.roll（cyclic 边界消除左右接缝），
-    # 垂直方向标准 padding（ERP 垂直方向有限）。
-    # 不在此处使用 row_weight / rgb_nonedge：确保极地也有足够的
-    # normal smoothness 来抑制 MSE loss 导致的旋转正反馈漂移。
+    # L2 TV with cyclic horizontal boundary: L2 penalizes small bumps
+    # quadratically, giving stronger suppression than L1 for the same lambda.
+    # 使用 row_weight 加权：极地（lat≈±90°, row_weight≈0）平滑约束
+    # 自动减轻，避免极地像素密集导致的过度平滑。
     if opt.lambda_normal_smooth > 0:
         rendered_normal = results["normal"]
-        # L2 TV with cyclic horizontal boundary: L2 penalizes small bumps
-        # quadratically (gradient ∝ Δn), giving stronger suppression than L1
-        # (gradient ∝ sign(Δn)) for the same lambda.
         dx = (torch.roll(rendered_normal, shifts=-1, dims=-1) - rendered_normal).pow(2)
         dy = torch.zeros_like(rendered_normal)
         if rendered_normal.shape[-2] > 1:
             dy[:, :-1, :] = (rendered_normal[:, 1:, :] - rendered_normal[:, :-1, :]).pow(2)
+
+        # 纬度面积加权：极地平滑约束降权，避免深度/法线极地畸变
+        if row_weight is not None:
+            w = row_weight.to(dtype=rendered_normal.dtype, device=rendered_normal.device)
+            dx = dx * w
+            dy = dy * w
+
         loss_normal_smooth = dx.mean() + dy.mean()
         tb_dict["loss_normal_smooth"] = loss_normal_smooth.item()
         loss = loss + geom_ramp * opt.lambda_normal_smooth * loss_normal_smooth

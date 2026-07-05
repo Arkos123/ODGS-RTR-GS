@@ -20,7 +20,7 @@ from utils.graphics_utils import  read_hdr, latlong_to_cubemap
 
 
 
-def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, is_pbr=False):
+def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, is_pbr=False, is_equirect=False):
 
     """
     Setup Gaussians
@@ -59,9 +59,11 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         pbr_kwargs["transfer_net"] = transfer_net
 
 
+    # equirect mode doesn't need canonical_rays (SGS rasterizer computes its own)
     if is_pbr or pipe.ref_map:
-        canonical_rays = scene.get_canonical_rays()
-        pbr_kwargs["canonical_rays"] = canonical_rays
+        if not is_equirect:
+            canonical_rays = scene.get_canonical_rays()
+            pbr_kwargs["canonical_rays"] = canonical_rays
 
         brdf_lut = get_brdf_lut().cuda()
         pbr_kwargs["brdf_lut"] = brdf_lut
@@ -117,14 +119,22 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
     envmap_base_dir = args.envmap_path
     task_dict = {
+        "directional_front_top": {
+            "capture_list": capture_list,
+            "envmap_path": envmap_base_dir + "directional_front_top.hdr",
+        },
+        "TCom_ColorfulAlley": {
+            "capture_list": capture_list,
+            "envmap_path": envmap_base_dir + "TCom_ColorfulAlley_colorful_alley_2K_hdri_sphere.exr",
+        },
         "studio": {
             "capture_list": capture_list,
             "envmap_path": envmap_base_dir + "big-studio-01_4K.exr",
         },
-        "rock-theatre": {
-            "capture_list": capture_list,
-            "envmap_path": envmap_base_dir + "rock-theatre-viewpoint_4K.exr",
-        },
+        # "rock-theatre": {
+        #     "capture_list": capture_list,
+        #     "envmap_path": envmap_base_dir + "rock-theatre-viewpoint_4K.exr",
+        # },
         "sunset": {
             "capture_list": capture_list,
             "envmap_path": envmap_base_dir + "sunset.hdr",
@@ -152,8 +162,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     }
 
 
-    # task_names = ['bridge', 'city', 'fireplace', 'forest', 'night']
-    task_names = ['rock-theatre']
+    task_names = ['studio','directional_front_top','TCom_ColorfulAlley','bridge', 'city', 'fireplace', 'forest', 'night']
+    # task_names = ['studio']
     for task_name in task_names:
         cubemap = None
         hdri = read_hdr(task_dict[task_name]["envmap_path"])
@@ -166,15 +176,25 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
         pbr_kwargs["cubemap"] = cubemap
 
-        eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, task_name)
+        # 导出当前环境贴图为 PNG（方便查看 relighting 用了什么光照）
+        envmap_dir = os.path.join(args.model_path, 'test_rli', task_name)
+        os.makedirs(envmap_dir, exist_ok=True)
+        envmap = cubemap.export_envmap(return_img=True)  # [H, W, 3], HDR
+        # Reinhard tone mapping: HDR → [0,1] 使亮部可见
+        envmap_tm = (envmap / (envmap + 1.0)).permute(2, 0, 1).clamp(0.0, 1.0)
+        save_image(envmap_tm, os.path.join(envmap_dir, "envmap.png"))
 
-        if args.save_video:
+        eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, task_name,
+                    equirect_width=getattr(args, 'equirect_width', None))
+
+        if args.save_video and not is_equirect:
             eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, task_name)
     
 
 
 
-def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, env_name, save_video = False):
+def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, env_name,
+                save_video=False, equirect_width=None):
     test_cameras = scene.getTestCameras()
 
     mkdir_flag = False
@@ -185,6 +205,10 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
         for idx in progress_bar:
             viewpoint = test_cameras[idx]
 
+            # Override camera resolution for equirect mode if --equirect_width is set
+            if equirect_width is not None:
+                viewpoint.image_width = equirect_width
+                viewpoint.image_height = equirect_width // 2
 
             results = render_fn(viewpoint, gaussians, pipe, background, opt=opt, is_training=False,
                                 dict_params=pbr_kwargs)
@@ -349,11 +373,14 @@ if __name__ == "__main__":
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument('--gui', action='store_true', default=False, help="use gui")
-    parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast'], default='render_ref')
+    parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast',
+                                                   'render_ref_equirect', 'render_ref_pbr_equirect'], default='render_ref')
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
     parser.add_argument("--occlusion_path", type=str, default=None)
     parser.add_argument('-e', '--envmap_path', default="/home/huangpengyue/projects/RTR-GS/data/env_maps/", help="Env map path")
     parser.add_argument("--save_video", action="store_true", default=False)
+    parser.add_argument("--equirect_width", type=int, default=None,
+                        help="Equirect output width (height=width/2). If not set, uses camera native resolution.")
 
     args = parser.parse_args(sys.argv[1:])
     print(f"Current model path: {args.model_path}")
@@ -364,8 +391,9 @@ if __name__ == "__main__":
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    is_pbr = args.type in ['neilf', 'neilf_blend', 'neilf_forward', 'neilf_ref_pbr', 'render_ref_pbr']
-    training(lp.extract(args), op.extract(args), pp.extract(args), is_pbr=is_pbr)
+    is_pbr = args.type in ['neilf', 'neilf_blend', 'neilf_forward', 'neilf_ref_pbr', 'render_ref_pbr', 'render_ref_pbr_equirect']
+    is_equirect = 'equirect' in args.type
+    training(lp.extract(args), op.extract(args), pp.extract(args), is_pbr=is_pbr, is_equirect=is_equirect)
 
     # All done
     print("\nTraining complete.")
