@@ -17,6 +17,13 @@ The [doc/](doc/) directory contains detailed documentation for this project, inc
 
 Check the `doc/` folder for details if you need more information.
 
+## 相关项目
+
+### 3DGS-Editor-3.0
+`/home/huangpengyue/projects/3DGS_Editor-3.0/` — 3DGS 渲染编辑工具。当前正在进行**重光照渲染能力迁移**：扩展 3DGS 模型支持 RTR-GS 格式点云（已完成 Phase 1-2），未来桥接 PRT/PBR 渲染管线、支持重光照功能。
+
+任务记录：[`.tasks/迁移重光照能力到Editor/`](.tasks/迁移重光照能力到Editor/task_plan.md)
+
 ## RTR-GS Key Algorithmic Concepts
 
 > For more details, please refer to `paper/full.md`.

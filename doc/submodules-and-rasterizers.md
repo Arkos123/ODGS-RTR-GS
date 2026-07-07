@@ -8,11 +8,11 @@ RTR-GS 项目包含 5 个子模块目录和 3 个不同的 CUDA 光栅化器，�
 
 | 目录 | 类型 | 用途 | 编译方式 |
 |------|------|------|---------|
-| `submodules/rtr_gs-rasterization/` | CUDA rasterizer | **透视模式**混合渲染（PRT + 反射贴图 + PBR） | `pip install submodules/rtr_gs-rasterization/` |
-| `submodules/spherical-gaussian-splatting/submodules/spherical-gaussian-rasterization/` | CUDA rasterizer | **等距模式**渲染（360° equirect） | `pip install submodules/spherical-gaussian-rasterization/`（在 SGS 子模块内） |
-| `submodules/diff-gaussian-rasterization/` | CUDA rasterizer | 原始 3DGS 光栅化器（baking 的轻量 cubemap 渲染用） | `pip install submodules/diff-gaussian-rasterization/` |
-| `submodules/gs-ir/` | CUDA kernels | 遮挡体素（SH 插值 + 重建） | `pip install submodules/gs-ir/` |
-| `submodules/simple-knn/` | CUDA kernel | KNN 初始化（`distCUDA2` 计算初始 scale） | `pip install submodules/simple-knn/` |
+| `submodules/rtr_gs-rasterization/` | CUDA rasterizer | **透视模式**混合渲染（PRT + 反射贴图 + PBR） | `pip install -e submodules/rtr_gs-rasterization/` |
+| `submodules/spherical-gaussian-splatting/submodules/spherical-gaussian-rasterization/` | CUDA rasterizer | **等距模式**渲染（360° equirect） | `pip install -e submodules/spherical-gaussian-rasterization/`（在 SGS 子模块内） |
+| `submodules/diff-gaussian-rasterization/` | CUDA rasterizer | 原始 3DGS 光栅化器（baking 的轻量 cubemap 渲染用） | `pip install -e submodules/diff-gaussian-rasterization/` |
+| `submodules/gs-ir/` | CUDA kernels | 遮挡体素（SH 插值 + 重建） | `pip install -e submodules/gs-ir/` |
+| `submodules/simple-knn/` | CUDA kernel | KNN 初始化（`distCUDA2` 计算初始 scale） | `pip install -e submodules/simple-knn/` |
 | `submodules/spherical-gaussian-splatting/` | 完整训练框架 | SGS 预训练（含 geometry + SH 优化） | 见其 `CLAUDE.md` |
 
 ## CUDA 光栅化器详解
@@ -47,8 +47,8 @@ RTR-GS 项目包含 5 个子模块目录和 3 个不同的 CUDA 光栅化器，�
 **关键特性**：
 - `camera_type=3`（equirectangular），`camera_type=1`（pinhole）
 - 使用径向深度（radial distance），非 Z-depth
-- 输出：`rendered_image`, `radii`, `depth_raw`, `alpha`, `normal_raw`
-- 不支持 feature tensor → `render_equirect.py` 使用多 pass 渲染策略
+- 输出：`color`, `extra`, `radii`, `depth_raw`, `alpha`, `normal_raw`（6 元组）
+- **V2 支持 extra_features**：`extra_features: [P, N]` 参数一次传入所有非颜色属性，通过 `renderDynamicChannelsCUDA` 内核在单次光栅化调用中完成渲染 — 替换了 V1 的多 pass 策略
 
 **camera_type 分发机制**（`rasterize_points.cu:108-142`）：
 - `camera_type == 1`：Pinhole，调用 `CudaRasterizer::Rasterizer::forward()`（标准 3DGS 光栅化器，与 `diff-gaussian-rasterization` 同源但代码独立，已知有 bug）
@@ -86,13 +86,14 @@ Python 端看到的是一次调用返回全部输出，GPU 上两个 kernel 串�
 - 透视（`camera_type=1`）：`depths[idx] = p_view.z`（Z-depth），见 `forward.cu:448`
 - 全景模式 `p_view` 的齐次 w 分量是到相机的欧氏距离，乘以单位射线方向即 3D 位置。
 
-**渲染管线**：多 pass 渲染（每 pass 一个颜色属性）：
-1. 前向着色 PRT 颜色
-2. 法线贴图（编码为 RGB）
-3. reflection 属性（strength + roughness + tint）
-4. PBR base color
-5. PBR packed（roughness + metallic + depth）
-6. Incident light
+**渲染管线**：V2 单次光栅化调用（extra_features 合并所有非颜色属性）：
+1. **颜色**：前向着色 PRT 颜色（含可选 forward reflection），标准 alpha blending
+2. **extra_features** `[P, N]`：法线(3) + ref_strength(1) + ref_roughness(1) + ref_tint(3) + base_color(3) + roughness(1) + metallic(1) + incident(3) = 16 通道，通过 `renderDynamicChannelsCUDA` 一次性渲染
+3. Python 端 alpha 归一化后按 offset 切片为独立属性图
+
+**V2 CUDA 新增内核**：
+- **`renderDynamicChannelsCUDA`**（forward.cu）：通用多通道特征光栅化，使用动态共享内存 `sizeof(float) * BLOCK_SIZE * feature_channels` 处理任意通道数
+- **`BACKWARD::renderChannels`**（backward.cu）：对应反向传播，`cudaFuncSetAttribute` 设置动态共享内存上限为 71KB 以支持 16 通道
 
 ### 3. diff-gaussian-rasterization（原始 3DGS）
 
@@ -127,7 +128,7 @@ render.py (perspective)
   └── gs-ir → recon_occlusion（遮挡评估）
 
 render_equirect.py (equirect)
-  ├── spherical-gaussian-rasterization → CUDA 光栅化（多 pass）
+  ├── spherical-gaussian-rasterization → CUDA 光栅化（V2：单次调用 + extra_features）
   └── gs-ir → recon_occlusion（遮挡评估）
 
 baking.py
@@ -142,15 +143,15 @@ scene/gaussian_model.py
 ## 编译顺序
 
 ```bash
-# 按依赖顺序编译：
-pip install submodules/diff-gaussian-rasterization/
-pip install submodules/simple-knn/
-pip install submodules/rtr_gs-rasterization/
-pip install submodules/gs-ir/
+# 按依赖顺序编译（-e 为 editable 安装，修改 Python 代码无需重装）：
+pip install -e submodules/diff-gaussian-rasterization/
+pip install -e submodules/simple-knn/
+pip install -e submodules/rtr_gs-rasterization/
+pip install -e submodules/gs-ir/
 # SGS 子模块内部的 rasterizer：
 cd submodules/spherical-gaussian-splatting
-pip install submodules/spherical-gaussian-rasterization/
-pip install submodules/simple-knn/
+pip install -e submodules/spherical-gaussian-rasterization/
+pip install -e submodules/simple-knn/
 ```
 
 ## 注意
