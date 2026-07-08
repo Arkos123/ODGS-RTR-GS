@@ -8,7 +8,8 @@
 ### 3DGS-Editor-3.0 (`/home/huangpengyue/projects/3DGS_Editor-3.0/`)
 - **GS 模型**：已扩展支持 RTR-GS Stage1 + Stage2 属性（共 13 个扩展字段）
 - **格式支持**：标准 3DGS + RTR-GS Stage1（96 字段）+ RTR-GS Stage2（149 字段），自动检测
-- **渲染管线**：4 种模式——自定义 CUDA、SGS pinhole、SGS equirect（尚未接入 PRT/PBR）
+- **渲染管线**：PBR equirect 重光照（CubemapLight + pbr_shading）+ 自定义 CUDA、SGS pinhole、SGS equirect
+- **调试通道**：PBR、Base Color、Roughness、Metallic、Diffuse PBR、Specular PBR、Incident Light、可见性
 - **GUI 架构**：PyQt5，左侧 ControlWidget，右侧 RenderWidget
 
 ### RTR-GS (`/home/huangpengyue/projects/RTR-GS/`)
@@ -31,14 +32,14 @@
 - [x] 导出格式自动切换（标准 3DGS / Stage1 / Stage2）
 - [ ] 加载后初始化渲染组件（transfer_net, refmap, cubemap）— 待 Phase 3
 
-### Phase 3: RTR-GS 渲染引擎桥接（进行中）
-- [ ] 将 RTR-GS 的 rendering pipeline 模块化，使其可在 3DGS-Editor 环境中调用
-  - PRT 颜色计算：view-independent diffuse + view-dependent specular
-  - 反射渲染：CubemapLight + split-sum
-  - PBR 渲染：Cook-Torrance BRDF
-- [ ] 集成到 editor 渲染管线复用 `scene.render_mode` 机制
-- [ ] 处理依赖：TransferMLP / CubemapLight 实例化
-- [ ] 支持重光照参数传递
+### Phase 3: RTR-GS 渲染引擎桥接 ✅
+- [x] PBR 渲染（Cook-Torrance BRDF） — 通过 extra_features V2 单次光栅化 + 屏幕空间 pbr_shading
+- [x] CubemapLight 实例化（load_envmap 加载 HDR）
+- [x] 集成到 editor 渲染管线（is_pbr 路由、通道切换缓存、equirect→viewport 提取）
+- [x] 支持重光照参数传递（envmap 加载/旋转、occlusion 可选加载、Occlusion on/off）
+- [ ] 反射渲染（CubemapLight + split-sum forward）— 暂未实现（fast_pbr only）
+- [ ] PRT 颜色计算（TransferMLP）— 暂未实现（仅 PBR）
+- [ ] 透视模式 PBR 渲染 — 当前仅 equirect 模式支持
 
 ### Phase 4: GUI 光照编辑
 - [ ] 光照编辑标签页/面板
@@ -73,8 +74,13 @@
 
 ## Errors Encountered
 - Simplification agent 第一次跑时 CWD 在 RTR-GS，找不到 3DGS_Editor-3.0 的文件
+- **命名冲突**：RTR-GS 的 `scene/`、`utils/`（无 `__init__.py`）与 Editor 的 `scene.py`、`utils.py` 冲突。解决方案：`sys.path.append()`（放末尾）而非 `insert(0)`，并预注册 `utils.sh_utils`/`utils.graphics_utils` 到 `sys.modules` 使内部 import 可解析
+- **CRLF 行尾**：文件混入 CRLF，导致 Edit 工具匹配失败。用 `dos2unix` 批量转换
+- **PLY 存储 pre-activation 值**：`base_color`/`roughness`/`metallic` 从 PLY 加载后需在渲染时 `torch.sigmoid()`
+- **`cubemap.shs` 形状**：实际为 `[1, 3, (sh+1)^2]` 非 `[3, (sh+1)^2]`，做 SH 乘法时需注意广播
+- **Occlusion 表面点符号**：`-ray_dirs * depth` 需要 `+ camera_center` 才得到正确世界坐标
 
 ## Status
-**Phase 1-2 ✅ 已完成** — 提交 3DGS_Editor-3.0 `1a42b4b`
-- 支持：标准 3DGS + RTR-GS Stage1(96字段) + Stage2(149字段)
-- 下一步：Phase 3 — 渲染引擎桥接
+**Phase 1-3 ✅ 已完成** — 提交 3DGS_Editor-3.0 `1a42b4b`..`746adae`
+- Phase 3 实现了 PBR equirect 重光照（不含 PRT/forward reflection）
+- 下一步：Phase 4 — GUI 光照编辑面板
