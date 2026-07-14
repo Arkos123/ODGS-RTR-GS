@@ -585,6 +585,8 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             "normal_facing": facing_vis.permute(2, 0, 1),
         }
         vis_dict["pseudo_normal"] = pseudo_normal * 0.5 + 0.5
+        if viewpoint_camera.normal is not None and viewpoint_camera.normal.abs().sum() > 1e-6:
+            vis_dict["normal_prior"] = viewpoint_camera.normal * 0.5 + 0.5
         vis_dict["ref_strength"] = rendered_ref_strength_map
         vis_dict["ref_roughness"] = rendered_ref_roughness_map
         vis_dict["ref_tint"] = rendered_ref_tint
@@ -603,6 +605,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
                 "visibility": occlusion_map.permute(2, 0, 1) if occlusion_map is not None
                               else torch.zeros_like(roughness_map).permute(2, 0, 1),
                 "incidents_light": pbr_result.get("incidents_light", torch.zeros_like(roughness_map)).permute(2, 0, 1),
+                "incident_light_raw": incident_light_map.permute(2, 0, 1),
                 "incident_light_raw": incident_light_map.permute(2, 0, 1),
                 "image_pbr": gamma_func(rendered_pbr.permute(2, 0, 1)),
             })
@@ -751,16 +754,28 @@ def calculate_loss(viewpoint_camera, pc, results, opt, env_map=None, use_ws_ssim
             tb_dict["loss_ref_strength_smooth"] = loss_ref_strength_smooth.item()
             loss = loss + geom_ramp * opt.lambda_ref_strength_smooth * loss_ref_strength_smooth
 
-    # ── Normal 一致性（MSE 拉向深度法线） ──────────────────────
-    # 把光栅化器输出的最短轴法线（rendered_normal）向深度推导
-    # 法线（pseudo_normal）拉近。pseudo_normal 使用 detach()
-    # 切断梯度，避免此 loss 反向传播到深度和 position。
-    # 注意：rotation 参数仍通过其他路径（PBR 渲染梯度）更新，
-    # 因此需要下方的 TV smooth 来防止法线无约束漂移。
+    # ── Normal 一致性（MSE 拉向 normal prior / 深度法线） ─────
+    # 优先使用 MTPano normal prior（通过 viewpoint_camera.normal 传入），
+    # 没有时才 fallback 到 depth-derived pseudo_normal。
+    # pseudo_normal / normal_prior 使用 detach() 切断梯度，
+    # 避免此 loss 反向传播到 depth 和 position。
     if opt.lambda_normal_render_depth > 0:
         rendered_normal = results["normal"]
-        pseudo_normal = results["pseudo_normal"]
-        loss_normal_render_depth = F.mse_loss(rendered_normal, pseudo_normal.detach())
+        # 检查 camera.normal 是否有有效数据
+        normal_prior = viewpoint_camera.normal
+        has_normal_prior = (normal_prior is not None
+                           and not (isinstance(normal_prior, torch.Tensor)
+                                    and normal_prior.abs().sum() < 1e-6))
+        if has_normal_prior:
+            target_normal = normal_prior.detach().to(dtype=rendered_normal.dtype, device=rendered_normal.device)
+            # 防止分辨率不匹配（训练中 crop/resize 改变大小）
+            if target_normal.shape != rendered_normal.shape:
+                target_normal = F.interpolate(target_normal.unsqueeze(0),
+                                               size=rendered_normal.shape[-2:],
+                                               mode='nearest').squeeze(0)
+        else:
+            target_normal = results["pseudo_normal"].detach()
+        loss_normal_render_depth = F.mse_loss(rendered_normal, target_normal)
         tb_dict["loss_normal_render_depth"] = loss_normal_render_depth.item()
         loss = loss + geom_ramp * opt.lambda_normal_render_depth * loss_normal_render_depth
 

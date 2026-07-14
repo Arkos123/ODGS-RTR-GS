@@ -695,9 +695,18 @@ def readCamerasFromOpenMVG(path, extrinsicsfile, cam_dict, white_background, rea
                 height = image.shape[0]
 
             fovy = focal2fov(fov2focal(fovx, width), height)
+
+            # 加载 MTPano normal prior（如果存在）
+            normal_prior = None
+            mtpano_dir = os.path.join(path, "mtpano_results", image_name)
+            if os.path.isdir(mtpano_dir):
+                npy_path = os.path.join(mtpano_dir, f"{image_name}_normal_colmap.npy")
+                if os.path.exists(npy_path):
+                    normal_prior = np.load(npy_path).transpose(1, 2, 0).astype(np.float32)
+
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx,
                                         image=image, image_path=image_path, image_name=image_name,
-                                        width=width, height=height))
+                                        width=width, height=height, normal=normal_prior))
 
     return cam_infos
 

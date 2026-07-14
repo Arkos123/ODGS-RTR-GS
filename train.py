@@ -20,6 +20,7 @@ RTR-GS 训练入口
 
 import os
 import json
+import math
 import time
 import torch
 import torch.nn.functional as F
@@ -322,6 +323,43 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                 save_vis_images(scene, render_fn, pipe, background,
                                 iteration, pbr_kwargs, is_pbr)
 
+            
+            # ── 保存场景（PLY格式） ───────────────────────────────
+            if iteration % args.save_interval == 0 or iteration == args.iterations:
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
+
+            # ── 保存checkpoint（完整训练状态，含优化器） ─────────
+            # 支持从中断点恢复训练：
+            #   - 高斯模型的状态 + 优化器状态
+            #   - 各PBR组件的状态 + 优化器状态
+            if iteration % args.checkpoint_interval == 0 or iteration == args.iterations:
+                os.makedirs(os.path.join(scene.model_path, "checkpoint"),exist_ok=True)
+                torch.save((gaussians.capture(), iteration),
+                           os.path.join(scene.model_path, "checkpoint/chkpnt" + str(iteration) + ".pth"))
+
+                for com_name, component in pbr_kwargs.items():
+                    try:
+                        torch.save((component.capture(), iteration),
+                                   os.path.join(scene.model_path, f"checkpoint/{com_name}_chkpnt" + str(iteration) + ".pth"))
+                        print("\n[ITER {}] Saving Checkpoint".format(iteration))
+                    except:
+                        pass
+
+                    print("[ITER {}] Saving {} Checkpoint".format(iteration, com_name))
+
+            # ── 可选的几何冻结（freeze_geo_from_iter） ─────────────
+            # 当达到指定迭代次数后，冻结位置优化并停止增删高斯点，
+            # 只允许微调 scale/rotation 来优化法线（最短轴）。
+            if opt.freeze_geo_from_iter > 0 and iteration == opt.freeze_geo_from_iter:
+                print(f"\n[ITER {iteration}] Freezing geometry: "
+                      f"xyz LR → 0, densification → disabled")
+                for group in gaussians.optimizer.param_groups:
+                    if group["name"] == "xyz":
+                        group['lr'] = 0
+                # 终止 densification 和 post-densification 修剪
+                opt.densify_until_iter = 0
+
             # ── Densification（高斯密化/修剪） ────────────────────
             if iteration < opt.densify_until_iter:
                 if pipe.equirect:
@@ -376,7 +414,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             # 透视模式的 densification 结束后，全景模式仍需继续修剪
             # 低不透明度高斯，防止 floater 积累。
             # 使用 SGS 风格的保守修剪（capped、保护初始点）。
-            if pipe.equirect and iteration >= opt.densify_until_iter:
+            if pipe.equirect and iteration >= opt.densify_until_iter \
+                    and not (opt.freeze_geo_from_iter > 0 and iteration >= opt.freeze_geo_from_iter):
                 if iteration > 500 and iteration % opt.densification_interval == 0:
                     gaussians.equirect_prune(
                         opt, scene.cameras_extent, iteration=iteration)
@@ -403,30 +442,6 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
                     component.step()
                 except:
                     pass
-
-            # ── 保存场景（PLY格式） ───────────────────────────────
-            if iteration % args.save_interval == 0 or iteration == args.iterations:
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-
-            # ── 保存checkpoint（完整训练状态，含优化器） ─────────
-            # 支持从中断点恢复训练：
-            #   - 高斯模型的状态 + 优化器状态
-            #   - 各PBR组件的状态 + 优化器状态
-            if iteration % args.checkpoint_interval == 0 or iteration == args.iterations:
-                os.makedirs(os.path.join(scene.model_path, "checkpoint"),exist_ok=True)
-                torch.save((gaussians.capture(), iteration),
-                           os.path.join(scene.model_path, "checkpoint/chkpnt" + str(iteration) + ".pth"))
-
-                for com_name, component in pbr_kwargs.items():
-                    try:
-                        torch.save((component.capture(), iteration),
-                                   os.path.join(scene.model_path, f"checkpoint/{com_name}_chkpnt" + str(iteration) + ".pth"))
-                        print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                    except:
-                        pass
-
-                    print("[ITER {}] Saving {} Checkpoint".format(iteration, com_name))
 
     # ── 训练完成后的处理 ─────────────────────────────────────────
     if is_pbr:
@@ -474,75 +489,98 @@ def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, 
         viewpoint = test_cameras[idx]
         render_kwargs = dict(dict_params)
         render_kwargs["iteration"] = iteration
-        render_pkg = render_fn(viewpoint, scene.gaussians, pipe, background,
-                               is_training=False, dict_params=render_kwargs)
-
-        # 核心渲染结果
-        render_img = torch.clamp(render_pkg["render"], 0.0, 1.0)
-        gt_img = torch.clamp(viewpoint.original_image.cuda(), 0.0, 1.0)
-
-        # 深度图（归一化到[0, 1]以便保存为图像）
-        depth_raw = render_pkg["depth"]
-        depth_norm = (depth_raw - depth_raw.min()) / (depth_raw.max() - depth_raw.min() + 1e-8)
-
-        # 法线（从[-1, 1]映射到[0, 1]以便可视化）
-        opacity = torch.clamp(render_pkg["opacity"], 0.0, 1.0)
-        normal = torch.clamp(render_pkg["normal"] * 0.5 + 0.5, 0.0, 1.0)
-        pseudo_normal = torch.clamp(render_pkg["pseudo_normal"] * 0.5 + 0.5, 0.0, 1.0)
-
+        # LINK ./gaussian_renderer/render_equirect.py:231
+        # LINK ./gaussian_renderer/render.py:18
         view_dir = os.path.join(vis_dir, f"view_{viewpoint.image_name}")
         os.makedirs(view_dir, exist_ok=True)
 
-        save_image(render_img, os.path.join(view_dir, "render.png"))
-        save_image(gt_img, os.path.join(view_dir, "gt.png"))
-        save_image(depth_norm, os.path.join(view_dir, "depth.png"))
-        save_image(opacity, os.path.join(view_dir, "opacity.png"))
-        save_image(normal, os.path.join(view_dir, "normal.png"))
-        save_image(pseudo_normal, os.path.join(view_dir, "pseudo_normal.png"))
+        def save_pkg(render_pkg, save_dir):
+            # 核心渲染结果
+            render_img = torch.clamp(render_pkg["render"], 0.0, 1.0)
+            gt_img = torch.clamp(viewpoint.original_image.cuda(), 0.0, 1.0)
 
-        # PBR 主结果
-        if is_pbr and "pbr" in render_pkg:
-            pbr_img = torch.clamp(render_pkg["pbr"], 0.0, 1.0)
-            save_image(pbr_img, os.path.join(view_dir, "pbr.png"))
+            # 深度图（归一化到[0, 1]以便保存为图像）
+            depth_raw = render_pkg["depth"]
+            depth_norm = (depth_raw - depth_raw.min()) / (depth_raw.max() - depth_raw.min() + 1e-8)
 
-        # 从 vis_dict 保存更多可视化中间结果
-        vis_dict = render_pkg.get("vis_dict", {})
+            # 法线（从[-1, 1]映射到[0, 1]以便可视化）
+            opacity = torch.clamp(render_pkg["opacity"], 0.0, 1.0)
+            normal = torch.clamp(render_pkg["normal"] * 0.5 + 0.5, 0.0, 1.0)
+            pseudo_normal = torch.clamp(render_pkg["pseudo_normal"] * 0.5 + 0.5, 0.0, 1.0)
 
-        # 通用可视化key（所有模式都需要）
-        core_vis_keys = [
-            "radiance_color",
-            "ref_strength", "ref_roughness", "ref_tint",
-            "ref_export_base",
-            "normal_facing",
-        ]
-        # PBR专用可视化key
-        pbr_vis_keys = [
-            "base_color", "roughness", "metallic",
-            "diffuse_pbr", "specular_pbr", "image_pbr",
-            "visibility",
-            "incidents_light", "incident_light_raw",
-            "env_export_base", "env_export_diffuse",
-        ]
+            save_image(render_img, os.path.join(save_dir, "render.png"))
+            save_image(gt_img, os.path.join(save_dir, "gt.png"))
+            save_image(depth_norm, os.path.join(save_dir, "depth.png"))
+            save_image(opacity, os.path.join(save_dir, "opacity.png"))
+            save_image(normal, os.path.join(save_dir, "normal.png"))
+            save_image(pseudo_normal, os.path.join(save_dir, "pseudo_normal.png"))
 
-        keys_to_save = core_vis_keys + (pbr_vis_keys if is_pbr else [])
-        for key in keys_to_save:
-            if key in vis_dict:
-                save_image(
-                    torch.clamp(vis_dict[key], 0.0, 1.0),
-                    os.path.join(view_dir, f"{key}.png"))
+            # PBR 主结果
+            if is_pbr and "pbr" in render_pkg:
+                pbr_img = torch.clamp(render_pkg["pbr"], 0.0, 1.0)
+                save_image(pbr_img, os.path.join(save_dir, "pbr.png"))
 
-        # Equirect → cubemap 六面转换
-        # 方便在标准3D查看器中检查全景渲染质量
+            # 从 vis_dict 保存更多可视化中间结果
+            vis_dict = render_pkg.get("vis_dict", {})
+
+            # 通用可视化key（所有模式都需要）
+            core_vis_keys = [
+                "radiance_color",
+                "ref_strength", "ref_roughness", "ref_tint",
+                "ref_export_base",
+                "normal_facing", "normal_prior",
+            ]
+            # PBR专用可视化key
+            pbr_vis_keys = [
+                "base_color", "roughness", "metallic",
+                "diffuse_pbr", "specular_pbr", "image_pbr",
+                "visibility",
+                "incidents_light", "incident_light_raw",
+                "env_export_base", "env_export_diffuse",
+            ]
+
+            keys_to_save = core_vis_keys + (pbr_vis_keys if is_pbr else [])
+            for key in keys_to_save:
+                if key in vis_dict:
+                    save_image(
+                        torch.clamp(vis_dict[key], 0.0, 1.0),
+                        os.path.join(save_dir, f"{key}.png"))
+
+
+
+        render_pkg = render_fn(viewpoint, scene.gaussians, pipe, background,
+                               is_training=False, dict_params=render_kwargs)
+        save_pkg(render_pkg, view_dir)
         if getattr(pipe, 'equirect', False):
-            cubemap_dir = os.path.join(view_dir, "cubemap")
-            os.makedirs(cubemap_dir, exist_ok=True)
-            face_names = ["posx", "negx", "posy", "negy", "posz", "negz"]
-            cubemap = latlong_to_cubemap_equirect(
-                render_img.permute(1, 2, 0), [512, 512])
-            for face_idx in range(6):
-                face_img = cubemap[face_idx].permute(2, 0, 1)
-                save_image(face_img, os.path.join(
-                    cubemap_dir, f"{face_names[face_idx]}.png"))
+            # 额外渲染perspective：复制equirect相机的位姿(R,T)，改用针孔FOV与分辨率
+            from scene.cameras import Camera
+            fov_x = math.radians(120.0)   # ≈ 1.0472
+            fov_y = 2 * math.atan(math.tan(fov_x * 0.5) * 500 / 1000)  # 保持方形像素 fx=fy
+            persp_viewpoint = Camera(
+                colmap_id=viewpoint.colmap_id, R=viewpoint.R, T=viewpoint.T,
+                FoVx=fov_x, FoVy=fov_y,
+                fx=None, fy=None, cx=None, cy=None,
+                image_name=viewpoint.image_name, uid=viewpoint.uid,
+                trans=viewpoint.trans, scale=viewpoint.scale,
+                height=500, width=1000, render_only=True,
+            )
+            render_kwargs["canonical_rays"] = persp_viewpoint.get_canonical_rays()
+            render_pkg2 = render_fn_dict["render_ref"](persp_viewpoint, scene.gaussians, pipe, background,
+                                is_training=False, dict_params=render_kwargs)
+            view_dir2 = os.path.join(view_dir, "perspective")
+            os.makedirs(view_dir2, exist_ok=True)
+            save_pkg(render_pkg2, view_dir2)
+            # # Equirect → cubemap 六面转换
+            # # 方便在标准3D查看器中检查全景渲染质量
+            # cubemap_dir = os.path.join(view_dir, "cubemap")
+            # os.makedirs(cubemap_dir, exist_ok=True)
+            # face_names = ["posx", "negx", "posy", "negy", "posz", "negz"]
+            # cubemap = latlong_to_cubemap_equirect(
+            # render_img.permute(1, 2, 0), [512, 512])
+            # for face_idx in range(6):
+            #     face_img = cubemap[face_idx].permute(2, 0, 1)
+            #     save_image(face_img, os.path.join(
+            #         cubemap_dir, f"{face_names[face_idx]}.png"))
 
     torch.cuda.empty_cache()
 
