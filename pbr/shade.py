@@ -490,13 +490,13 @@ def point_light_shading(
         G = G_vis * G_light
 
         # Fresnel (Schlick)
-        F = F0 + (1.0 - F0) * (1.0 - HoV).pow(5)
+        fresnel_val = F0 + (1.0 - F0) * (1.0 - HoV).pow(5)
 
         # Specular
-        specular = NDF * G * F / (4.0 * NoV * NoL + 1e-6)
+        specular = NDF * G * fresnel_val / (4.0 * NoV * NoL + 1e-6)
 
         # Diffuse
-        kd = (1.0 - F) * (1.0 - metallic) if metallic is not None else (1.0 - F)
+        kd = (1.0 - fresnel_val) * (1.0 - metallic) if metallic is not None else (1.0 - fresnel_val)
         diffuse = kd * albedo / torch.pi
 
         # Combine
