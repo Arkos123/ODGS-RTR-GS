@@ -54,7 +54,7 @@ def get_depth_cubemap(
     """
     从光源位置渲染 6 张深度图组成 cubemap。
 
-    使用 diff_gaussian_rasterization._C.lite_rasterize_gaussians
+    使用 baking.py 相同的 lite_rasterize_gaussians 调用方式，
     配合 argmax_depth=True 保证深度来自最近（贡献最大）的高斯。
 
     Args:
@@ -65,13 +65,13 @@ def get_depth_cubemap(
     Returns:
         depth_cubemap: [6, res, res, 1] 深度 cubemap
     """
-    bg = torch.zeros(3, device="cuda")
+    bg_color = torch.zeros(3, device="cuda")
     proj_matrix = getProjectionMatrix(
         znear=znear, zfar=zfar, fovX=torch.pi * 0.5, fovY=torch.pi * 0.5
     ).transpose(0, 1).cuda()
 
     means3D = gaussians.get_xyz
-    colors_precomp = torch.tensor([], device="cuda")  # not used
+    shs = gaussians.get_shs
 
     depth_faces = []
     for rot in CUBEMAP_ROTATIONS:
@@ -79,34 +79,35 @@ def get_depth_cubemap(
         c2w = rot.clone()
         c2w[:3, 3] = light_pos
         w2c = torch.inverse(c2w)
-        T = w2c[:3, 3]
-        R = w2c[:3, :3].T
-        world_view_transform = _getWorld2ViewTorch(R, T).transpose(0, 1)
-        full_proj_transform = (world_view_transform.unsqueeze(0).bmm(
-            proj_matrix.unsqueeze(0))).squeeze(0)
-        cam_center = world_view_transform.inverse()[3, :3]
+        # baking.py 风格：w2c.T 作为 viewmatrix
+        world_view_transform = w2c.T
+        full_proj_transform = (
+            world_view_transform.unsqueeze(0).bmm(proj_matrix.unsqueeze(0))
+        ).squeeze(0)
+        camera_center = light_pos  # baking.py 直接用 position
 
-        args = (
-            bg,
+        input_args = (
+            bg_color,
             means3D,
-            colors_precomp,
+            torch.zeros_like(means3D),   # colors_precomp / features dummy
             gaussians.get_opacity,
             gaussians.get_scaling,
             gaussians.get_rotation,
-            colors_precomp,  # cov3D_precomp
+            torch.Tensor([]),            # cov3D_precomp empty
+            shs,                         # SH coefficients
+            camera_center,
             world_view_transform,
             full_proj_transform,
-            cam_center,
-            1.0,              # tanfovx
-            1.0,              # tanfovy
-            1.0,              # scale_modifier
-            res,              # height
-            res,              # width
+            1.0,                         # scale_modifier
+            1.0,                         # tanfovx
+            1.0,                         # tanfovy
+            res,                         # height
+            res,                         # width
             gaussians.active_sh_degree,
-            False,            # prefiltered
-            True,             # argmax_depth ← 关键！
+            False,                       # prefiltered
+            True,                        # argmax_depth ← 关键！
         )
-        _, _, _, _, depth_map = diff_C.lite_rasterize_gaussians(*args)
+        _, _, _, _, depth_map = diff_C.lite_rasterize_gaussians(*input_args)
         depth_faces.append(depth_map.permute(1, 2, 0))  # [res, res, 1]
 
     depth_cubemap = torch.stack(depth_faces, dim=0)  # [6, res, res, 1]
@@ -191,7 +192,7 @@ def make_shadow_func_cubemap(
 
         closest_depth = dr.texture(
             depth_cubemap,
-            (-dir_to_light).contiguous(),  # cubemap 方向从光源→表面，需要取反
+            (-dir_to_light).unsqueeze(0).contiguous(),  # [1, H, W, 3]
             filter_mode="linear",
             boundary_mode="cube",
         )[0, ...]  # [H, W, 1]
