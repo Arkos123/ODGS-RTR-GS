@@ -6,7 +6,7 @@ Equirect 模式：从光源位置渲染单张全景深度图，用方向→UV �
 
 参考 GS-IR/shadow_map.py:get_depth_cubemap()
 """
-from typing import Callable, List, Tuple
+from typing import Callable
 
 import nvdiffrast.torch as dr
 import torch
@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from diff_gaussian_rasterization import _C as diff_C
 from scene.gaussian_model import GaussianModel
 from spherical_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from scene.cameras import Camera
 from utils.graphics_utils import getProjectionMatrix
 
 
@@ -186,7 +185,6 @@ def make_shadow_func_cubemap(
 
     def shadow_func(points: torch.Tensor) -> torch.Tensor:
         """逐像素阴影查询"""
-        H, W, _ = points.shape
         dir_to_light = F.normalize(light_pos[None, None, :] - points, dim=-1)
         dist = torch.norm(light_pos[None, None, :] - points, dim=-1, keepdim=True)
 
@@ -211,12 +209,9 @@ def make_shadow_func_equirect(
     创建 equirect 模式的阴影查询函数。
     方向向量 → (lat, lon) → equirect UV → grid_sample 查深度。
     """
-    # 预计算 equirect UV 网格（用于 grid_sample）
-    H, W = depth_erp.shape[1:]
-
     def shadow_func(points: torch.Tensor) -> torch.Tensor:
         """逐像素阴影查询（equirect）"""
-        H, W, _ = points.shape
+        _, H, W = points.shape
         dir_to_light = F.normalize(light_pos[None, None, :] - points, dim=-1)
         dist = torch.norm(light_pos[None, None, :] - points, dim=-1, keepdim=True)
 
