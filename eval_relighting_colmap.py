@@ -611,7 +611,7 @@ def eval_render_video_equirect(scene, gaussians, render_fn, pipe, background, op
                         continue
                     theta = np.radians(rotate_total * fraction)
                     c, s = np.cos(theta), np.sin(theta)
-                    new_pos = pivot + torch.tensor([radius * c, 0.0, radius * s], device=pivot.device)
+                    new_pos = pivot + torch.tensor([radius * c, 0.0, radius * s], dtype=pivot.dtype, device=pivot.device)
                     rotated_lights.append(PointLight(position=new_pos, color=pbr_kwargs["point_lights"][li].color, intensity=pbr_kwargs["point_lights"][li].intensity))
                     # Re-bake shadow map from rotated position
                     if eq_mode:
