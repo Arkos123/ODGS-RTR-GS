@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn.functional as F
 from arguments import OptimizationParams
-from pbr.shade import get_reflectance_color_forward, pbr_shading
+from pbr.shade import get_reflectance_color_forward, pbr_shading, point_light_shading
 from scene.gaussian_model import GaussianModel
 from scene.cameras import Camera
 from utils.prt_utils import PRTutils
@@ -512,6 +512,23 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         rendered_pbr = pbr_result["render_rgb"]
         diffuse_pbr = pbr_result["diffuse_rgb"]
         specular_pbr = pbr_result["specular_rgb"]
+
+        # ── Point light overlay ──────────────────────────────────────────────
+        point_lights = dict_params.get("point_lights", None) if dict_params else None
+        if point_lights and len(point_lights) > 0:
+            surf_points = points.reshape(H, W, 3)  # [HW, 3] → [H, W, 3]
+            point_rgb = point_light_shading(
+                lights=point_lights,
+                points=surf_points,
+                normals=normal_map,
+                view_dirs=view_dirs,
+                albedo=base_color_map,
+                roughness=roughness_map,
+                metallic=metallic_map if pipe.metallic else None,
+                shadow_funcs=dict_params.get("point_light_shadow_funcs", None),
+            )
+            point_rgb = point_rgb * opacity_map
+            rendered_pbr = rendered_pbr + point_rgb
 
         # PBR output is NOT pre-multiplied; blend with background via opacity.
         # Detach opacity from PBR gradient — PBR should not optimize opacity.

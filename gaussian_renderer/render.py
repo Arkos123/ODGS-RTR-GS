@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn.functional as F
 from arguments import OptimizationParams
-from pbr.shade import get_reflectance_color, get_reflectance_color_forward, pbr_shading
+from pbr.shade import get_reflectance_color, get_reflectance_color_forward, pbr_shading, point_light_shading
 from scene.gaussian_model import GaussianModel
 from scene.cameras import Camera
 from utils.prt_utils import PRTutils
@@ -268,7 +268,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
     viewdirs = F.normalize(viewpoint_camera.camera_center - means3D, dim=-1)
 
     # 如果使用前向着色模式（forward shading）：在光栅化前计算反射颜色
-    if pipe.forward_shading:
+    if pipe.forward_shading and colors_precomp is not None:
         # 高斯级：高斯指向相机
         view_dirs = F.normalize(viewpoint_camera.camera_center.repeat(means3D.shape[0], 1) - means3D, dim=-1)
         # 使用前向着色计算反射颜色（基于反射贴图、法线、粗糙度、色调）
@@ -313,14 +313,14 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             # 重光照模式：使用新的光照条件
             if pipe.transfer_light:
                 # 可能有bug？
-                pass
-                # # 传输光照模式：将环境贴图的SH系数与传输SH系数相乘
-                # transfer_shs = pc.get_incidents.permute(0, 2, 1)  # 传输SH系数
-                # light_shs = cubemap.shs                           # 环境贴图SH系数
-                # incidents = light_shs * transfer_shs              # 相乘得到新的入射光
-                # incidents = incidents.permute(0, 2, 1)
-                # # 评估SH系数，得到重光照后的入射光
-                # incidents_light = torch.clamp(eval_sh(pc.active_sh_degree, incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2), normal), 0.0, 1.0)
+                # pass
+                # 传输光照模式：将环境贴图的SH系数与传输SH系数相乘
+                transfer_shs = pc.get_incidents.permute(0, 2, 1)  # 传输SH系数
+                light_shs = cubemap.shs                           # 环境贴图SH系数
+                incidents = light_shs * transfer_shs              # 相乘得到新的入射光
+                incidents = incidents.permute(0, 2, 1)
+                # 评估SH系数，得到重光照后的入射光
+                incidents_light = torch.clamp(eval_sh(pc.active_sh_degree, incidents.transpose(1, 2).view(-1, 3, (pc.max_sh_degree + 1) ** 2), normal), 0.0, 1.0)
             else:
                 # 非传输模式：入射光为零
                 incidents_light = torch.zeros_like(base_color)
@@ -511,7 +511,23 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
 
         diffuse_pbr = pbr_result["diffuse_rgb"]             # 漫反射分量 [H, W, 3]
         specular_pbr = pbr_result["specular_rgb"]           # 镜面反射分量 [H, W, 3]
-        occulusion_incident_light = pbr_result["incidents_light"]  # 遮挡后的间接漫反射光照 [H, W, 3]
+        occulusion_incident_light = pbr_result["incidents_light"]
+        # ── Point light overlay ──────────────────────────────────────────────
+        point_lights = dict_params.get("point_lights", None) if dict_params else None
+        if point_lights and len(point_lights) > 0:
+            surf_points = rendered_surface_xyz.permute(1, 2, 0)  # [3, H, W] → [H, W, 3]
+            point_rgb = point_light_shading(
+                lights=point_lights,
+                points=surf_points,
+                normals=normal_map,
+                view_dirs=view_dirs,
+                albedo=base_color_map,
+                roughness=roughness_map,
+                metallic=metallic_map if pipe.metallic else None,
+                shadow_funcs=dict_params.get("point_light_shadow_funcs", None),
+            )
+            point_rgb = point_rgb * opacity_map
+            rendered_pbr = rendered_pbr + point_rgb  # 遮挡后的间接漫反射光照 [H, W, 3]
 
 
         # 应用透明度，混合背景色
