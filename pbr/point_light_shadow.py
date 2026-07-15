@@ -211,7 +211,6 @@ def make_shadow_func_equirect(
     """
     def shadow_func(points: torch.Tensor) -> torch.Tensor:
         """逐像素阴影查询（equirect）"""
-        _, H, W = points.shape
         dir_to_light = F.normalize(light_pos[None, None, :] - points, dim=-1)
         dist = torch.norm(light_pos[None, None, :] - points, dim=-1, keepdim=True)
 
