@@ -166,6 +166,7 @@ def get_depth_equirect(
         rotations=gaussians.get_rotation,
         cov3D_precomp=None,
     )
+    depth_raw[depth_raw == 0] = depth_raw.max()
     return depth_raw  # [1, H, W]
 
 
@@ -190,7 +191,7 @@ def make_shadow_func_cubemap(
 
         closest_depth = dr.texture(
             depth_cubemap,
-            dir_to_light.contiguous(),
+            (-dir_to_light).contiguous(),  # cubemap 方向从光源→表面，需要取反
             filter_mode="linear",
             boundary_mode="cube",
         )[0, ...]  # [H, W, 1]
@@ -211,17 +212,18 @@ def make_shadow_func_equirect(
     """
     def shadow_func(points: torch.Tensor) -> torch.Tensor:
         """逐像素阴影查询（equirect）"""
-        dir_to_light = F.normalize(light_pos[None, None, :] - points, dim=-1)
+        # 从光源指向表面的方向 = normalize(P - L)
+        dir_from_light = F.normalize(points - light_pos[None, None, :], dim=-1)
         dist = torch.norm(light_pos[None, None, :] - points, dim=-1, keepdim=True)
 
         # 方向 → equirect UV（COLMAP space: +Y down, +Z forward）
-        # lat = asin(-y), lon = atan2(x, z)
-        lat = torch.asin((-dir_to_light[..., 1]).clamp(-1.0, 1.0))
-        lon = torch.atan2(dir_to_light[..., 0], dir_to_light[..., 2])
+        # lat = asin(-y), light_postracketlon = atan2(x, z)
+        lat = torch.asin((-dir_from_light[..., 1]).clamp(-1.0, 1.0))
+        lon = torch.atan2(dir_from_light[..., 0], dir_from_light[..., 2])
 
-        # 纬度: lat∈[-π/2,π/2] → v∈[0,1]（图像从上到下）
-        # 经度: lon∈[-π,π]   → u∈[0,1]（图像从左到右）
-        v = (lat / (torch.pi / 2) + 1.0) * 0.5  # [H, W]
+        # 纬度: lat∈[-π/2,π/2] → v∈[0,1]（图像从上到下，SGS light_postop 行=物理上方）
+        # SGS rasterizer 第0行对应 lat=+π/2（物理上方），所以 v=0 应映射到 lat=+π/2
+        v = 0.5 - (lat / torch.pi)  # [H, W]
         u = (lon / torch.pi + 1.0) * 0.5         # [H, W]
 
         # grid_sample 需要 [-1, 1] 范围
