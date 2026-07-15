@@ -25,6 +25,7 @@ def load_point_lights(config_path: str):
     每个光源支持可选字段：
       radius: float — 视频逐帧水平旋转半径（默认 0，不旋转）
       rotate_total: float — 视频总旋转角度（度，默认 360）
+      shadow_bias: float — 阴影深度偏移（默认 0.3），越大越不容易产生自阴影黑斑
     COLMAP 空间：+Y 向下，旋转在 XZ 水平面进行。
     """
     import json
@@ -32,6 +33,7 @@ def load_point_lights(config_path: str):
         data = json.load(f)
     lights = []
     orbits = []
+    biases = []
     for item in data["lights"]:
         pos = torch.tensor(item["position"], dtype=torch.float32, device="cuda")
         col = torch.tensor(item["color"], dtype=torch.float32, device="cuda")
@@ -39,7 +41,60 @@ def load_point_lights(config_path: str):
         radius = item.get("radius", 0.0)
         rotate_total = item.get("rotate_total", 360.0)
         orbits.append((radius, rotate_total))
-    return lights, orbits
+        biases.append(item.get("shadow_bias", 0.3))
+    return lights, orbits, biases
+
+
+def _draw_light_indicator(
+    image: torch.Tensor,  # [3, H, W] RGB 图像，值域 [0,1]
+    lights: List[PointLight],
+    camera,
+    is_equirect: bool = False,
+    color: tuple = (1.0, 0.2, 0.1),
+    radius: int = 20,
+) -> torch.Tensor:
+    """在渲染图像上叠加点光源位置指示光球，方便确认光源位置。"""
+    import math
+    H, W = image.shape[1:]
+    img = image.clone()
+    for light in lights:
+        pos = light.position
+        if is_equirect:
+            # Equirect 投影：方向 → (lon, lat)
+            # 相机在原点时，方向向量 = normalize(light_pos - camera_pos)
+            cam_center = camera.camera_center
+            d = pos - cam_center
+            d = d / d.norm()
+            lat = torch.asin((-d[1]).clamp(-1.0, 1.0))
+            lon = torch.atan2(d[0], d[2])
+            px = (lon / math.pi + 1.0) * 0.5 * W
+            py = (0.5 - lat / math.pi) * H
+        else:
+            # Perspective 投影：使用 view-projection 矩阵
+            import torch.nn.functional as F
+            p_h = torch.cat([pos, torch.tensor([1.0], device=pos.device)])
+            p_clip = camera.full_proj_transform @ p_h
+            p_ndc = p_clip[:2] / p_clip[3]
+            px = (p_ndc[0] + 1.0) * 0.5 * W
+            py = (p_ndc[1] + 1.0) * 0.5 * H
+        px = int(px.item())
+        py = int(py.item())
+        # 在图像边界内才绘制
+        if 0 <= px < W and 0 <= py < H:
+            # 绘制外圈光晕（高斯衰减）
+            import numpy as np
+            ys = torch.arange(max(0, py - radius * 2), min(H, py + radius * 2 + 1), device=image.device)
+            xs = torch.arange(max(0, px - radius * 2), min(W, px + radius * 2 + 1), device=image.device)
+            gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+            dist = ((gx - px) ** 2 + (gy - py) ** 2).float()
+            glow = torch.exp(-dist / (radius * radius))
+            for c in range(3):
+                img[c, gy, gx] = img[c, gy, gx] * (1 - glow * 0.5) + color[c] * glow * 0.5
+            # 绘制内核（实心圆）
+            inner = dist < radius * radius * 0.25
+            for c in range(3):
+                img[c, gy, gx] = torch.where(inner, color[c], img[c, gy, gx])
+    return img
 
 
 def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, is_pbr=False, is_equirect=False):
@@ -142,7 +197,7 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
 
     # Point lights
     if args.point_lights_config:
-        point_lights, orbits = load_point_lights(args.point_lights_config)
+        point_lights, orbits, biases = load_point_lights(args.point_lights_config)
         pbr_kwargs["point_lights"] = point_lights
         has_orbit = any(r > 0 for r, _ in orbits)
         if has_orbit:
@@ -157,15 +212,17 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         is_equirect_mode = getattr(args, 'equirect_width', None) is not None
         shadow_funcs = []
         for i, light in enumerate(point_lights):
+            bias = biases[i] if i < len(biases) else 0.3
             if is_equirect_mode:
                 depth_map = get_depth_equirect(gaussians, light.position)
-                shadow_fn = make_shadow_func_equirect(depth_map, light.position)
+                shadow_fn = make_shadow_func_equirect(depth_map, light.position, threshold=bias)
             else:
                 depth_map = get_depth_cubemap(gaussians, light.position)
-                shadow_fn = make_shadow_func_cubemap(depth_map, light.position)
+                shadow_fn = make_shadow_func_cubemap(depth_map, light.position, threshold=bias)
             shadow_funcs.append(shadow_fn)
-            print(f"  [shadow] Light {i}: depth map ready")
+            print(f"  [shadow] Light {i}: depth map ready (bias={bias})")
         pbr_kwargs["point_light_shadow_funcs"] = shadow_funcs
+        pbr_kwargs["_point_light_biases"] = biases
 
     """ Prepare render function and bg"""
     render_fn = render_fn_dict[args.type]
@@ -304,7 +361,12 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
                 image_pbr = results["pbr"]
                 image_pbr = torch.clamp(image_pbr, 0.0, 1.0)
 
-
+            # ── 点光源位置指示光球 ──
+            point_lights = pbr_kwargs.get("point_lights", None) if pbr_kwargs else None
+            if args.point_light_vis and point_lights and len(point_lights) > 0:
+                image_pbr = _draw_light_indicator(
+                    image_pbr, point_lights, viewpoint,
+                    is_equirect=(equirect_width is not None))
 
             write_image_dict = {}
             write_image_dict.update({
@@ -530,7 +592,7 @@ def eval_render_video_equirect(scene, gaussians, render_fn, pipe, background, op
     print('equirect_size: H:', H, 'W:', W)
 
     # 按场景尺寸的~10%作为运动半径，保持相机朝向不变，产生视差效果
-    radius = scene.cameras_extent * 0.10
+    radius = scene.cameras_extent * 0.03
     n_frames = 120  # 5s at 24fps
 
     # ---- 光源旋转参数 ----
@@ -604,22 +666,24 @@ def eval_render_video_equirect(scene, gaussians, render_fn, pipe, background, op
                 rotated_lights = []
                 rotated_shadow_funcs = []
                 for li, (pivot) in enumerate(pbr_kwargs["_point_light_pivots"]):
-                    radius, rotate_total = point_light_orbits[li]
-                    if radius <= 0 or rotate_total == 0:
+                    orbit_radius, orbit_total = point_light_orbits[li]
+                    if orbit_radius <= 0 or orbit_total == 0:
                         rotated_lights.append(pbr_kwargs["point_lights"][li])
                         rotated_shadow_funcs.append(pbr_kwargs["point_light_shadow_funcs"][li])
                         continue
-                    theta = np.radians(rotate_total * fraction)
+                    theta = np.radians(orbit_total * fraction)
                     c, s = np.cos(theta), np.sin(theta)
-                    new_pos = pivot + torch.tensor([radius * c, 0.0, radius * s], dtype=pivot.dtype, device=pivot.device)
+                    new_pos = pivot + torch.tensor([orbit_radius * c, 0.0, orbit_radius * s], dtype=pivot.dtype, device=pivot.device)
                     rotated_lights.append(PointLight(position=new_pos, color=pbr_kwargs["point_lights"][li].color, intensity=pbr_kwargs["point_lights"][li].intensity))
                     # Re-bake shadow map from rotated position
+                    _biases = pbr_kwargs.get("_point_light_biases", [])
+                    _bias = _biases[li] if li < len(_biases) else 0.3
                     if eq_mode:
                         dm = get_depth_equirect(gaussians, new_pos)
-                        rotated_shadow_funcs.append(make_shadow_func_equirect(dm, new_pos))
+                        rotated_shadow_funcs.append(make_shadow_func_equirect(dm, new_pos, threshold=_bias))
                     else:
                         dm = get_depth_cubemap(gaussians, new_pos)
-                        rotated_shadow_funcs.append(make_shadow_func_cubemap(dm, new_pos))
+                        rotated_shadow_funcs.append(make_shadow_func_cubemap(dm, new_pos, threshold=_bias))
                 pbr_kwargs["point_lights"] = rotated_lights
                 pbr_kwargs["point_light_shadow_funcs"] = rotated_shadow_funcs
 
@@ -627,6 +691,13 @@ def eval_render_video_equirect(scene, gaussians, render_fn, pipe, background, op
                                 dict_params=pbr_kwargs)
             image_pbr = results["pbr"]
             image_pbr = torch.clamp(image_pbr, 0.0, 1.0)
+
+            # ── 点光源位置指示光球（视频每帧） ──
+            v_point_lights = pbr_kwargs.get("point_lights", None) if pbr_kwargs else None
+            if args.point_light_vis and v_point_lights and len(v_point_lights) > 0:
+                image_pbr = _draw_light_indicator(
+                    image_pbr, v_point_lights, custom_cam,
+                    is_equirect=(equirect_width is not None))
 
             # 确保宽高为偶数（视频编码要求）
             H_actual, W_actual = image_pbr.shape[1], image_pbr.shape[2]
@@ -687,6 +758,8 @@ if __name__ == "__main__":
                              "diffuse, specular, roughness, metallic, occlusion, incident light, etc.)")
     parser.add_argument("--point_lights_config", type=str, default=None,
                         help="点光源 JSON 配置文件路径")
+    parser.add_argument("--point_light_vis", action="store_true", default=False,
+                        help="在渲染图像上绘制点光源位置指示光球")
 
     args = parser.parse_args(sys.argv[1:])
     print(f"Current model path: {args.model_path}")
