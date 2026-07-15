@@ -1,13 +1,13 @@
 import os
 import math
-from typing import Dict, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 import nvdiffrast.torch as dr
 import torch
 import torch.nn.functional as F
 
-from .light import CubemapLight
+from .light import CubemapLight, PointLight
 
 
 # Lazarov 2013, "Getting More Physical in Call of Duty: Black Ops II"
@@ -417,3 +417,96 @@ def pbr_shading(
     )
 
     return results
+
+
+def point_light_shading(
+    lights: List[PointLight],
+    points: torch.Tensor,       # [H, W, 3] 表面世界坐标
+    normals: torch.Tensor,      # [H, W, 3]
+    view_dirs: torch.Tensor,    # [H, W, 3]
+    albedo: torch.Tensor,       # [H, W, 3]
+    roughness: torch.Tensor,    # [H, W, 1]
+    metallic: Optional[torch.Tensor] = None,  # [H, W, 1]
+    shadow_funcs: Optional[List[Callable]] = None,  # 每个光源对应的阴影函数, None=无阴影
+) -> torch.Tensor:              # [H, W, 3] 所有点光源的累计贡献
+    """
+    点光源 PBR 着色。对每个光源独立计算 Cook-Torrance BRDF + 距离衰减，
+    求和后返回。
+
+    Args:
+        lights: 点光源列表
+        points: 表面 3D 位置 [H, W, 3]
+        normals: 表面法线 [H, W, 3]
+        view_dirs: 视图方向（表面到相机）[H, W, 3]
+        albedo: 基础颜色 [H, W, 3]
+        roughness: 粗糙度 [H, W, 1]
+        metallic: 金属度 [H, W, 1] 或 None
+        shadow_funcs: 每个光源对应的阴影查询函数, callable(points) -> [H, W, 1]
+                      阴影函数创建时已绑定对应的 depth_map 和 light_pos。
+                      None 或长度不足时对应光源无阴影。
+    Returns:
+        combined_rgb: [H, W, 3] 累加后的点光源颜色
+    """
+    H, W, _ = points.shape
+    device = points.device
+    combined_rgb = torch.zeros(H, W, 3, device=device)
+
+    for i, light in enumerate(lights):
+        # 光源方向 & 距离衰减
+        to_light = light.position[None, None, :] - points  # [H, W, 3]
+        light_dir = F.normalize(to_light, dim=-1)
+        distance = torch.norm(to_light, dim=-1, keepdim=True).clamp(min=1e-4)
+        attenuation = 1.0 / (distance * distance)
+        radiance = light.color[None, None, :] * light.intensity * attenuation  # [H, W, 3]
+
+        # NoL
+        NoL = saturate_dot(normals, light_dir)  # [H, W, 1]
+
+        # Half vector
+        half_dir = F.normalize(light_dir + view_dirs, dim=-1)
+        HoV = saturate_dot(half_dir, view_dirs)  # [H, W, 1]
+        NoH = saturate_dot(normals, half_dir)    # [H, W, 1]
+        NoV = saturate_dot(normals, view_dirs)   # [H, W, 1]
+
+        # F0
+        if metallic is None:
+            F0 = torch.ones_like(albedo) * 0.04
+        else:
+            F0 = (1.0 - metallic) * 0.04 + albedo * metallic
+
+        # Cook-Torrance BRDF
+        alpha = roughness * roughness
+        alpha2 = alpha * alpha
+
+        # NDF (GGX)
+        NoH2 = NoH * NoH
+        denom = (NoH2 * (alpha2 - 1.0) + 1.0)
+        NDF = alpha2 / (torch.pi * denom * denom + 1e-6)
+
+        # Geometry (Smith GGX)
+        k = (roughness + 1.0).pow(2) / 8.0
+        G_vis = NoV / (NoV * (1.0 - k) + k + 1e-6)
+        G_light = NoL / (NoL * (1.0 - k) + k + 1e-6)
+        G = G_vis * G_light
+
+        # Fresnel (Schlick)
+        F = F0 + (1.0 - F0) * (1.0 - HoV).pow(5)
+
+        # Specular
+        specular = NDF * G * F / (4.0 * NoV * NoL + 1e-6)
+
+        # Diffuse
+        kd = (1.0 - F) * (1.0 - metallic) if metallic is not None else (1.0 - F)
+        diffuse = kd * albedo / torch.pi
+
+        # Combine
+        rgb = (diffuse + specular) * radiance * NoL
+
+        # Shadow（每个光源独立查询，阴影函数已绑定对应的 depth_map 和 light_pos）
+        if shadow_funcs is not None and i < len(shadow_funcs) and shadow_funcs[i] is not None:
+            shadow = shadow_funcs[i](points)
+            rgb = rgb * (1.0 - shadow * 0.7)
+
+        combined_rgb = combined_rgb + rgb
+
+    return combined_rgb

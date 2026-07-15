@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import List, Optional
 
 import cv2
@@ -291,3 +292,11 @@ class CubemapLight(nn.Module):
                 print("Not loading optimizer state_dict!")
 
         return first_iter
+
+
+@dataclass
+class PointLight:
+    """点光源：位置 + 颜色 + 强度"""
+    position: torch.Tensor  # [3] 世界坐标
+    color: torch.Tensor     # [3] RGB 线性颜色
+    intensity: float = 1.0
