@@ -13,11 +13,24 @@ from arguments import ModelParams, PipelineParams, OptimizationParams
 
 from utils.graphics_utils import focal2fov, fov2focal
 from torchvision.utils import save_image
-from pbr import CubemapLight, get_brdf_lut
+from pbr import CubemapLight, PointLight, get_brdf_lut
+from pbr.point_light_shadow import get_depth_cubemap, get_depth_equirect, make_shadow_func_cubemap, make_shadow_func_equirect
 from scene.transfer_mlp import TransferMLP
 import imageio
 from utils.graphics_utils import  read_hdr, latlong_to_cubemap
 
+
+def load_point_lights(config_path: str):
+    """从 JSON 加载点光源列表。"""
+    import json
+    with open(config_path) as f:
+        data = json.load(f)
+    lights = []
+    for item in data["lights"]:
+        pos = torch.tensor(item["position"], dtype=torch.float32, device="cuda")
+        col = torch.tensor(item["color"], dtype=torch.float32, device="cuda")
+        lights.append(PointLight(position=pos, color=col, intensity=item.get("intensity", 1.0)))
+    return lights
 
 
 def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, is_pbr=False, is_equirect=False):
@@ -27,7 +40,19 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     """
     gaussians = GaussianModel(dataset.sh_degree, render_type=args.type)
     scene = Scene(dataset, gaussians, shuffle=False)
-    if args.checkpoint:
+    if args.ply_path:
+        print("Loading Gaussians from PLY {}".format(args.ply_path))
+        gaussians.load_ply(args.ply_path)
+        # 从路径中提取迭代号（如 iteration_30000/point_cloud.ply），没有则默认为 0
+        first_iter = 0
+        for part in args.ply_path.replace('\\', '/').split('/'):
+            if part.startswith('iteration_'):
+                try:
+                    first_iter = int(part.split('_')[1])
+                except ValueError:
+                    pass
+                break
+    elif args.checkpoint:
         print("Create Gaussians from checkpoint {}".format(args.checkpoint))
         first_iter = gaussians.create_from_ckpt(args.checkpoint, restore_optimizer=True)
 
@@ -106,6 +131,26 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         refmap.training_setup(opt, light_type="ref")
         pbr_kwargs["refmap"] = refmap
 
+    # Point lights
+    if args.point_lights_config:
+        point_lights = load_point_lights(args.point_lights_config)
+        pbr_kwargs["point_lights"] = point_lights
+        print(f"[point light] Loaded {len(point_lights)} point light(s) from {args.point_lights_config}")
+
+        # Pre-bake shadow maps for fixed lights
+        is_equirect_mode = getattr(args, 'equirect_width', None) is not None
+        shadow_funcs = []
+        for i, light in enumerate(point_lights):
+            if is_equirect_mode:
+                depth_map = get_depth_equirect(gaussians, light.position)
+                shadow_fn = make_shadow_func_equirect(depth_map, light.position)
+            else:
+                depth_map = get_depth_cubemap(gaussians, light.position)
+                shadow_fn = make_shadow_func_cubemap(depth_map, light.position)
+            shadow_funcs.append(shadow_fn)
+            print(f"  [shadow] Light {i}: depth map ready")
+        pbr_kwargs["point_light_shadow_funcs"] = shadow_funcs
+
     """ Prepare render function and bg"""
     render_fn = render_fn_dict[args.type]
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -122,6 +167,22 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         "directional_front_top": {
             "capture_list": capture_list,
             "envmap_path": envmap_base_dir + "directional_front_top.hdr",
+        },
+        "directional_front": {
+            "capture_list": capture_list,
+            "envmap_path": envmap_base_dir + "directional_front.hdr",
+        },
+        "directional_left": {
+            "capture_list": capture_list,
+            "envmap_path": envmap_base_dir + "directional_left.hdr",
+        },
+        "directional_right": {
+            "capture_list": capture_list,
+            "envmap_path": envmap_base_dir + "directional_right.hdr",
+        },
+        "directional_top": {
+            "capture_list": capture_list,
+            "envmap_path": envmap_base_dir + "directional_top.hdr",
         },
         "TCom_ColorfulAlley": {
             "capture_list": capture_list,
@@ -162,7 +223,8 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
     }
 
 
-    task_names = ['studio','directional_front_top','TCom_ColorfulAlley','bridge', 'city', 'fireplace', 'forest', 'night']
+    task_names = ["directional_front_top"]
+    # task_names = ['studio','directional_front_top','directional_front','directional_left','directional_right','directional_top','TCom_ColorfulAlley','bridge', 'city', 'fireplace', 'forest', 'night']
     # task_names = ['studio']
     for task_name in task_names:
         cubemap = None
@@ -187,8 +249,15 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
         eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, task_name,
                     equirect_width=getattr(args, 'equirect_width', None))
 
-        if args.save_video and not is_equirect:
-            eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, task_name)
+        if args.save_video:
+            full_video = getattr(args, 'full_video_output', False)
+            if is_equirect:
+                eval_render_video_equirect(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, task_name,
+                                            equirect_width=getattr(args, 'equirect_width', None),
+                                            full_video_output=full_video)
+            else:
+                eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, task_name,
+                                  full_video_output=full_video)
     
 
 
@@ -236,9 +305,65 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
                             os.path.join(args.model_path, 'test_rli', env_name, f"{viewpoint.image_name}_{idx}.png"))
                     
 
-def eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, env_name):
+# ---- Intermediate video output helpers ----
+
+# Standard intermediate attributes for video output.
+# Each entry: (vis_dict_key, filename_suffix, is_color_or_1ch)
+#   is_color_or_1ch: "color" (3-ch already), "1ch" (single-ch -> replicate to 3)
+INTERMEDIATE_VIDEO_ATTRS = [
+    ("base_color",          "albedo",           "color"),
+    ("diffuse_pbr",         "diffuse",          "color"),
+    ("specular_pbr",        "specular",         "color"),
+    ("normal",              "normal",           "color"),
+    ("pseudo_normal",       "pseudo_normal",    "color"),
+    ("depth",               "depth",            "1ch"),
+    ("roughness",           "roughness",        "1ch"),
+    ("metallic",            "metallic",         "1ch"),
+    ("visibility",          "occlusion",        "1ch"),
+    ("incidents_light",  "incident_light",   "color"),
+    ("radiance_color",      "radiance",         "color"),
+    ("ref_strength",        "ref_strength",     "1ch"),
+    ("ref_roughness",       "ref_roughness",    "1ch"),
+    ("ref_tint",            "ref_tint",         "color"),
+]
+
+
+def _extract_intermediate_frame(results, vis_key, H_even, W_even, kind):
+    """Extract a single intermediate result frame -> numpy uint8 [H, W, 3] or None."""
+    img = None
+    vis_dict = results.get("vis_dict")
+    if vis_dict is not None and vis_key in vis_dict:
+        img = vis_dict[vis_key]
+    elif vis_key in results:
+        img = results[vis_key]
+    if img is None:
+        return None
+
+    img = img.detach().cpu().float()
+    # Single-channel -> replicate to 3-ch for video encoding
+    if kind == "1ch" and img.dim() == 3 and img.shape[0] == 1:
+        img = img.expand(3, -1, -1)
+    img = img.clamp(0.0, 1.0)
+    img = img[:, :H_even, :W_even]
+    img_np = img.permute(1, 2, 0).numpy()
+    return (img_np * 255).astype("uint8")
+
+
+def _save_intermediate_videos(all_frames, video_path, env_name):
+    """Save all intermediate attribute videos."""
+    for suffix, frames in all_frames.items():
+        if len(frames) > 0:
+            imageio.mimsave(
+                os.path.join(video_path, f"{env_name}_{suffix}.mp4"),
+                np.stack(frames), fps=24, macro_block_size=1,
+            )
+
+
+def eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, env_name,
+                      full_video_output=False):
     test_cameras = scene.getTrainCameras()
     video_images_dict = []
+    intermediate_frames = {suffix: [] for _, suffix, _ in INTERMEDIATE_VIDEO_ATTRS} if full_video_output else None
     
     camera = test_cameras[0]
     H = camera.image_height
@@ -346,14 +471,18 @@ def eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kw
                 H_resize = H - 1
             if W % 2 != 0:
                 W_resize = W -1
-            # print(H_resize, W_resize)
-            # print(H, W)
-            # print(H % 2 != 0)
 
             tmp_image_pbr = image_pbr[:,:H_resize, :W_resize]
             video_image_pbr = torch.clamp(tmp_image_pbr, 0.0, 1.0).permute(1,2,0).detach().cpu()
             video_image_pbr = (video_image_pbr.numpy() * 255).astype('uint8')
             video_images_dict.append(video_image_pbr)
+
+            # ---- Full video output: collect intermediate frames ----
+            if full_video_output:
+                for vis_key, suffix, kind in INTERMEDIATE_VIDEO_ATTRS:
+                    frame = _extract_intermediate_frame(results, vis_key, H_resize, W_resize, kind)
+                    if frame is not None:
+                        intermediate_frames[suffix].append(frame)
 
 
 
@@ -362,6 +491,125 @@ def eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kw
         os.makedirs(video_path, exist_ok=True)
         imageio.mimsave(os.path.join(video_path, f"{env_name}_pbr_video.mp4"), np.stack(video_images_dict), fps=24, macro_block_size=1)
 
+        if full_video_output:
+            _save_intermediate_videos(intermediate_frames, video_path, env_name)
+            print(f"  Saved {len([v for v in intermediate_frames.values() if len(v)>0])} intermediate videos to {video_path}")
+
+
+def eval_render_video_equirect(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, env_name, equirect_width=None, full_video_output=False):
+    """全景模式重光照视频：相机小幅圆周运动产生视差效果"""
+    train_cameras = scene.getTrainCameras()
+    if len(train_cameras) == 0:
+        train_cameras = scene.getTestCameras()
+
+    video_images_dict = []
+    intermediate_frames = {suffix: [] for _, suffix, _ in INTERMEDIATE_VIDEO_ATTRS} if full_video_output else None
+
+    ref_cam = train_cameras[0]
+    H = ref_cam.image_height
+    W = ref_cam.image_width
+    if equirect_width is not None:
+        W = equirect_width
+        H = equirect_width // 2
+    print('equirect_size: H:', H, 'W:', W)
+
+    # 按场景尺寸的~10%作为运动半径，保持相机朝向不变，产生视差效果
+    radius = scene.cameras_extent * 0.10
+    n_frames = 120  # 5s at 24fps
+
+    # ---- 光源旋转参数 ----
+    cubemap = pbr_kwargs.get("cubemap")
+    light_rotate_yaw = getattr(args, 'light_rotate_yaw', 0.0)
+    light_rotate_pitch = getattr(args, 'light_rotate_pitch', 0.0)
+    light_rotate_roll = getattr(args, 'light_rotate_roll', 0.0)
+    has_light_rotation = (light_rotate_yaw != 0 or light_rotate_pitch != 0 or light_rotate_roll != 0)
+
+    progress_bar = tqdm(range(n_frames), desc="Relighting (Equirect Video)")
+
+    with torch.no_grad():
+        for idx in progress_bar:
+            # 水平面小幅圆周运动（保持相机朝向不变）
+            angle = 2 * np.pi * idx / n_frames
+            translate = np.array([
+                radius * np.cos(angle),
+                radius * np.sin(angle),
+                0.0,
+            ])
+
+            custom_cam = Camera(
+                colmap_id=0, R=ref_cam.R, T=ref_cam.T,
+                FoVx=ref_cam.FoVx, FoVy=ref_cam.FoVy,
+                fx=None, fy=None, cx=None, cy=None,
+                image=torch.zeros(3, H, W), image_name=None, uid=0,
+                trans=translate,
+            )
+
+            # ---- 光源逐帧旋转 ----
+            if cubemap is not None and has_light_rotation:
+                fraction = idx / (n_frames - 1) if n_frames > 1 else 1.0  # 0 → 1
+                yaw_r = np.radians(light_rotate_yaw * fraction)
+                pitch_r = np.radians(light_rotate_pitch * fraction)
+                roll_r = np.radians(light_rotate_roll * fraction)
+
+                cos_y, sin_y = np.cos(yaw_r), np.sin(yaw_r)
+                cos_p, sin_p = np.cos(pitch_r), np.sin(pitch_r)
+                cos_r, sin_r = np.cos(roll_r), np.sin(roll_r)
+
+                R_y = torch.tensor([
+                    [cos_y, 0.0, -sin_y],
+                    [0.0, 1.0, 0.0],
+                    [sin_y, 0.0, cos_y],
+                ], dtype=torch.float32, device=cubemap.base.device)
+
+                R_x = torch.tensor([
+                    [1.0, 0.0, 0.0],
+                    [0.0, cos_p, -sin_p],
+                    [0.0, sin_p, cos_p],
+                ], dtype=torch.float32, device=cubemap.base.device)
+
+                R_z = torch.tensor([
+                    [cos_r, -sin_r, 0.0],
+                    [sin_r, cos_r, 0.0],
+                    [0.0, 0.0, 1.0],
+                ], dtype=torch.float32, device=cubemap.base.device)
+
+                # 旋转顺序：pitch → yaw → roll
+                cubemap.xfm(R_z @ R_y @ R_x)
+            elif cubemap is not None:
+                cubemap.xfm(None)  # 无旋转时清除上一帧可能残留的 mtx
+
+            results = render_fn(custom_cam, gaussians, pipe, background, opt=opt, is_training=False,
+                                dict_params=pbr_kwargs)
+            image_pbr = results["pbr"]
+            image_pbr = torch.clamp(image_pbr, 0.0, 1.0)
+
+            # 确保宽高为偶数（视频编码要求）
+            H_actual, W_actual = image_pbr.shape[1], image_pbr.shape[2]
+            H_resize, W_resize = H_actual, W_actual
+            if H_actual % 2 != 0:
+                H_resize = H_actual - 1
+            if W_actual % 2 != 0:
+                W_resize = W_actual - 1
+
+            video_image = image_pbr[:, :H_resize, :W_resize].permute(1, 2, 0).detach().cpu()
+            video_image = (video_image.numpy() * 255).astype('uint8')
+            video_images_dict.append(video_image)
+
+            # ---- Full video output: collect intermediate frames ----
+            if full_video_output:
+                for vis_key, suffix, kind in INTERMEDIATE_VIDEO_ATTRS:
+                    frame = _extract_intermediate_frame(results, vis_key, H_resize, W_resize, kind)
+                    if frame is not None:
+                        intermediate_frames[suffix].append(frame)
+
+    video_path = os.path.join(args.model_path, 'test_rli', "video")
+    os.makedirs(video_path, exist_ok=True)
+    imageio.mimsave(os.path.join(video_path, f"{env_name}_equirect_video.mp4"),
+                    np.stack(video_images_dict), fps=24, macro_block_size=1)
+
+    if full_video_output:
+        _save_intermediate_videos(intermediate_frames, video_path, env_name)
+        print(f"  Saved {len([v for v in intermediate_frames.values() if len(v)>0])} intermediate videos to {video_path}")
 
 
 if __name__ == "__main__":
@@ -376,11 +624,24 @@ if __name__ == "__main__":
     parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast',
                                                    'render_ref_equirect', 'render_ref_pbr_equirect'], default='render_ref')
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
+    parser.add_argument("--ply_path", type=str, default=None,
+                        help="Path to .ply file (alternative to --checkpoint)")
     parser.add_argument("--occlusion_path", type=str, default=None)
     parser.add_argument('-e', '--envmap_path', default="/home/huangpengyue/projects/RTR-GS/data/env_maps/", help="Env map path")
     parser.add_argument("--save_video", action="store_true", default=False)
     parser.add_argument("--equirect_width", type=int, default=None,
                         help="Equirect output width (height=width/2). If not set, uses camera native resolution.")
+    parser.add_argument("--light_rotate_yaw", type=float, default=0.0,
+                        help="Total light yaw rotation (degrees) over video duration")
+    parser.add_argument("--light_rotate_pitch", type=float, default=0.0,
+                        help="Total light pitch rotation (degrees) over video duration")
+    parser.add_argument("--light_rotate_roll", type=float, default=0.0,
+                        help="Total light roll rotation (degrees) over video duration")
+    parser.add_argument("--full_video_output", action="store_true", default=False,
+                        help="Also output videos of intermediate results (albedo, normal, depth, "
+                             "diffuse, specular, roughness, metallic, occlusion, incident light, etc.)")
+    parser.add_argument("--point_lights_config", type=str, default=None,
+                        help="点光源 JSON 配置文件路径")
 
     args = parser.parse_args(sys.argv[1:])
     print(f"Current model path: {args.model_path}")
