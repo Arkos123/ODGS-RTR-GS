@@ -150,6 +150,15 @@ def training(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams
             shadow_funcs.append(shadow_fn)
             print(f"  [shadow] Light {i}: depth map ready")
         pbr_kwargs["point_light_shadow_funcs"] = shadow_funcs
+        if args.point_light_rotate != 0.0:
+            pbr_kwargs["_point_light_rotate_total"] = args.point_light_rotate
+            # 保存光源初始位置，用于视频逐帧旋转
+            pbr_kwargs["_point_lights_original"] = [PointLight(
+                position=light.position.clone(),
+                color=light.color.clone(),
+                intensity=light.intensity,
+            ) for light in point_lights]
+            print(f"[point light] Video rotation: {args.point_light_rotate}° total over video")
 
     """ Prepare render function and bg"""
     render_fn = render_fn_dict[args.type]
@@ -578,6 +587,29 @@ def eval_render_video_equirect(scene, gaussians, render_fn, pipe, background, op
             elif cubemap is not None:
                 cubemap.xfm(None)  # 无旋转时清除上一帧可能残留的 mtx
 
+            # ── 点光源逐帧水平旋转 ──
+            point_light_rotate_total = pbr_kwargs.get("_point_light_rotate_total", 0.0)
+            if point_light_rotate_total != 0.0 and "_point_lights_original" in pbr_kwargs:
+                fraction = idx / (n_frames - 1) if n_frames > 1 else 1.0
+                theta = np.radians(point_light_rotate_total * fraction)
+                cos_t, sin_t = np.cos(theta), np.sin(theta)
+                eq_mode = equirect_width is not None
+                rotated_lights = []
+                rotated_shadow_funcs = []
+                for orig_light in pbr_kwargs["_point_lights_original"]:
+                    px, py, pz = orig_light.position.unbind()
+                    new_pos = torch.stack([px * cos_t - pz * sin_t, py, px * sin_t + pz * cos_t])
+                    rotated_lights.append(PointLight(position=new_pos, color=orig_light.color, intensity=orig_light.intensity))
+                    # Re-bake shadow map from rotated position
+                    if eq_mode:
+                        dm = get_depth_equirect(gaussians, new_pos)
+                        rotated_shadow_funcs.append(make_shadow_func_equirect(dm, new_pos))
+                    else:
+                        dm = get_depth_cubemap(gaussians, new_pos)
+                        rotated_shadow_funcs.append(make_shadow_func_cubemap(dm, new_pos))
+                pbr_kwargs["point_lights"] = rotated_lights
+                pbr_kwargs["point_light_shadow_funcs"] = rotated_shadow_funcs
+
             results = render_fn(custom_cam, gaussians, pipe, background, opt=opt, is_training=False,
                                 dict_params=pbr_kwargs)
             image_pbr = results["pbr"]
@@ -642,6 +674,8 @@ if __name__ == "__main__":
                              "diffuse, specular, roughness, metallic, occlusion, incident light, etc.)")
     parser.add_argument("--point_lights_config", type=str, default=None,
                         help="点光源 JSON 配置文件路径")
+    parser.add_argument("--point_light_rotate", type=float, default=0.0,
+                        help="点光源视频逐帧水平旋转总角度（度），0=不旋转")
 
     args = parser.parse_args(sys.argv[1:])
     print(f"Current model path: {args.model_path}")
