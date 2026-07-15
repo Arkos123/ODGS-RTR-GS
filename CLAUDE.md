@@ -9,6 +9,17 @@ RTR-GS is a 3D Gaussian Splatting framework for inverse rendering with radiance 
 This repository also includes **Spherical Gaussian Splatting (SGS)** as a submodule at `submodules/spherical-gaussian-splatting/`, enabling RTR-GS to train with omnidirectional (equirectangular) 360° images. See [README.md](README.md) for unified environment setup and read `submodules/spherical-gaussian-splatting/CLAUDE.md` for SGS usage.
 - The old ODGS (Omni3DGS) submodule has been replaced by the new SGS(Spherical3DGS) submodule. See `doc/关于融合RTRGS&ODGS的方案/implement/*.md` for historical integration details.
 
+## MTPano (全景图法线/深度/语义估计)
+
+项目位置 `MTPano/`，用于为 RTR-GS 的 equirect 训练提供全景法线先验。
+
+- README: `MTPano/README.md`
+- 环境：独立的另一个 conda 环境 `mtpano`，基于 PyTorch 2.5.0 + CUDA 11.8
+
+## 点光源重光照
+
+支持基于点光源的重光照渲染。通过 `pbr/point_light_shadow.py` 实现透视（cubemap）和全景（equirect 深度图）两种阴影模式。详见 `doc/point-light-relighting-design.md`。
+
 ## Documentation
 
 The [doc/](doc/) directory contains detailed documentation for this project, including:
