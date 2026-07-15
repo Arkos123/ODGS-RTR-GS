@@ -533,6 +533,28 @@ def eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kw
 
             viewpoint = test_cameras[idx]
 
+            # ── 点光源逐帧水平轨道旋转（perspective 视频） ──
+            _orbits = pbr_kwargs.get("_point_light_orbits", None)
+            if _orbits and "_point_light_pivots" in pbr_kwargs:
+                _frac = idx / (n_frames - 1) if n_frames > 1 else 1.0
+                _rot_lights = []
+                _rot_shadow = []
+                _biases = pbr_kwargs.get("_point_light_biases", [])
+                for _li, _pivot in enumerate(pbr_kwargs["_point_light_pivots"]):
+                    _r, _rt = _orbits[_li]
+                    if _r <= 0 or _rt == 0:
+                        _rot_lights.append(pbr_kwargs["point_lights"][_li])
+                        _rot_shadow.append(pbr_kwargs["point_light_shadow_funcs"][_li])
+                        continue
+                    _theta = np.radians(_rt * _frac)
+                    _c, _s = np.cos(_theta), np.sin(_theta)
+                    _np = _pivot + torch.tensor([_r * _c, 0.0, _r * _s], dtype=_pivot.dtype, device=_pivot.device)
+                    _rot_lights.append(PointLight(position=_np, color=pbr_kwargs["point_lights"][_li].color, intensity=pbr_kwargs["point_lights"][_li].intensity))
+                    _bias = _biases[_li] if _li < len(_biases) else 0.3
+                    _dm = get_depth_cubemap(gaussians, _np)
+                    _rot_shadow.append(make_shadow_func_cubemap(_dm, _np, threshold=_bias))
+                pbr_kwargs["point_lights"] = _rot_lights
+                pbr_kwargs["point_light_shadow_funcs"] = _rot_shadow
 
             results = render_fn(viewpoint, gaussians, pipe, background, opt=opt, is_training=False,
                                 dict_params=pbr_kwargs)
