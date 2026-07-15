@@ -403,7 +403,11 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             .sum(dim=-1)
             .reshape(H, W, 3)
         )  # [H, W, 3]
-    
+
+    # 计算原始射线长度 norm（canonical_rays 是 [dx,dy,1] 未归一化，norm = ||[dx,dy,1]||）
+    # 用于从 depth（视空间 Z）重建正确的欧几里得距离
+    raw_ray_norm = torch.norm(canonical_rays, dim=-1).reshape(H, W)  # [H, W]
+
     # 延迟反射着色：根据模式选择使用前向或延迟反射计算
     # 用于非pbr的普通render结果。
     if not pipe.forward_shading:
@@ -456,7 +460,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             # 计算每个像素的3D世界坐标点：通过深度和视图方向反投影
             # points = (-view_dirs * depth + camera_position)
             points = (
-                (-view_dirs.reshape(-1, 3) * rendered_depth.reshape(-1, 1) + c2w[:3, 3])
+                (-view_dirs.reshape(-1, 3) * raw_ray_norm.reshape(-1, 1) * rendered_depth.reshape(-1, 1) + c2w[:3, 3])
                     .clamp(min=clamp_min, max=clamp_max)
                         .contiguous()
                     )  # [HW, 3]
@@ -513,9 +517,13 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         specular_pbr = pbr_result["specular_rgb"]           # 镜面反射分量 [H, W, 3]
         occulusion_incident_light = pbr_result["incidents_light"]
         # ── Point light overlay ──────────────────────────────────────────────
+        point_rgb = None
         point_lights = dict_params.get("point_lights", None) if dict_params else None
         if point_lights and len(point_lights) > 0:
-            surf_points = rendered_surface_xyz.permute(1, 2, 0)  # [3, H, W] → [H, W, 3]
+            # 从 depth + view_dirs + raw_ray_norm 重建表面世界坐标
+            surf_points = (
+                -view_dirs.reshape(-1, 3) * raw_ray_norm.reshape(-1, 1) * rendered_depth.reshape(-1, 1) + c2w[:3, 3]
+            ).reshape(H, W, 3)  # [H, W, 3]
             point_rgb = point_light_shading(
                 lights=point_lights,
                 points=surf_points,
@@ -550,6 +558,8 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         out_feature_dict.update({
             "visibility": occlusion_map.permute(2, 0, 1) if occlusion_map is not None else torch.zeros_like(roughness_map).permute(2, 0, 1),
         })
+        if point_rgb is not None:
+            out_feature_dict["point_light"] = point_rgb.permute(2, 0, 1)
     # !SECTION
 
 

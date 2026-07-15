@@ -514,6 +514,7 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
         specular_pbr = pbr_result["specular_rgb"]
 
         # ── Point light overlay ──────────────────────────────────────────────
+        point_rgb = None
         point_lights = dict_params.get("point_lights", None) if dict_params else None
         if point_lights and len(point_lights) > 0:
             surf_points = points.reshape(H, W, 3)  # [HW, 3] → [H, W, 3]
@@ -555,6 +556,9 @@ def render_view(viewpoint_camera: Camera, pc: GaussianModel, pipe, bg_color: tor
             if cubemap is not None:
                 out_feature_dict["env_export_base"] = cubemap.export_envmap(return_img=True).permute(2, 0, 1)
                 out_feature_dict["env_export_diffuse"] = cubemap.export_envmap(return_img=True, base=False).permute(2, 0, 1)
+
+    if point_rgb is not None:
+        out_feature_dict["point_light"] = point_rgb.permute(2, 0, 1)
 
     if not fast_pbr:
         out_feature_dict.update({

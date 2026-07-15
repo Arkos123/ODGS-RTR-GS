@@ -487,3 +487,37 @@ def cubemap_to_equirect(cubemap_faces: torch.Tensor,
     sampled = dr.texture(tex, uv, filter_mode="linear",
                          boundary_mode="cube")              # [1, eq_height, eq_width, C]
     return sampled[0].permute(-1, 0, 1)                     # [C, eq_height, eq_width]
+
+
+    
+
+def get_canonical_rays(W, H, FoVx, FoVy):
+    """
+    相机自身坐标系中，从原点出发、穿过每个像素的未归一化射线方向 [dx, dy, 1]。
+    """
+    cen_x = W / 2
+    cen_y = H / 2
+    tan_fovx = math.tan(FoVx * 0.5)
+    tan_fovy = math.tan(FoVy * 0.5)
+    focal_x = W / (2.0 * tan_fovx)
+    focal_y = H / (2.0 * tan_fovy)
+
+    x, y = torch.meshgrid(
+        torch.arange(W),
+        torch.arange(H),
+        indexing="xy",
+    )
+    x = x.flatten()  # [H * W]
+    y = y.flatten()  # [H * W]
+    camera_dirs = F.pad(
+        torch.stack(
+            [
+                (x - cen_x + 0.5) / focal_x,
+                (y - cen_y + 0.5) / focal_y,
+            ],
+            dim=-1,
+        ),
+        (0, 1),
+        value=1.0,
+    )  # [H * W, 3]，未归一化
+    return camera_dirs.cuda()

@@ -45,6 +45,29 @@ def load_point_lights(config_path: str):
     return lights, orbits, biases
 
 
+def _project_to_screen(pos, camera, is_equirect, W, H):
+    """将 3D 世界坐标点投影到 2D 屏幕坐标。返回 (px, py) 或 None（点在相机后面）。"""
+    import math
+    if is_equirect:
+        cam_center = camera.camera_center
+        d = pos - cam_center
+        d = d / d.norm()
+        lat = torch.asin((-d[1]).clamp(-1.0, 1.0))
+        lon = torch.atan2(d[0], d[2])
+        px = (lon / math.pi + 1.0) * 0.5 * W
+        py = (0.5 - lat / math.pi) * H
+    else:
+        full_proj = camera.full_proj_transform.T  # 行主序
+        p_h = torch.cat([pos, torch.ones(1, device=pos.device)])
+        p_clip = full_proj @ p_h
+        if p_clip[3] < 1e-6:
+            return None  # 点在相机后面或近平面之前
+        inv_w = 1.0 / p_clip[3]
+        px = (p_clip[0] * inv_w + 1.0) * 0.5 * W - 0.5  # ndc2Pix: ((v+1)*S-1)*0.5
+        py = (p_clip[1] * inv_w + 1.0) * 0.5 * H - 0.5
+    return int(px.item()), int(py.item())
+
+
 def _draw_light_indicator(
     image: torch.Tensor,  # [3, H, W] RGB 图像，值域 [0,1]
     lights: List[PointLight],
@@ -52,48 +75,59 @@ def _draw_light_indicator(
     is_equirect: bool = False,
     color: tuple = (1.0, 0.2, 0.1),
     radius: int = 20,
+    axis_length: float = 0,
 ) -> torch.Tensor:
-    """在渲染图像上叠加点光源位置指示光球，方便确认光源位置。"""
+    """在渲染图像上叠加点光源位置指示光球和 XYZ 轴线段（方便确认投影）。
+    axis_length > 0 时绘制 RGB 三色轴（R=X, G=Y, B=Z），
+    COLMAP 空间：+X 右, +Y 下, +Z 前。
+    """
     import math
     H, W = image.shape[1:]
     img = image.clone()
+    # 转为 numpy array 方便绘制线段
+    import numpy as np
+    img_np = img.permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+
     for light in lights:
         pos = light.position
-        if is_equirect:
-            # Equirect 投影：方向 → (lon, lat)
-            # 相机在原点时，方向向量 = normalize(light_pos - camera_pos)
-            cam_center = camera.camera_center
-            d = pos - cam_center
-            d = d / d.norm()
-            lat = torch.asin((-d[1]).clamp(-1.0, 1.0))
-            lon = torch.atan2(d[0], d[2])
-            px = (lon / math.pi + 1.0) * 0.5 * W
-            py = (0.5 - lat / math.pi) * H
-        else:
-            # Perspective 投影：使用 view-projection 矩阵
-            import torch.nn.functional as F
-            p_h = torch.cat([pos, torch.tensor([1.0], device=pos.device)])
-            p_clip = camera.full_proj_transform @ p_h
-            p_ndc = p_clip[:2] / p_clip[3]
-            px = (p_ndc[0] + 1.0) * 0.5 * W
-            py = (p_ndc[1] + 1.0) * 0.5 * H
-        px = int(px.item())
-        py = int(py.item())
-        # 在图像边界内才绘制
-        if 0 <= px < W and 0 <= py < H:
-            # 绘制外圈光晕（高斯衰减）
-            import numpy as np
-            ys = torch.arange(max(0, py - radius * 2), min(H, py + radius * 2 + 1), device=image.device)
-            xs = torch.arange(max(0, px - radius * 2), min(W, px + radius * 2 + 1), device=image.device)
-            gy, gx = torch.meshgrid(ys, xs, indexing='ij')
-            dist = ((gx - px) ** 2 + (gy - py) ** 2).float()
-            glow = torch.exp(-dist / (radius * radius))
-            for c in range(3):
-                img[c, gy, gx] = img[c, gy, gx] * (1 - glow * 0.5) + color[c] * glow * 0.5
-            # 绘制内核（实心圆）
-            inner = dist < radius * radius * 0.25
-            for c in range(3):
-                img[c, gy, gx] = torch.where(inner, color[c], img[c, gy, gx])
+        center_2d = _project_to_screen(pos, camera, is_equirect, W, H)
+        if center_2d is None:
+            continue
+        cx, cy = center_2d
+        if not (0 <= cx < W and 0 <= cy < H):
+            continue
+
+        # 绘制光晕 + 实心圆（直接在 img tensor 上做）
+        ys = torch.arange(max(0, cy - radius * 2), min(H, cy + radius * 2 + 1), device=image.device)
+        xs = torch.arange(max(0, cx - radius * 2), min(W, cx + radius * 2 + 1), device=image.device)
+        gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+        dist = ((gx - cx) ** 2 + (gy - cy) ** 2).float()
+        glow = torch.exp(-dist / (radius * radius))
+        for c in range(3):
+            img[c, gy, gx] = img[c, gy, gx] * (1 - glow * 0.5) + color[c] * glow * 0.5
+        inner = dist < radius * radius * 0.25
+        for c in range(3):
+            img[c, gy, gx] = torch.where(inner, color[c], img[c, gy, gx])
+
+        # ── XYZ 轴线段（RGB 三色，在 numpy 上用 cv2.line 绘制）──
+        if axis_length > 0:
+            import cv2
+            axes = [
+                (torch.tensor([axis_length, 0.0, 0.0], device=pos.device), (0, 0, 255)),   # X=红 (BGR)
+                (torch.tensor([0.0, axis_length, 0.0], device=pos.device), (0, 255, 0)),   # Y=绿
+                (torch.tensor([0.0, 0.0, axis_length], device=pos.device), (255, 0, 0)),   # Z=蓝
+            ]
+            for axis_vec, col_bgr in axes:
+                tip = pos + axis_vec
+                tip_2d = _project_to_screen(tip, camera, is_equirect, W, H)
+                if tip_2d is None:
+                    continue
+                tx, ty = tip_2d
+                cv2.line(img_np, (cx, cy), (tx, ty), col_bgr, 2, cv2.LINE_AA)
+                cv2.circle(img_np, (tx, ty), 3, col_bgr, -1, cv2.LINE_AA)
+
+    # 将 numpy 结果合并回 img tensor
+    img = torch.from_numpy(img_np).permute(2, 0, 1).to(device=image.device, dtype=image.dtype)
     return img
 
 
@@ -366,7 +400,7 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
             if args.point_light_vis and point_lights and len(point_lights) > 0:
                 image_pbr = _draw_light_indicator(
                     image_pbr, point_lights, viewpoint,
-                    is_equirect=(equirect_width is not None))
+                    is_equirect=(equirect_width is not None), axis_length=0.3)
 
             write_image_dict = {}
             write_image_dict.update({
@@ -398,7 +432,8 @@ INTERMEDIATE_VIDEO_ATTRS = [
     ("roughness",           "roughness",        "1ch"),
     ("metallic",            "metallic",         "1ch"),
     ("visibility",          "occlusion",        "1ch"),
-    ("incidents_light",  "incident_light",   "color"),
+    ("incidents_light",     "incident_light",   "color"),
+    ("point_light",         "point_light",      "color"),
     ("radiance_color",      "radiance",         "color"),
     ("ref_strength",        "ref_strength",     "1ch"),
     ("ref_roughness",       "ref_roughness",    "1ch"),
@@ -565,6 +600,12 @@ def eval_render_video(scene, gaussians, render_fn, pipe, background, opt, pbr_kw
                 image_pbr = results["pbr"]
                 image_pbr = torch.clamp(image_pbr, 0.0, 1.0)
 
+            # ── 点光源位置指示光球（透视视频） ──
+            _v_pl = pbr_kwargs.get("point_lights", None) if pbr_kwargs else None
+            if args.point_light_vis and _v_pl and len(_v_pl) > 0:
+                image_pbr = _draw_light_indicator(
+                    image_pbr, _v_pl, viewpoint, is_equirect=False, axis_length=0.3)
+
             H, W = image_pbr.shape[1], image_pbr.shape[2]
             H_resize, W_resize = H, W
             if H % 2 != 0:
@@ -719,7 +760,7 @@ def eval_render_video_equirect(scene, gaussians, render_fn, pipe, background, op
             if args.point_light_vis and v_point_lights and len(v_point_lights) > 0:
                 image_pbr = _draw_light_indicator(
                     image_pbr, v_point_lights, custom_cam,
-                    is_equirect=(equirect_width is not None))
+                    is_equirect=(equirect_width is not None), axis_length=0.3)
 
             # 确保宽高为偶数（视频编码要求）
             H_actual, W_actual = image_pbr.shape[1], image_pbr.shape[2]
