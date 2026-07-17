@@ -76,6 +76,7 @@ from pbr import CubemapLight, get_brdf_lut
 from scene.transfer_mlp import TransferMLP
 from utils.general_utils import safe_state
 from utils.graphics_utils import latlong_to_cubemap_equirect
+from utils.image_utils import colorize_depth
 from scripts.render_cubemap_equirect import render_equirect_from_position
 
 
@@ -273,14 +274,14 @@ def main():
             render_img = torch.clamp(render_pkg["render"], 0.0, 1.0)
             # gt_img = torch.clamp(viewpoint.original_image.cuda(), 0.0, 1.0)
             depth = render_pkg["depth"]
-            depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+            depth_vis = colorize_depth(depth)
             opacity = torch.clamp(render_pkg["opacity"], 0.0, 1.0)
             normal = torch.clamp(render_pkg.get("normal", torch.zeros_like(render_img)) * 0.5 + 0.5, 0.0, 1.0)
             pseudo_normal = torch.clamp(render_pkg.get("pseudo_normal", torch.zeros_like(render_img)) * 0.5 + 0.5, 0.0, 1.0)
 
             torchvision.utils.save_image(render_img, os.path.join(view_dir, "render.png"))
             # torchvision.utils.save_image(gt_img, os.path.join(view_dir, "gt.png"))
-            torchvision.utils.save_image(depth_norm, os.path.join(view_dir, "depth.png"))
+            torchvision.utils.save_image(depth_vis, os.path.join(view_dir, "depth.png"))
             torchvision.utils.save_image(opacity, os.path.join(view_dir, "opacity.png"))
             torchvision.utils.save_image(normal, os.path.join(view_dir, "normal.png"))
             torchvision.utils.save_image(pseudo_normal, os.path.join(view_dir, "pseudo_normal.png"))
@@ -347,6 +348,7 @@ def main():
                 # globally over the full equirect for consistent visualization.
                 lo, hi = eq_img.min(), eq_img.max()
                 eq_img = (eq_img - lo) / (hi - lo + 1e-8)
+                eq_img = colorize_depth(eq_img, normalized=True)
             else:
                 # vis_dict channels are already post-processed (gamma,
                 # *0.5+0.5, bg-blend); pkg-only channels (render, pbr)
@@ -357,6 +359,8 @@ def main():
         for label, cube in result["cubemaps"].items():
             ch = label.split(":")[-1]
             face_grid = cube.permute(0, 3, 1, 2)  # [6, C, H, W]
+            if ch == "depth":
+                face_grid = torch.stack([colorize_depth(face, normalized=True) for face in face_grid], dim=0)
             collage = torchvision.utils.make_grid(face_grid, nrow=6)
             cubemap_dir = os.path.join(eq_dir, "cubemap")
             os.makedirs(cubemap_dir, exist_ok=True)

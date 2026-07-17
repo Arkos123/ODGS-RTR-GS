@@ -12,7 +12,7 @@ from utils.loss_utils import ssim
 from gaussian_renderer import render_fn_dict
 from scene import Scene, GaussianModel
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import colorize_depth, psnr
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.graphics_utils import focal2fov, fov2focal
@@ -603,10 +603,11 @@ def eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames,
 
                 for key in write_image_dict:
                         if write_image_dict[key] != None:
-                            save_image(torch.clamp(write_image_dict[key], 0.0, 1.0), 
+                            image_to_save = colorize_depth(write_image_dict[key], normalized=True) if key == "depth" else torch.clamp(write_image_dict[key], 0.0, 1.0)
+                            save_image(image_to_save,
                                 os.path.join(args.model_path, save_name, key, f"{custom_cam.image_name}_{idx}.png"))
 
-                            video_image = torch.clamp(write_image_dict[key], 0.0, 1.0).permute(1,2,0).detach().cpu()
+                            video_image = image_to_save.permute(1,2,0).detach().cpu()
                             video_image = (video_image.numpy() * 255).astype('uint8')
                             video_dict[key].append(video_image)
 

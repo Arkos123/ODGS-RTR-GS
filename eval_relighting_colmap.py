@@ -18,6 +18,7 @@ from pbr.point_light_shadow import get_depth_cubemap, get_depth_equirect, make_s
 from scene.transfer_mlp import TransferMLP
 import imageio
 from utils.graphics_utils import  read_hdr, latlong_to_cubemap
+from utils.image_utils import colorize_depth
 
 
 def load_point_lights(config_path: str):
@@ -421,14 +422,14 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs, 
 
 # Standard intermediate attributes for video output.
 # Each entry: (vis_dict_key, filename_suffix, is_color_or_1ch)
-#   is_color_or_1ch: "color" (3-ch already), "1ch" (single-ch -> replicate to 3)
+#   is_color_or_1ch: "color" (3-ch already), "1ch" (single-ch -> replicate to 3), "depth" (colorized)
 INTERMEDIATE_VIDEO_ATTRS = [
     ("base_color",          "albedo",           "color"),
     ("diffuse_pbr",         "diffuse",          "color"),
     ("specular_pbr",        "specular",         "color"),
     ("normal",              "normal",           "color"),
     ("pseudo_normal",       "pseudo_normal",    "color"),
-    ("depth",               "depth",            "1ch"),
+    ("depth",               "depth",            "depth"),
     ("roughness",           "roughness",        "1ch"),
     ("metallic",            "metallic",         "1ch"),
     ("visibility",          "occlusion",        "1ch"),
@@ -453,8 +454,10 @@ def _extract_intermediate_frame(results, vis_key, H_even, W_even, kind):
         return None
 
     img = img.detach().cpu().float()
+    if kind == "depth":
+        img = colorize_depth(img, normalized=True).cpu()
     # Single-channel -> replicate to 3-ch for video encoding
-    if kind == "1ch" and img.dim() == 3 and img.shape[0] == 1:
+    elif kind == "1ch" and img.dim() == 3 and img.shape[0] == 1:
         img = img.expand(3, -1, -1)
     img = img.clamp(0.0, 1.0)
     img = img[:, :H_even, :W_even]

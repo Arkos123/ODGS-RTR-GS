@@ -41,6 +41,7 @@ from pbr.point_light_shadow import (
     make_shadow_func_cubemap, make_shadow_func_equirect,
 )
 from utils.graphics_utils import read_hdr, latlong_to_cubemap, latlong_to_cubemap_equirect
+from utils.image_utils import colorize_depth
 from torchvision.utils import save_image
 from plyfile import PlyData
 
@@ -670,17 +671,22 @@ def _get_point_light_shadow(scene_data: dict, light_pos_np: np.ndarray,
 
 def _extract_raw_tensor(render_pkg: dict, render_mode: str) -> torch.Tensor:
     """从 render_pkg 提取指定模式的原始图像张量 [3, H, W]。"""
+    from_vis_dict = False
     if render_mode == "pbr":
         img = render_pkg.get("pbr", render_pkg.get("render"))
     elif render_mode == "render":
         img = render_pkg.get("render")
     elif "vis_dict" in render_pkg and render_mode in render_pkg["vis_dict"]:
         img = render_pkg["vis_dict"][render_mode]
+        from_vis_dict = True
     else:
         img = render_pkg.get(render_mode, render_pkg.get("pbr", render_pkg.get("render")))
 
     if img is None:
         raise KeyError(f"Render mode '{render_mode}' not found in output.")
+
+    if render_mode == "depth":
+        return colorize_depth(img, normalized=from_vis_dict)
 
     # 单通道 → 3 通道
     if img.shape[0] == 1:
@@ -1100,6 +1106,13 @@ def main():
             return "PERSPECTIVE"
         return "EQUIRECT PANORAMA" if show_equirect_panorama else "EQUIRECT CROP"
 
+    def cycle_render_mode(step: int):
+        nonlocal render_mode
+        keys_list = [k for k, _ in RENDER_MODES]
+        idx = keys_list.index(render_mode) if render_mode in keys_list else 0
+        render_mode = keys_list[(idx + step) % len(keys_list)]
+        print(f"View: {RENDER_MODE_NAMES.get(render_mode, render_mode.upper())}")
+
     print(f"Display: {display_state_name()}")
 
     # ── Pygame 初始化 ────────────────────────────────────────────────
@@ -1128,10 +1141,10 @@ def main():
                     cam_ctrl.toggle_mode()
 
                 elif event.key == pygame.K_v:
-                    keys_list = [k for k, _ in RENDER_MODES]
-                    idx = keys_list.index(render_mode) if render_mode in keys_list else 0
-                    render_mode = keys_list[(idx + 1) % len(keys_list)]
-                    print(f"View: {RENDER_MODE_NAMES.get(render_mode, render_mode.upper())}")
+                    cycle_render_mode(1)
+
+                elif event.key == pygame.K_c:
+                    cycle_render_mode(-1)
 
                 elif event.key == pygame.K_n:
                     prev_backend = render_backend
@@ -1343,7 +1356,7 @@ def main():
         fps_text = font.render(f"FPS: {clock.get_fps():.1f}", True, (0, 255, 0))
         mode_text = font.render(f"Mode: {cam_ctrl.mode.upper()}", True, (0, 255, 0))
         backend_text = font.render(f"Display: {display_state_name()} [N]", True, (0, 255, 255))
-        view_text = font.render(f"View: {RENDER_MODE_NAMES.get(render_mode, render_mode.upper())} [V]", True, (0, 255, 0))
+        view_text = font.render(f"View: {RENDER_MODE_NAMES.get(render_mode, render_mode.upper())} [V/C]", True, (0, 255, 0))
         occ_text = font.render(f"Occlusion: {'ON' if scene_data['enable_occlusion'] else 'OFF'} [X]", True, (0, 255, 0))
         env_bg_text = font.render(f"Env BG: {'ON' if show_env_bg else 'OFF'} [B]", True, (0, 255, 0))
         env_only_text = font.render(f"Env Only: {'ON' if show_env_only else 'OFF'} [H]", True, (255, 255, 0))

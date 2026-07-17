@@ -34,7 +34,7 @@ from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from utils.graphics_utils import latlong_to_cubemap_equirect
 from tqdm import tqdm
-from utils.image_utils import psnr
+from utils.image_utils import colorize_depth, psnr
 from utils.system_utils import prepare_output_and_logger
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, OptimizationParams
@@ -499,9 +499,9 @@ def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, 
             render_img = torch.clamp(render_pkg["render"], 0.0, 1.0)
             gt_img = torch.clamp(viewpoint.original_image.cuda(), 0.0, 1.0)
 
-            # 深度图（归一化到[0, 1]以便保存为图像）
+            # 深度图（彩色可视化，便于判断深度层次）
             depth_raw = render_pkg["depth"]
-            depth_norm = (depth_raw - depth_raw.min()) / (depth_raw.max() - depth_raw.min() + 1e-8)
+            depth_vis = colorize_depth(depth_raw)
 
             # 法线（从[-1, 1]映射到[0, 1]以便可视化）
             opacity = torch.clamp(render_pkg["opacity"], 0.0, 1.0)
@@ -510,7 +510,7 @@ def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, 
 
             save_image(render_img, os.path.join(save_dir, "render.png"))
             save_image(gt_img, os.path.join(save_dir, "gt.png"))
-            save_image(depth_norm, os.path.join(save_dir, "depth.png"))
+            save_image(depth_vis, os.path.join(save_dir, "depth.png"))
             save_image(opacity, os.path.join(save_dir, "opacity.png"))
             save_image(normal, os.path.join(save_dir, "normal.png"))
             save_image(pseudo_normal, os.path.join(save_dir, "pseudo_normal.png"))
@@ -542,8 +542,9 @@ def save_vis_images(scene, render_fn, pipe, background, iteration, dict_params, 
             keys_to_save = core_vis_keys + (pbr_vis_keys if is_pbr else [])
             for key in keys_to_save:
                 if key in vis_dict:
+                    image_to_save = colorize_depth(vis_dict[key], normalized=True) if key == "depth" else torch.clamp(vis_dict[key], 0.0, 1.0)
                     save_image(
-                        torch.clamp(vis_dict[key], 0.0, 1.0),
+                        image_to_save,
                         os.path.join(save_dir, f"{key}.png"))
 
 
@@ -647,8 +648,9 @@ def training_report(tb_writer, iteration, tb_dict, scene: Scene, renderFunc, pip
                     # TensorBoard 保存前10个视角的完整可视化
                     if tb_writer and (idx < 10):
                         for key in write_image_dict:
+                            image_to_log = colorize_depth(write_image_dict[key], normalized=True) if key == "depth" else torch.clamp(write_image_dict[key], 0.0, 1.0)
                             tb_writer.add_images(config['name'] + "_view_{}_{}/{}".format(viewpoint.image_name, idx, key),
-                                                torch.clamp(write_image_dict[key][None], 0.0, 1.0), global_step=iteration)
+                                                image_to_log[None], global_step=iteration)
 
                     l1_test += F.l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
@@ -783,7 +785,8 @@ def eval_render(scene, gaussians, render_fn, pipe, background, opt, pbr_kwargs):
 
             for key in write_image_dict:
                 if key not in ban_image_keys:
-                    save_image(torch.clamp(write_image_dict[key], 0.0, 1.0),
+                    image_to_save = colorize_depth(write_image_dict[key], normalized=True) if key == "depth" else torch.clamp(write_image_dict[key], 0.0, 1.0)
+                    save_image(image_to_save,
                             os.path.join(args.model_path, 'eval', key, f"{viewpoint.image_name}_{idx}.png"))
 
     # 汇总指标
