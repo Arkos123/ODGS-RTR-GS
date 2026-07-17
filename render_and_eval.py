@@ -262,12 +262,12 @@ def marching_cubes_with_contraction(
     return combined
 
 
-def evaling(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, is_pbr=False):
+def evaling(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams, is_pbr=False, is_equirect=False):
     """
     Setup Gaussians
     """
     gaussians = GaussianModel(dataset.sh_degree, render_type=args.type)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, shuffle=False)
     if args.checkpoint:
         print("Create Gaussians from checkpoint {}".format(args.checkpoint))
         first_iter = gaussians.create_from_ckpt(args.checkpoint, restore_optimizer=True)
@@ -305,9 +305,11 @@ def evaling(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams,
         pbr_kwargs["transfer_net"] = transfer_net
 
 
+    # equirect mode doesn't need canonical_rays (SGS rasterizer computes its own)
     if is_pbr or pipe.ref_map:
-        canonical_rays = scene.get_canonical_rays()
-        pbr_kwargs["canonical_rays"] = canonical_rays
+        if not is_equirect:
+            canonical_rays = scene.get_canonical_rays()
+            pbr_kwargs["canonical_rays"] = canonical_rays
 
         brdf_lut = get_brdf_lut().cuda()
         pbr_kwargs["brdf_lut"] = brdf_lut
@@ -357,15 +359,22 @@ def evaling(dataset: ModelParams, opt: OptimizationParams, pipe: PipelineParams,
 
 
     if not args.skip_render:
-        test_transforms_file = os.path.join(args.source_path, "transforms_test.json")
-        contents = load_json_config(test_transforms_file)
-        fovx = contents["camera_angle_x"]
-        frames = contents["frames"]
+        if is_equirect:
+            # equirect 模式：相机由 scene.getTestCameras() 提供，不读 transforms_test.json
+            frames = None
+            fovx = None
+        else:
+            test_transforms_file = os.path.join(args.source_path, "transforms_test.json")
+            contents = load_json_config(test_transforms_file)
+            fovx = contents["camera_angle_x"]
+            frames = contents["frames"]
         if pipe.editing_config_path != "":
             save_name = args.save_name + "/" + editing_name
         else:
             save_name = args.save_name
-        eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames, fovx, dataset.white_background, args.skip_save_image, args.skip_eval, save_name, args.save_video)
+        eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames, fovx,
+                    dataset.white_background, args.skip_save_image, args.skip_eval, save_name, args.save_video,
+                    is_equirect=is_equirect, scene=scene, equirect_width=getattr(args, 'equirect_width', None))
     if args.save_mesh:
         train_transforms_file = os.path.join(args.source_path, "transforms_train.json")
         contents = load_json_config(train_transforms_file)
@@ -424,7 +433,7 @@ def exported_mesh(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frame
         o3d.io.write_triangle_mesh(os.path.join(mesh_dir, name.replace('.ply', '_post.ply')), mesh_post)
         print("mesh post processed saved at {}".format(os.path.join(mesh_dir, name.replace('.ply', '_post.ply'))))
 
-def eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames, fovx, white_background, skip_save, skip_eval, save_name, save_video):
+def eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames, fovx, white_background, skip_save, skip_eval, save_name, save_video, is_equirect=False, scene=None, equirect_width=None):
     LPIPS = get_lpips_model(net_type='vgg').cuda()
 
     psnr_radiance_test = 0.0
@@ -455,32 +464,62 @@ def eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames,
     depthmaps = []
     viewpoint_stack = []
 
+    # 准备相机迭代器：equirect 模式从 scene 获取，透视模式从 transforms_test.json 解析
+    if is_equirect:
+        test_cameras = scene.getTestCameras()
+        if len(test_cameras) == 0:
+            print("[Equirect] No test cameras found, falling back to train cameras.")
+            test_cameras = scene.getTrainCameras()
+        iterator = list(enumerate(tqdm(test_cameras, leave=False, desc="Equirect Eval")))
+        n_frames = len(test_cameras)
+    else:
+        iterator = list(enumerate(tqdm(frames, leave=False)))
+        n_frames = len(frames)
+
     with torch.no_grad():
-        for idx, frame in enumerate(tqdm(frames, leave=False)):
-            image_path = os.path.join(args.source_path, frame["file_path"] + ".png")
+        for idx, item in iterator:
+            if is_equirect:
+                # equirect 模式：使用 scene 提供的相机，GT 来自 original_image（已在加载时做 alpha 合成）
+                viewpoint = item
+                if equirect_width is not None:
+                    # 覆盖输出分辨率，重建相机以保证派生属性（image_width/height）正确
+                    H_eq = equirect_width // 2
+                    W_eq = equirect_width
+                    custom_cam = Camera(colmap_id=0, R=viewpoint.R, T=viewpoint.T,
+                                        FoVx=viewpoint.FoVx, FoVy=viewpoint.FoVy,
+                                        fx=None, fy=None, cx=None, cy=None,
+                                        image=torch.zeros(3, H_eq, W_eq),
+                                        image_name=viewpoint.image_name, uid=0)
+                else:
+                    custom_cam = viewpoint
+                gt_image = viewpoint.original_image.cuda()
+            else:
+                # 透视模式：保持原逻辑，从 transforms_test.json 中的 frame 构建相机
+                frame = item
+                image_path = os.path.join(args.source_path, frame["file_path"] + ".png")
 
-            c2w = np.array(frame["transform_matrix"])
-            c2w[:3, 1:3] *= -1
-            w2c = np.linalg.inv(c2w)
-            R = np.transpose(w2c[:3, :3])  # R is stored transposed due to 'glm' in CUDA code
-            T = w2c[:3, 3]
+                c2w = np.array(frame["transform_matrix"])
+                c2w[:3, 1:3] *= -1
+                w2c = np.linalg.inv(c2w)
+                R = np.transpose(w2c[:3, :3])  # R is stored transposed due to 'glm' in CUDA code
+                T = w2c[:3, 3]
 
-            
-            image_rgba = load_img_rgb(image_path)
-            image = image_rgba[..., :3]
-            mask = image_rgba[..., 3:]
 
-            gt_image = torch.from_numpy(image).permute(2, 0, 1).float().cuda()
-            mask = torch.from_numpy(mask).permute(2, 0, 1).float().cuda()
-            gt_image = gt_image * mask + bg * (1 - mask)
+                image_rgba = load_img_rgb(image_path)
+                image = image_rgba[..., :3]
+                mask = image_rgba[..., 3:]
 
-            H = image.shape[0]
-            W = image.shape[1]
-            fovy = focal2fov(fov2focal(fovx, W), H)
+                gt_image = torch.from_numpy(image).permute(2, 0, 1).float().cuda()
+                mask = torch.from_numpy(mask).permute(2, 0, 1).float().cuda()
+                gt_image = gt_image * mask + bg * (1 - mask)
 
-            custom_cam = Camera(colmap_id=0, R=R, T=T,
-                                FoVx=fovx, FoVy=fovy, fx=None, fy=None, cx=None, cy=None,
-                                image=torch.zeros(3, H, W), image_name="test", uid=0)
+                H = image.shape[0]
+                W = image.shape[1]
+                fovy = focal2fov(fov2focal(fovx, W), H)
+
+                custom_cam = Camera(colmap_id=0, R=R, T=T,
+                                    FoVx=fovx, FoVy=fovy, fx=None, fy=None, cx=None, cy=None,
+                                    image=torch.zeros(3, H, W), image_name="test", uid=0)
 
             if idx > 0:
                 t1 = time.time()
@@ -534,18 +573,19 @@ def eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames,
                     "pseudo_normal": vis_dict["pseudo_normal"],
 
                     "radiance_color": vis_dict["radiance_color"],
-                    "ref_color": vis_dict["ref_color"],
+                    "ref_tint": vis_dict["ref_tint"],
                     "ref_strength": vis_dict["ref_strength"],
                     "ref_roughness": vis_dict["ref_roughness"],
-                    "blended_radiance" : vis_dict["blended_radiance"],
-                    "blended_ref_color" : vis_dict["blended_ref_color"],
+                    # equirect 渲染器不输出 blended_radiance/blended_ref_color，用 .get() 兼容
+                    "blended_radiance" : vis_dict.get("blended_radiance"),
+                    "blended_ref_color" : vis_dict.get("blended_ref_color"),
                 })
 
                 if is_pbr:
                     write_image_dict.update({
                         "roughness": vis_dict["roughness"],
                         "metallic": vis_dict["metallic"],
-                        "albedo": vis_dict["base_color_rgb"],
+                        "albedo": vis_dict["base_color"],
                         "diffuse_pbr": vis_dict["diffuse_pbr"],
                         "specular_pbr": vis_dict["specular_pbr"],
                     })
@@ -553,29 +593,10 @@ def eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames,
 
                 if not mkdir_flag:
                     mkdir_flag = True
-                    
-                    os.makedirs(os.path.join(args.model_path, save_name, 'render_radiance'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'gt'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'normal'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'depth'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'pseudo_normal'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'visibility'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'incidents_light'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'radiance_color'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'ref_color'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'ref_roughness'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'ref_strength'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'blended_radiance'), exist_ok=True)
-                    os.makedirs(os.path.join(args.model_path, save_name, 'blended_ref_color'), exist_ok=True)
 
-                    if is_pbr:
-                        os.makedirs(os.path.join(args.model_path, save_name, 'render_pbr'), exist_ok=True)
-                        os.makedirs(os.path.join(args.model_path, save_name, 'albedo'), exist_ok=True)
-                        os.makedirs(os.path.join(args.model_path, save_name, 'metallic'), exist_ok=True)
-                        os.makedirs(os.path.join(args.model_path, save_name, 'roughness'), exist_ok=True)
-                        os.makedirs(os.path.join(args.model_path, save_name, 'diffuse_pbr'), exist_ok=True)
-                        os.makedirs(os.path.join(args.model_path, save_name, 'specular_pbr'), exist_ok=True)
-
+                    # 根据 write_image_dict 的 keys 动态创建目录（兼容 equirect 与透视模式 vis_dict 差异）
+                    for key in write_image_dict:
+                        os.makedirs(os.path.join(args.model_path, save_name, key), exist_ok=True)
 
                     for key in write_image_dict:
                         video_dict[key] = []
@@ -590,15 +611,15 @@ def eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames,
                             video_dict[key].append(video_image)
 
 
-    psnr_radiance_test /= len(frames)
-    ssim_radiance_test /= len(frames)
-    lpips_radiance_test /= len(frames)
+    psnr_radiance_test /= n_frames
+    ssim_radiance_test /= n_frames
+    lpips_radiance_test /= n_frames
 
-    psnr_pbr_test /= len(frames)
-    ssim_pbr_test  /= len(frames)
-    lpips_pbr_test /= len(frames)
+    psnr_pbr_test /= n_frames
+    ssim_pbr_test  /= n_frames
+    lpips_pbr_test /= n_frames
 
-    fps = 1.0/ (render_time / (len(frames)-1))
+    fps = 1.0/ (render_time / (n_frames-1))
 
     print("fps: ", fps)
     if not skip_eval:
@@ -619,6 +640,9 @@ def eval_render(gaussians, render_fn, pipe, background, opt, pbr_kwargs, frames,
         video_path = os.path.join(args.model_path, save_name, "video")
         os.makedirs(video_path, exist_ok=True)
         for key in video_dict:
+            # 跳过空列表（equirect 模式下某些 vis_dict 键可能缺失）
+            if len(video_dict[key]) == 0:
+                continue
             imageio.mimsave(os.path.join(video_path, f"{key}_video.mp4"), np.stack(video_dict[key]), fps=24, macro_block_size=1)
 
 
@@ -643,7 +667,8 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast'], default='render_ref')
+    parser.add_argument('-t', '--type', choices=['render_ref', 'render_ref_pbr', 'render_ref_fast',
+                                                   'render_ref_equirect', 'render_ref_pbr_equirect'], default='render_ref')
     parser.add_argument("-c", "--checkpoint", type=str, default=None)
     parser.add_argument("--occlusion_path", type=str, default=None)
     parser.add_argument("--save_name", type=str, default="eval_test")
@@ -653,6 +678,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_video", action='store_true', default=False)
     parser.add_argument("--save_mesh", action='store_true', default=False)
     parser.add_argument("--fps", action='store_true', default=False)
+    parser.add_argument("--equirect_width", type=int, default=None,
+                        help="Equirect output width (height=width/2). If not set, uses camera native resolution.")
     
 
     args = get_combined_args(parser)
@@ -663,5 +690,6 @@ if __name__ == "__main__":
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    is_pbr = args.type in ['render_ref_pbr', 'render_ref_fast']
-    evaling(lp.extract(args), op.extract(args), pp.extract(args), is_pbr=is_pbr)
+    is_pbr = args.type in ['render_ref_pbr', 'render_ref_fast', 'render_ref_pbr_equirect']
+    is_equirect = 'equirect' in args.type
+    evaling(lp.extract(args), op.extract(args), pp.extract(args), is_pbr=is_pbr, is_equirect=is_equirect)
