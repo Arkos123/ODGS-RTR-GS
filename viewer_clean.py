@@ -181,17 +181,18 @@ class CameraController:
         """
         f = self.forward / np.linalg.norm(self.forward)
 
-        # 正交相机基: OpenGL 相机沿 -Z 看
+        # Camera canonical rays are [x_right, y_down, +z_forward].
         right = np.cross(f, self.up_ref)
         rn = np.linalg.norm(right)
         if rn < 1e-8:
             right = np.array([1.0, 0.0, 0.0], dtype=np.float64)
         else:
             right /= rn
-        up = np.cross(right, f)  # 重正交化
+        down = np.cross(f, right)
+        down /= np.linalg.norm(down)
 
-        # c2w 旋转矩阵: 列 = [right, up, -forward]
-        c2w_rot = np.column_stack([right, up, -f]).astype(np.float32)
+        # c2w 旋转矩阵: 列 = [screen right, screen down, forward]
+        c2w_rot = np.column_stack([right, down, f]).astype(np.float32)
 
         # Camera 存储的 (R, T):
         #   R = w2c[:3,:3].T = c2w_rot           (c2w 旋转矩阵)
@@ -504,8 +505,9 @@ def render_equirect_crop(cam_ctrl: CameraController, scene_data: dict,
                          env_angle_y: float = 0.0, env_angle_x: float = 0.0,
                          fast_pbr: bool = True,
                          point_lights=None, point_light_shadow_funcs=None,
-                         point_light_pos=None) -> np.ndarray:
-    """渲染当前位置 equirect 全景图 → 裁切为透视视口。
+                         point_light_pos=None,
+                         show_panorama: bool = False) -> np.ndarray:
+    """渲染当前位置 equirect 全景图，可直接显示或裁切为透视视口。
 
     位置未显著变化时复用缓存的 equirect 以节省时间。
     """
@@ -574,17 +576,59 @@ def render_equirect_crop(cam_ctrl: CameraController, scene_data: dict,
     else:
         equirect_img = cache["image"]
 
-    # 裁切透视视口
+    if show_panorama:
+        return _fit_tensor_to_display_image(
+            equirect_img, cam_ctrl.width, cam_ctrl.height, preserve_aspect=True
+        )
+
+    # 裁切透视视口：复用普通透视模式实际使用的 canonical_rays + c2w，
+    # 避免全景裁切维护另一套相机基导致 pitch/roll 不一致。
+    persp_camera, canonical_rays = cam_ctrl.build_camera()
     with torch.no_grad():
         perspective_img = _equirect_to_perspective(
             equirect_img,
             cam_ctrl.forward, cam_ctrl.up_ref,
             cam_ctrl.FoVx, cam_ctrl.width, cam_ctrl.height,
+            canonical_rays=canonical_rays,
+            c2w=persp_camera.c2w,
         )
 
-    img_np = perspective_img.permute(1, 2, 0).cpu().numpy()
+    return _tensor_to_display_image(perspective_img)
+
+
+def _tensor_to_display_image(img: torch.Tensor) -> np.ndarray:
+    """Convert a [3, H, W] tensor in 0..1 to uint8 display image."""
+    img_np = img.detach().permute(1, 2, 0).cpu().numpy()
     img_np = np.clip(img_np, 0.0, 1.0)
     return (img_np * 255).astype(np.uint8)
+
+
+def _fit_tensor_to_display_image(img: torch.Tensor, target_w: int, target_h: int,
+                                 preserve_aspect: bool = True) -> np.ndarray:
+    """Resize a [3, H, W] tensor for display, letterboxing when requested."""
+    if not preserve_aspect:
+        resized = F.interpolate(
+            img.unsqueeze(0), size=(target_h, target_w),
+            mode="bilinear", align_corners=False,
+        )[0]
+        return _tensor_to_display_image(resized)
+
+    _, src_h, src_w = img.shape
+    scale = min(target_w / max(src_w, 1), target_h / max(src_h, 1))
+    fit_w = max(1, int(round(src_w * scale)))
+    fit_h = max(1, int(round(src_h * scale)))
+    resized = F.interpolate(
+        img.unsqueeze(0), size=(fit_h, fit_w),
+        mode="bilinear", align_corners=False,
+    )[0]
+
+    canvas = torch.zeros(
+        (3, target_h, target_w), dtype=resized.dtype, device=resized.device
+    )
+    x0 = (target_w - fit_w) // 2
+    y0 = (target_h - fit_h) // 2
+    canvas[:, y0:y0 + fit_h, x0:x0 + fit_w] = resized
+    return _tensor_to_display_image(canvas)
 
 
 # Equirect 缓存（模块级）
@@ -656,7 +700,8 @@ def _extract_display_image(render_pkg: dict, render_mode: str) -> np.ndarray:
 # ── Equirect → 透视裁切（复用了 nvdiffrast 风格的空间变换） ──────────────
 
 def _equirect_to_perspective(equirect_img, forward, up_ref,
-                              fovx_rad, target_w, target_h):
+                              fovx_rad, target_w, target_h,
+                              canonical_rays=None, c2w=None):
     """从等距柱状投影中提取透视视口。"""
     device = equirect_img.device
     H, W = target_h, target_w
@@ -666,26 +711,36 @@ def _equirect_to_perspective(equirect_img, forward, up_ref,
     tan_hfovx = math.tan(fovx_rad * 0.5)
     tan_hfovy = math.tan(fovy_rad * 0.5)
 
-    xs = torch.linspace(-tan_hfovx, tan_hfovx, W, device=device)
-    ys = torch.linspace(tan_hfovy, -tan_hfovy, H, device=device)
-    gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+    if canonical_rays is not None and c2w is not None:
+        dirs_world = (
+            (F.normalize(canonical_rays[:, None, :], p=2, dim=-1) * c2w[None, :3, :3])
+            .sum(dim=-1)
+            .reshape(H, W, 3)
+        )
+    else:
+        xs = torch.linspace(-tan_hfovx, tan_hfovx, W, device=device)
+        ys = torch.linspace(-tan_hfovy, tan_hfovy, H, device=device)
+        gy, gx = torch.meshgrid(ys, xs, indexing='ij')
 
-    dirs_cam = F.normalize(torch.stack([gx, gy, torch.ones_like(gx)], dim=-1), dim=-1)
+        dirs_cam = F.normalize(torch.stack([gx, gy, torch.ones_like(gx)], dim=-1), dim=-1)
 
-    forward_n = forward / np.linalg.norm(forward)
-    right = np.cross(forward_n, up_ref)
-    rn = np.linalg.norm(right)
-    right = right / rn if rn > 1e-8 else np.array([1.0, 0.0, 0.0])
-    cam_up = np.cross(right, forward_n)
-    cam_up /= np.linalg.norm(cam_up)
+        forward_n = forward / np.linalg.norm(forward)
+        right = np.cross(forward_n, up_ref)
+        rn = np.linalg.norm(right)
+        right = right / rn if rn > 1e-8 else np.array([1.0, 0.0, 0.0])
+        down = np.cross(forward_n, right)
+        down /= np.linalg.norm(down)
 
-    R_world = np.float32([right, cam_up, forward_n])  # [3, 3]
-    R_world_t = torch.from_numpy(R_world).to(device=device)
+        R_world = np.float32([right, down, forward_n])  # [3, 3]
+        R_world_t = torch.from_numpy(R_world).to(device=device)
+        dirs_world = (dirs_cam.reshape(-1, 3) @ R_world_t.T).reshape(H, W, 3)
 
-    dirs_world = (dirs_cam.reshape(-1, 3) @ R_world_t.T).reshape(H, W, 3)
+    dirs_erp = dirs_world
 
-    lon = torch.atan2(dirs_world[..., 0], dirs_world[..., 2])
-    lat = torch.asin(torch.clamp(dirs_world[..., 1], -1.0, 1.0))
+    lon = torch.atan2(dirs_erp[..., 0], dirs_erp[..., 2])
+    # render_equirect._equirect_ray_dirs stores COLMAP view-space +Y as image down:
+    # dir_y = -sin(lat), so invert with lat = asin(-dir_y).
+    lat = torch.asin(torch.clamp(-dirs_erp[..., 1], -1.0, 1.0))
 
     grid_x = lon / math.pi
     grid_y = -2 * lat / math.pi
@@ -740,6 +795,62 @@ def render_env_skybox(cubemap, forward, up_ref, fovx_rad, width, height):
         boundary_mode="cube",
     )[0]
     return sky.permute(2, 0, 1)
+
+
+# ── 点光源屏幕示意 ─────────────────────────────────────────────────
+
+def _project_world_to_screen(cam_ctrl: CameraController, world_pos: np.ndarray):
+    """Project a COLMAP-world point into the current perspective viewport."""
+    f = cam_ctrl.forward / np.linalg.norm(cam_ctrl.forward)
+    right = np.cross(f, cam_ctrl.up_ref)
+    rn = np.linalg.norm(right)
+    if rn < 1e-8:
+        right = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        right /= rn
+    down = np.cross(f, right)
+    down /= np.linalg.norm(down)
+
+    rel = np.asarray(world_pos, dtype=np.float64) - cam_ctrl.position
+    x_cam = float(np.dot(rel, right))
+    y_cam = float(np.dot(rel, down))
+    z_cam = float(np.dot(rel, f))
+    if z_cam <= 1e-4:
+        return None
+
+    focal_x = cam_ctrl.width / (2.0 * math.tan(cam_ctrl.FoVx * 0.5))
+    focal_y = cam_ctrl.height / (2.0 * math.tan(cam_ctrl.FoVy * 0.5))
+    px = cam_ctrl.width * 0.5 + (x_cam / z_cam) * focal_x
+    py = cam_ctrl.height * 0.5 + (y_cam / z_cam) * focal_y
+    return px, py, z_cam
+
+
+def draw_point_light_indicator(screen, cam_ctrl: CameraController, light_pos: np.ndarray):
+    """Draw a small glowing sphere at the projected point-light position."""
+    projected = _project_world_to_screen(cam_ctrl, light_pos)
+    if projected is None:
+        return
+
+    px, py, depth = projected
+    margin = 32
+    if px < -margin or px > cam_ctrl.width + margin or py < -margin or py > cam_ctrl.height + margin:
+        return
+
+    center = (int(round(px)), int(round(py)))
+    radius = int(np.clip(90.0 / max(depth, 1e-3), 7, 18))
+    glow_radius = radius * 3
+
+    glow = pygame.Surface((glow_radius * 2, glow_radius * 2), pygame.SRCALPHA)
+    for i, alpha in ((3, 28), (2, 45), (1, 70)):
+        pygame.draw.circle(
+            glow, (255, 210, 70, alpha),
+            (glow_radius, glow_radius), radius * i
+        )
+    screen.blit(glow, (center[0] - glow_radius, center[1] - glow_radius))
+
+    pygame.draw.circle(screen, (255, 190, 45), center, radius)
+    pygame.draw.circle(screen, (255, 245, 170), center, max(2, radius // 2))
+    pygame.draw.circle(screen, (80, 45, 0), center, radius, 2)
 
 
 # ── 环境光旋转 ─────────────────────────────────────────────────────
@@ -939,9 +1050,9 @@ def main():
     if test_cams and len(test_cams) > 0:
         c0 = test_cams[0]
         init_pos = -c0.R @ c0.T
-        init_forward = (c0.R @ np.array([0, 0, -1], dtype=np.float64)).astype(np.float64)
+        init_forward = c0.R[:, 2].astype(np.float64)
         init_target = scene_center.copy()
-        init_up = c0.R[:, 1].astype(np.float64)
+        init_up = (-c0.R[:, 1]).astype(np.float64)
         init_up /= np.linalg.norm(init_up)
         print(f"Initial position from first camera: {init_pos}, up: {init_up}")
     else:
@@ -957,6 +1068,11 @@ def main():
         width=args.image_width, height=args.image_height,
         render_mode=render_mode,
     )
+    if test_cams and len(test_cams) > 0:
+        cam_ctrl.forward = init_forward / np.linalg.norm(init_forward)
+        cam_ctrl.up_ref = init_up
+        cam_ctrl._yaw = math.atan2(cam_ctrl.forward[0], cam_ctrl.forward[2])
+        cam_ctrl._pitch = math.asin(np.clip(cam_ctrl.forward[1], -1 + 1e-6, 1 - 1e-6))
 
     # ── 渲染配置 ────────────────────────────────────────────────────
     render_cfg = RenderConfig(white_background=white_bg)
@@ -967,6 +1083,7 @@ def main():
     env_angle_x = 0.0
     show_env_bg = False
     show_env_only = False
+    show_equirect_panorama = False
     playing_transforms = False
     play_index = 0
 
@@ -978,10 +1095,12 @@ def main():
     )
     point_light_enabled = True
 
-    if render_backend == "equirect":
-        print("Backend: EQUIRECT (full panorama → perspective crop)")
-    else:
-        print("Backend: PERSPECTIVE (direct rendering)")
+    def display_state_name():
+        if render_backend == "perspective":
+            return "PERSPECTIVE"
+        return "EQUIRECT PANORAMA" if show_equirect_panorama else "EQUIRECT CROP"
+
+    print(f"Display: {display_state_name()}")
 
     # ── Pygame 初始化 ────────────────────────────────────────────────
     pygame.init()
@@ -1015,10 +1134,19 @@ def main():
                     print(f"View: {RENDER_MODE_NAMES.get(render_mode, render_mode.upper())}")
 
                 elif event.key == pygame.K_n:
-                    render_backend = "equirect" if render_backend == "perspective" else "perspective"
-                    print(f"Backend: {render_backend.upper()}")
-                    _EQUIRECT_CACHE["pos"] = None  # 清除缓存
-                    _POINT_LIGHT_SHADOW_CACHE["pos"] = None  # 阴影深度图也需重建
+                    prev_backend = render_backend
+                    if render_backend == "perspective":
+                        render_backend = "equirect"
+                        show_equirect_panorama = False
+                    elif not show_equirect_panorama:
+                        show_equirect_panorama = True
+                    else:
+                        render_backend = "perspective"
+                        show_equirect_panorama = False
+                    print(f"Display: {display_state_name()}")
+                    if render_backend != prev_backend:
+                        _EQUIRECT_CACHE["pos"] = None  # 清除缓存
+                        _POINT_LIGHT_SHADOW_CACHE["pos"] = None  # 阴影深度图也需重建
 
                 elif event.key == pygame.K_x:
                     scene_data["enable_occlusion"] = not scene_data["enable_occlusion"]
@@ -1047,12 +1175,12 @@ def main():
                             # 从当前 R/T 恢复 position/forward/up
                             fp = test_cams[play_index % len(test_cams)]
                             cam_ctrl.position = (-fp.R @ fp.T).astype(np.float64)
-                            cam_ctrl.forward = (fp.R @ np.array([0, 0, -1], dtype=np.float64)).astype(np.float64)
+                            cam_ctrl.forward = fp.R[:, 2].astype(np.float64)
                             cam_ctrl.forward /= np.linalg.norm(cam_ctrl.forward)
-                            cam_ctrl.up_ref = fp.R[:, 1].astype(np.float64)
+                            cam_ctrl.up_ref = (-fp.R[:, 1]).astype(np.float64)
                             cam_ctrl.up_ref /= np.linalg.norm(cam_ctrl.up_ref)
 
-                elif event.key == pygame.K_k:
+                elif event.key == pygame.K_f:
                     print("Saving snapshot...")
                     save_snapshot(cam_ctrl, scene_data, render_cfg)
 
@@ -1089,9 +1217,9 @@ def main():
             ref_cam = test_cams[play_index % len(test_cams)]
             # 从 ref_cam.R/T 恢复 c2w 位置、朝向和上方向
             cam_ctrl.position = (-ref_cam.R @ ref_cam.T).astype(np.float64)
-            cam_ctrl.forward = (ref_cam.R @ np.array([0, 0, -1], dtype=np.float64)).astype(np.float64)
+            cam_ctrl.forward = ref_cam.R[:, 2].astype(np.float64)
             cam_ctrl.forward /= np.linalg.norm(cam_ctrl.forward)
-            cam_ctrl.up_ref = ref_cam.R[:, 1].astype(np.float64)
+            cam_ctrl.up_ref = (-ref_cam.R[:, 1]).astype(np.float64)
             cam_ctrl.up_ref /= np.linalg.norm(cam_ctrl.up_ref)
             play_index += 1
         else:
@@ -1184,6 +1312,7 @@ def main():
                     point_lights=active_lights,
                     point_light_shadow_funcs=active_shadow,
                     point_light_pos=pl_pos,
+                    show_panorama=show_equirect_panorama,
                 )
             else:
                 display_np, env_bg_np, opacity_np = render_perspective(
@@ -1206,11 +1335,14 @@ def main():
         # surf = pygame.transform.flip(surf, False, True)  # Y-flip (temp fix for upside-down)
         screen.blit(surf, (0, 0))
 
+        if point_light_enabled and not (render_backend == "equirect" and show_equirect_panorama):
+            draw_point_light_indicator(screen, cam_ctrl, cam_ctrl.point_light_pos)
+
         # HUD
         font = pygame.font.SysFont('Arial', 20)
         fps_text = font.render(f"FPS: {clock.get_fps():.1f}", True, (0, 255, 0))
         mode_text = font.render(f"Mode: {cam_ctrl.mode.upper()}", True, (0, 255, 0))
-        backend_text = font.render(f"Backend: {render_backend.upper()} [N]", True, (0, 255, 255))
+        backend_text = font.render(f"Display: {display_state_name()} [N]", True, (0, 255, 255))
         view_text = font.render(f"View: {RENDER_MODE_NAMES.get(render_mode, render_mode.upper())} [V]", True, (0, 255, 0))
         occ_text = font.render(f"Occlusion: {'ON' if scene_data['enable_occlusion'] else 'OFF'} [X]", True, (0, 255, 0))
         env_bg_text = font.render(f"Env BG: {'ON' if show_env_bg else 'OFF'} [B]", True, (0, 255, 0))
@@ -1225,12 +1357,13 @@ def main():
         screen.blit(fps_text, (10, 10))
         screen.blit(mode_text, (10, 35))
         screen.blit(backend_text, (10, 60))
-        screen.blit(view_text, (10, 85))
-        screen.blit(occ_text, (10, 110))
-        screen.blit(env_bg_text, (10, 135))
-        screen.blit(env_only_text, (10, 160))
-        screen.blit(env_rot_text, (10, 185))
-        screen.blit(pl_text, (10, 210))
+        hud_y0 = 85
+        screen.blit(view_text, (10, hud_y0))
+        screen.blit(occ_text, (10, hud_y0 + 25))
+        screen.blit(env_bg_text, (10, hud_y0 + 50))
+        screen.blit(env_only_text, (10, hud_y0 + 75))
+        screen.blit(env_rot_text, (10, hud_y0 + 100))
+        screen.blit(pl_text, (10, hud_y0 + 125))
 
         pygame.display.flip()
         clock.tick(60)
