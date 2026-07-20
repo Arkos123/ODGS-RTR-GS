@@ -50,6 +50,7 @@ def get_depth_cubemap(
     res: int = 512,
     znear: float = 0.01,
     zfar: float = 100.0,
+    argmax_depth: bool = True,
 ) -> torch.Tensor:
     """
     从光源位置渲染 6 张深度图组成 cubemap。
@@ -62,6 +63,7 @@ def get_depth_cubemap(
         light_pos: 光源位置 [3]
         res: 每面的分辨率（默认 512）
         znear/zfar: 近/远裁面
+        argmax_depth: True=最近/最大贡献深度，False=原 rasterizer depth 聚合
     Returns:
         depth_cubemap: [6, res, res, 1] 深度 cubemap
     """
@@ -105,7 +107,7 @@ def get_depth_cubemap(
             res,                         # width
             gaussians.active_sh_degree,
             False,                       # prefiltered
-            True,                        # argmax_depth ← 关键！
+            argmax_depth,                # argmax_depth
         )
         _, _, _, _, depth_map = diff_C.lite_rasterize_gaussians(*input_args)
         depth_faces.append(depth_map.permute(1, 2, 0))  # [res, res, 1]
@@ -120,16 +122,20 @@ def get_depth_equirect(
     light_pos: torch.Tensor,
     H: int = 512,
     W: int = 1024,
+    depth_mode: int = 1,
 ) -> torch.Tensor:
     """
     从光源位置渲染单张全景深度图（4π 球面覆盖）。
 
     使用 SGS GaussianRasterizer (camera_type=3)，适配 SGS 训练的点云。
+    默认 depth_mode=1，使用最近贡献高斯的中心深度，避免 shadow map 被 alpha
+    blending 推到更远处。
 
     Args:
         gaussians: 场景高斯模型
         light_pos: 光源位置 [3]
         H, W: 全景图分辨率
+        depth_mode: 0=alpha-weighted depth, 1=min contributing depth
     Returns:
         depth_erp: [1, H, W] 全景深度图
     """
@@ -153,6 +159,7 @@ def get_depth_equirect(
         debug=False,
         camera_type=3,
         render_depth=True,
+        depth_mode=depth_mode,
     )
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 

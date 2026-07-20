@@ -95,6 +95,7 @@ def get_depth_cubemap(gaussians, light_pos, res=2048):
     """
     从光源位置渲染 6 张深度图 (cubemap)
     使用 diff-gaussian-rasterization 的 lite_forward + argmax_depth
+    viewer 中可用 `Z` 在 argmax_depth 与原 depth 聚合之间切换
     返回: [6, res, res, 1] 深度 cubemap
     """
     # 定义 6 个方向的相机（+X, -X, +Y, -Y, +Z, -Z）
@@ -123,12 +124,13 @@ def query_shadow_cubemap(depth_cubemap, surface_pos, light_pos, threshold=0.3):
 def get_depth_equirect(gaussians, light_pos, H=512, W=1024):
     """
     从光源位置渲染单张全景深度图
-    使用 SGS GaussianRasterizer (camera_type=3)
+    使用 SGS GaussianRasterizer (camera_type=3, depth_mode=1)
+    viewer 中可用 `Z` 在 min-depth 与 alpha-weighted depth 之间切换
     返回: [1, H, W] 深度图
     """
     # 创建 equirect 相机：identity 旋转 + light_pos 位置
     # SGS rasterizer 一次渲染覆盖 4π 球面
-    # 返回 depth_raw
+    # 返回最近贡献高斯的中心深度，避免 alpha-weighted depth 让 shadow map 偏远
 ```
 
 对阴影查询：

@@ -163,14 +163,19 @@ class CameraController:
             self._pitch = math.asin(np.clip(self.forward[1], -1 + 1e-6, 1 - 1e-6))
 
     def move_point_light(self, forward_delta=0.0, right_delta=0.0, up_delta=0.0):
-        """基于当前相机朝向移动点光源位置。"""
-        self.point_light_pos += self.forward * forward_delta * self.move_speed
-        right = np.cross(self.forward, self.up_ref)
-        rn = np.linalg.norm(right)
-        if rn > 1e-8:
-            right /= rn
-        self.point_light_pos += right * right_delta * self.move_speed
-        self.point_light_pos += self.up_ref * up_delta * self.move_speed
+        """沿坐标轴移动点光源位置。"""
+        self.point_light_pos += np.array([0, 0, 1]) * forward_delta * self.move_speed
+        self.point_light_pos += np.array([1, 0, 0]) * right_delta * self.move_speed
+        self.point_light_pos += np.array([0, 1, 0]) * up_delta * self.move_speed
+
+        # """基于当前相机朝向移动点光源位置。"""
+        # self.point_light_pos += self.forward * forward_delta * self.move_speed
+        # right = np.cross(self.forward, self.up_ref)
+        # rn = np.linalg.norm(right)
+        # if rn > 1e-8:
+        #     right /= rn
+        # self.point_light_pos += right * right_delta * self.move_speed
+        # self.point_light_pos += self.up_ref * up_delta * self.move_speed
 
     # ── Camera 构造 ─────────────────────────────────────────────────────────
 
@@ -507,6 +512,7 @@ def render_equirect_crop(cam_ctrl: CameraController, scene_data: dict,
                          fast_pbr: bool = True,
                          point_lights=None, point_light_shadow_funcs=None,
                          point_light_pos=None,
+                         point_light_shadow_depth_mode=None,
                          show_panorama: bool = False) -> np.ndarray:
     """渲染当前位置 equirect 全景图，可直接显示或裁切为透视视口。
 
@@ -537,6 +543,7 @@ def render_equirect_crop(cam_ctrl: CameraController, scene_data: dict,
         or cache.get("render_mode") != render_mode
         or cache.get("env_angle_y") != env_angle_y
         or cache.get("env_angle_x") != env_angle_x
+        or cache.get("point_light_shadow_depth_mode") != point_light_shadow_depth_mode
         or pl_changed
     )
 
@@ -572,6 +579,7 @@ def render_equirect_crop(cam_ctrl: CameraController, scene_data: dict,
             "env_angle_y": env_angle_y,
             "env_angle_x": env_angle_x,
             "point_light_pos": point_light_pos.copy() if point_light_pos is not None else None,
+            "point_light_shadow_depth_mode": point_light_shadow_depth_mode,
             "image": equirect_img,
         }
     else:
@@ -641,32 +649,80 @@ _EQUIRECT_CACHE = {
 }
 
 # 点光源阴影深度图缓存（模块级）
-_POINT_LIGHT_SHADOW_CACHE = {"pos": None, "func": None}
+_POINT_LIGHT_SHADOW_CACHE = {
+    "pos": None,
+    "func": None,
+    "depth": None,
+    "backend": None,
+    "use_argmax_depth": None,
+}
 
 
 def _get_point_light_shadow(scene_data: dict, light_pos_np: np.ndarray,
-                            render_backend: str):
+                            render_backend: str,
+                            use_argmax_depth: bool = True):
     """获取或更新点光源阴影深度图。
 
     光源位置变化超过阈值（0.05）时重新渲染深度图，否则复用缓存。
     """
     cache = _POINT_LIGHT_SHADOW_CACHE
     if (cache["pos"] is not None
-            and np.linalg.norm(light_pos_np - cache["pos"]) < 0.05):
+            and np.linalg.norm(light_pos_np - cache["pos"]) < 0.05
+            and cache.get("backend") == render_backend
+            and cache.get("use_argmax_depth") == use_argmax_depth):
         return cache["func"]
 
     light_pos_t = torch.from_numpy(light_pos_np.astype(np.float32)).cuda()
     gaussians = scene_data["gaussians"]
     with torch.no_grad():
         if render_backend == "equirect":
-            depth_map = get_depth_equirect(gaussians, light_pos_t)
-            shadow_fn = make_shadow_func_equirect(depth_map, light_pos_t)
+            depth_mode = 1 if use_argmax_depth else 0
+            depth_map = get_depth_equirect(gaussians, light_pos_t, depth_mode=depth_mode)
+            shadow_fn = make_shadow_func_equirect(depth_map, light_pos_t, threshold=0.25)
         else:
-            depth_map = get_depth_cubemap(gaussians, light_pos_t)
-            shadow_fn = make_shadow_func_cubemap(depth_map, light_pos_t)
+            depth_map = get_depth_cubemap(
+                gaussians, light_pos_t, argmax_depth=use_argmax_depth
+            )
+            shadow_fn = make_shadow_func_cubemap(depth_map, light_pos_t, threshold=0.25)
     cache["pos"] = light_pos_np.copy()
     cache["func"] = shadow_fn
+    cache["depth"] = depth_map.detach().clone()
+    cache["backend"] = render_backend
+    cache["use_argmax_depth"] = use_argmax_depth
     return shadow_fn
+
+
+def save_point_light_shadow_depth(scene_data: dict, light_pos_np: np.ndarray,
+                                  render_backend: str,
+                                  use_argmax_depth: bool = True,
+                                  output_dir: str = "snapshots"):
+    """Save the point-light shadow depth map currently used by the viewer."""
+    _get_point_light_shadow(scene_data, light_pos_np, render_backend, use_argmax_depth)
+    cache = _POINT_LIGHT_SHADOW_CACHE
+    depth_map = cache.get("depth")
+    if depth_map is None:
+        print("No point-light shadow depth map available.")
+        return
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    save_dir = os.path.join(output_dir, f"point_light_shadow_{ts}")
+    os.makedirs(save_dir, exist_ok=True)
+
+    pos = cache["pos"] if cache["pos"] is not None else light_pos_np
+    with open(os.path.join(save_dir, "meta.txt"), "w") as f:
+        f.write(f"backend: {cache.get('backend')}\n")
+        f.write(f"use_argmax_depth: {cache.get('use_argmax_depth')}\n")
+        f.write(f"light_pos: {pos[0]:.6f}, {pos[1]:.6f}, {pos[2]:.6f}\n")
+
+    if cache.get("backend") == "equirect":
+        save_image(colorize_depth(depth_map), os.path.join(save_dir, "depth_equirect.png"))
+    else:
+        face_names = ["posx", "negx", "posy", "negy", "posz", "negz"]
+        for face_idx, name in enumerate(face_names):
+            face_depth = depth_map[face_idx].permute(2, 0, 1)
+            save_image(colorize_depth(face_depth), os.path.join(save_dir, f"depth_{name}.png"))
+
+    print(f"Point-light shadow depth saved to {save_dir}/")
 
 
 def _extract_raw_tensor(render_pkg: dict, render_mode: str) -> torch.Tensor:
@@ -857,6 +913,15 @@ def draw_point_light_indicator(screen, cam_ctrl: CameraController, light_pos: np
     pygame.draw.circle(screen, (255, 190, 45), center, radius)
     pygame.draw.circle(screen, (255, 245, 170), center, max(2, radius // 2))
     pygame.draw.circle(screen, (80, 45, 0), center, radius, 2)
+
+
+def adjust_point_light_intensity(point_light: PointLight, wheel_delta: int):
+    """Adjust point-light intensity with multiplicative mouse-wheel steps."""
+    if wheel_delta == 0:
+        return
+    factor = 1.12 ** wheel_delta
+    point_light.intensity = float(np.clip(point_light.intensity * factor, 0.0, 500.0))
+    print(f"Point Light Intensity: {point_light.intensity:.2f}")
 
 
 # ── 环境光旋转 ─────────────────────────────────────────────────────
@@ -1097,9 +1162,10 @@ def main():
     point_light = PointLight(
         position=torch.zeros(3, dtype=torch.float32, device="cuda"),
         color=torch.ones(3, dtype=torch.float32, device="cuda"),
-        intensity=20.0,
+        intensity=50.0,
     )
     point_light_enabled = True
+    use_argmax_depth = True
 
     def display_state_name():
         if render_backend == "perspective":
@@ -1112,6 +1178,11 @@ def main():
         idx = keys_list.index(render_mode) if render_mode in keys_list else 0
         render_mode = keys_list[(idx + step) % len(keys_list)]
         print(f"View: {RENDER_MODE_NAMES.get(render_mode, render_mode.upper())}")
+
+    def shadow_depth_mode_name():
+        if not use_argmax_depth:
+            return "ALPHA"
+        return "MIN" if render_backend == "equirect" else "ARGMAX"
 
     print(f"Display: {display_state_name()}")
 
@@ -1197,6 +1268,15 @@ def main():
                     print("Saving snapshot...")
                     save_snapshot(cam_ctrl, scene_data, render_cfg)
 
+                elif event.key == pygame.K_y:
+                    print("Saving point-light shadow depth...")
+                    save_point_light_shadow_depth(
+                        scene_data,
+                        cam_ctrl.point_light_pos,
+                        render_backend,
+                        use_argmax_depth,
+                    )
+
                 elif event.key == pygame.K_SPACE:
                     if not playing_transforms:
                         cam_ctrl.forward = np.array([0, 0, -1], dtype=np.float64)
@@ -1204,6 +1284,12 @@ def main():
                 elif event.key == pygame.K_t:
                     point_light_enabled = not point_light_enabled
                     print(f"Point Light: {'ON' if point_light_enabled else 'OFF'}")
+
+                elif event.key == pygame.K_z:
+                    use_argmax_depth = not use_argmax_depth
+                    _POINT_LIGHT_SHADOW_CACHE["pos"] = None
+                    _EQUIRECT_CACHE["pos"] = None
+                    print(f"Shadow Depth: {shadow_depth_mode_name()}")
 
                 elif event.key == pygame.K_g:
                     # 重置点光源位置到原点
@@ -1221,7 +1307,12 @@ def main():
                     right_mouse_down = False
 
             elif event.type == pygame.MOUSEWHEEL:
-                cam_ctrl.orbit_zoom(event.y)
+                if point_light_enabled and not (pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                    adjust_point_light_intensity(point_light, event.y)
+                    if render_backend == "equirect":
+                        _EQUIRECT_CACHE["pos"] = None
+                else:
+                    cam_ctrl.orbit_zoom(event.y)
 
         # ── 持续按键 ─────────────────────────────────────────────────
         keys = pygame.key.get_pressed()
@@ -1293,7 +1384,9 @@ def main():
         if point_light_enabled:
             pl_pos = cam_ctrl.point_light_pos
             point_light.position = torch.from_numpy(pl_pos.astype(np.float32)).cuda()
-            shadow_fn = _get_point_light_shadow(scene_data, pl_pos, render_backend)
+            shadow_fn = _get_point_light_shadow(
+                scene_data, pl_pos, render_backend, use_argmax_depth
+            )
             active_lights = [point_light]
             active_shadow = [shadow_fn]
         else:
@@ -1325,6 +1418,7 @@ def main():
                     point_lights=active_lights,
                     point_light_shadow_funcs=active_shadow,
                     point_light_pos=pl_pos,
+                    point_light_shadow_depth_mode=use_argmax_depth,
                     show_panorama=show_equirect_panorama,
                 )
             else:
@@ -1362,9 +1456,12 @@ def main():
         env_only_text = font.render(f"Env Only: {'ON' if show_env_only else 'OFF'} [H]", True, (255, 255, 0))
         env_rot_text = font.render(f"Env Rot: {env_angle_y * 180 / math.pi:.1f}° [←→]", True, (0, 255, 0))
         pl_pos = cam_ctrl.point_light_pos
+        shadow_depth_name = shadow_depth_mode_name()
         pl_text = font.render(
             f"Point Light: {'ON' if point_light_enabled else 'OFF'} [T] "
-            f"({pl_pos[0]:.2f},{pl_pos[1]:.2f},{pl_pos[2]:.2f}) IKJL UO [G=reset]",
+            f"I={point_light.intensity:.1f} "
+            f"({pl_pos[0]:.2f},{pl_pos[1]:.2f},{pl_pos[2]:.2f}) IKJL UO "
+            f"[G=reset,Y=depth,Z={shadow_depth_name}]",
             True, (255, 200, 0))
 
         screen.blit(fps_text, (10, 10))
