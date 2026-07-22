@@ -2,8 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import numpy as np
-from utils.graphics_utils import getWorld2View2, getProjectionMatrix, getProjectionMatrixCenterShift
-
+from utils.graphics_utils import getWorld2View2, getProjectionMatrix, get_canonical_rays, getProjectionMatrixCenterShift
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, fx, fy, cx, cy, image=None, image_name='', uid=0,
@@ -127,6 +126,9 @@ class Camera(nn.Module):
 
     def get_rotation(self):
         return torch.from_numpy(self.R.T).float().cuda()
+
+    def get_canonical_rays(self):
+        return get_canonical_rays(self.image_width, self.image_height, self.FoVx, self.FoVy)
 
     @staticmethod
     def create_for_gui():
